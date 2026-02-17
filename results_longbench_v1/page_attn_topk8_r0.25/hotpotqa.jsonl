@@ -1,0 +1,50 @@
+{"_id": "fc6267db9ba02bbb251960231bc87251c581110e4e2b5f3f", "task": "hotpotqa", "score": 0.3333333333333333, "response": "Gates v. Collier", "gold": ["Miller v. California"], "input_len": 11787}
+{"_id": "d542fcd45bbf5112eee9127f04ae060a887c8ef2050aa160", "task": "hotpotqa", "score": 1.0, "response": "Charles L. Clifford", "gold": ["Charles L. Clifford"], "input_len": 17322}
+{"_id": "cb9214532284b8202912b1b75592832daef0b109593185a0", "task": "hotpotqa", "score": 0.0, "response": "Lowell", "gold": ["Norman"], "input_len": 17388}
+{"_id": "105e7f4d337799315ddf870acc4ff2a62a1e6cdf489086cd", "task": "hotpotqa", "score": 0.0, "response": "Jupiter", "gold": ["Sun"], "input_len": 16764}
+{"_id": "5ff08452b84748458e71d82a6d387599969311fd61cd8fd1", "task": "hotpotqa", "score": 0.5, "response": "film", "gold": ["erotic thriller film"], "input_len": 15170}
+{"_id": "97b31d6d7a9137c220726ad51a6dca3e957e2c94ce5e65b8", "task": "hotpotqa", "score": 0.0, "response": "Gyles Brandreth", "gold": ["Parliament"], "input_len": 15750}
+{"_id": "11a7ad9d646184c16480376226d58f1b2754b095563c8344", "task": "hotpotqa", "score": 1.0, "response": "Tharangambadi", "gold": ["Tharangambadi"], "input_len": 16128}
+{"_id": "3dd1ade26fd583844dd2af051d61eb20856ccc8e23abae59", "task": "hotpotqa", "score": 1.0, "response": "Pleiospilos", "gold": ["Pleiospilos"], "input_len": 2317}
+{"_id": "f039fe9cc81a0a312f9899beca2fe26b710bf8c3aa23a4d9", "task": "hotpotqa", "score": 1.0, "response": "2013", "gold": ["2013"], "input_len": 13269}
+{"_id": "a30caa5dafcc37835bfe4093f129017adf4c814e9016e10d", "task": "hotpotqa", "score": 1.0, "response": "The Rebirth", "gold": ["The Rebirth"], "input_len": 9275}
+{"_id": "72feb2a8e5b92548a357bfc11e94050464f93f1ce286418c", "task": "hotpotqa", "score": 1.0, "response": "October 13, 1980", "gold": ["October 13, 1980"], "input_len": 16901}
+{"_id": "77439b0a62b6de3a022b1d7a5678c1c00fa8d9af42fea1bf", "task": "hotpotqa", "score": 0.0, "response": "Ted Turner", "gold": ["Betty Cohen"], "input_len": 16707}
+{"_id": "21bc398556b5612bf0437043cd2800e943bab5929c4bccc5", "task": "hotpotqa", "score": 1.0, "response": "Mary Astor", "gold": ["Mary Astor"], "input_len": 16039}
+{"_id": "e0998dbc2db68c7b18adff7fcc67081acc865c974b721312", "task": "hotpotqa", "score": 1.0, "response": "number five", "gold": ["number five"], "input_len": 10908}
+{"_id": "139d2fcf8763003414ebd0187eb30b94930de13c4ab754a0", "task": "hotpotqa", "score": 0.06451612903225805, "response": "Sri Lankan sambar deer and white-bellied musk deer share common deer species with the forests of Mara and Mondrem, though in different geographical", "gold": ["New Zealand, Canada, the United States, the Falkland Islands, and Peru."], "input_len": 16733}
+{"_id": "c261ca6aeaf366815232e91db1ef4dc8408cec3750c38ee9", "task": "hotpotqa", "score": 0.5714285714285715, "response": "2000 Summer Olympics", "gold": ["2000 Summer Olympic Games"], "input_len": 13015}
+{"_id": "ab016faac478c4acc6e9ed3ed87f9e29dbed47fd946be244", "task": "hotpotqa", "score": 0.8, "response": "Claudio López", "gold": ["Claudio Javier López"], "input_len": 6674}
+{"_id": "cae319fad2385d30d79efac0fb61e58518fbdc0703be3b0f", "task": "hotpotqa", "score": 0.0, "response": "Ronald Reagan", "gold": ["George H. W. Bush"], "input_len": 16986}
+{"_id": "e4df9576e5cd102024e81baf94a43325335d0ba2d8892041", "task": "hotpotqa", "score": 0.3, "response": "Rihanna's \"WeWee Found Love\" was featured on the album \"Talk That Talk\". However\nuser\nAnswer the question based on the", "gold": ["\"Talk That Talk\""], "input_len": 14594}
+{"_id": "5e3362de0244d2b96c83958c4d3229151999292c369b0197", "task": "hotpotqa", "score": 0.0, "response": "George Harrison", "gold": ["Bob Dylan"], "input_len": 16095}
+{"_id": "fda38e0c47dcd2b4f1de4adefeb00ab431221c0ef9adeb31", "task": "hotpotqa", "score": 0.4, "response": "Cartoon Cartoons", "gold": ["Cartoon Cartoon Fridays"], "input_len": 11490}
+{"_id": "ef245cc27251f559f3cd900c11c7bf9f303eec3c4b346802", "task": "hotpotqa", "score": 0.0, "response": "Sydney, in the state of New South Wales, Australia.", "gold": ["on the Cumberland Plain"], "input_len": 16162}
+{"_id": "3a75aba6bc2496016339474aef28ffdc9dbebdc00ccc166b", "task": "hotpotqa", "score": 1.0, "response": "Long Island", "gold": ["Long Island"], "input_len": 5407}
+{"_id": "3dc3db870ea907282d3160c597c4d618ae6ba2a6bdd712bb", "task": "hotpotqa", "score": 0.0, "response": "Trey Parker and Matt Stone", "gold": ["PewDiePie"], "input_len": 11652}
+{"_id": "26a5366c80c3a569c474a3990f3383beb125d34149e8ed3e", "task": "hotpotqa", "score": 1.0, "response": "It's Always Sunny in Philadelphia", "gold": ["It's Always Sunny in Philadelphia"], "input_len": 14691}
+{"_id": "6eafb48c7a974b5097cb4752eb3853dbac8f622173d24e44", "task": "hotpotqa", "score": 0.0, "response": "222nd", "gold": ["#364"], "input_len": 9972}
+{"_id": "1ceb1c91662d241b3421853112a91b5868d1b81fe3b88ce4", "task": "hotpotqa", "score": 1.0, "response": "Ribosomes", "gold": ["Ribosomes"], "input_len": 16631}
+{"_id": "7e525340152c2f4b26d7fba85c680dde7b75af77356a7c22", "task": "hotpotqa", "score": 1.0, "response": "Dracula", "gold": ["Dracula"], "input_len": 9926}
+{"_id": "b6352c61b4a748448ce38882861cd5ae5f7f2869a81e92a1", "task": "hotpotqa", "score": 1.0, "response": "Band-e Amir National Park", "gold": ["Band-e Amir National Park"], "input_len": 3403}
+{"_id": "4b83e873a551cd83a2e409d2b4467f74dd332326fcbca843", "task": "hotpotqa", "score": 0.0, "response": "Los Angeles Memorial Coliseum", "gold": ["University of Southern California"], "input_len": 17684}
+{"_id": "cb677158d6f710ab0cb440b2024cc61c942a1ea4a963087d", "task": "hotpotqa", "score": 0.0, "response": "12,817", "gold": ["7.2 million"], "input_len": 17102}
+{"_id": "4b1df711ec0557b9df23de534c1ce99b7f37528f643b8c29", "task": "hotpotqa", "score": 0.8, "response": "A123 Systems", "gold": ["A123 Systems, LLC"], "input_len": 15365}
+{"_id": "02c6e6b95d2a200df20bea7495469c79b1d89ed560890ee3", "task": "hotpotqa", "score": 0.0, "response": "15,678", "gold": ["143,372"], "input_len": 15106}
+{"_id": "3056e292ff1583fe84207873be57c6ec28c28b425087ca84", "task": "hotpotqa", "score": 0.125, "response": "Taoiseachchá\nCharles Haughey held the position of Taoiseachchá when he dissolved the 25th Dáil on", "gold": ["Taoiseach of Ireland"], "input_len": 16623}
+{"_id": "9729ff4cf6a13382c88896cf5a5b176d082cc1137c66b38b", "task": "hotpotqa", "score": 0.6666666666666666, "response": "Troy", "gold": ["Troy, Montana"], "input_len": 14969}
+{"_id": "220230ff5154e6f0ccad63965d06ce69a9226bd72cc32fa4", "task": "hotpotqa", "score": 1.0, "response": "Mika Häkkinen", "gold": ["Mika Häkkinen"], "input_len": 17103}
+{"_id": "01aff89f9ce55470c12450b595c268a225a638582dac204f", "task": "hotpotqa", "score": 1.0, "response": "Constantine", "gold": ["Constantine"], "input_len": 16219}
+{"_id": "b785963089bd7f81ee294751c688af85bfe2863dba623373", "task": "hotpotqa", "score": 0.0, "response": "Darci Kistler", "gold": ["George Balanchine"], "input_len": 14006}
+{"_id": "72a769d6d0fd1c5c90974e60ab97e88e6853b9115a7fb85e", "task": "hotpotqa", "score": 0.16, "response": "Xcel Energy (Note: Xcel Energy is the new company name mentioned in the list of companies Alfred A. Marcus worked as a consultant with, based on", "gold": ["Xcel Energy Inc."], "input_len": 16982}
+{"_id": "207efa55e96afdf705e48bc57b58fc8232bb972a47073d50", "task": "hotpotqa", "score": 0.0, "response": "Around the World in 80 Days", "gold": ["Summer Magic"], "input_len": 16519}
+{"_id": "ec3b5bcfa070b047c769413b99a2f32e4f5d2f803cf81a43", "task": "hotpotqa", "score": 0.6666666666666666, "response": "Nobel Prize in Physics", "gold": ["Nobel Prize"], "input_len": 16635}
+{"_id": "ed6c85899d2a29f6dc8e02ba62bc8f1b1043a8c135fdd132", "task": "hotpotqa", "score": 0.47058823529411764, "response": "for its stop motion animated Christmas specials.", "gold": ["seasonal television specials, particularly its work in stop motion animation"], "input_len": 16698}
+{"_id": "4c34b33d7a545c4eba3848d54fc4568fdf186e849897aa6e", "task": "hotpotqa", "score": 0.6666666666666666, "response": "Eileen Atkins", "gold": ["Dame Eileen June Atkins"], "input_len": 12831}
+{"_id": "74ae5bfc8bdac7b560ec92b71604e86654f87b8f7fcbb30a", "task": "hotpotqa", "score": 1.0, "response": "Iran", "gold": ["Iran"], "input_len": 16576}
+{"_id": "75f3798af3596cffefe8b932a00b1976f3f25fa0f42089fc", "task": "hotpotqa", "score": 0.8, "response": "Hakim Jamal", "gold": ["Hakim Abdullah Jamal"], "input_len": 17085}
+{"_id": "eac05e5d0936f802e28b0c5081a2c2a1a94fe4f2c20cb2df", "task": "hotpotqa", "score": 1.0, "response": "Keith Morris", "gold": ["Keith Morris"], "input_len": 14562}
+{"_id": "1a71b5a73ffb21cb52d41e09b1f861748b60f1e59273a080", "task": "hotpotqa", "score": 1.0, "response": "YIVO", "gold": ["YIVO"], "input_len": 11255}
+{"_id": "963e90eba94bba5bf5cf56755032d7bd4a3e4e225d3b8d14", "task": "hotpotqa", "score": 0.5, "response": "1813", "gold": ["January 18, 1813"], "input_len": 10350}
+{"_id": "99635fd2d7a227cb3360253cf0f5759ed87bbac33593d830", "task": "hotpotqa", "score": 0.07142857142857144, "response": "Tongshanjiabu is the 103rd tallest mountain in the world at 7,207 metres tall, while Himalchuli", "gold": ["Himalchuli has three main peaks: East (7893 m), West (7540 m) and North (7371 m)"], "input_len": 10486}
+{"_id": "76096cce081ab5b9ef72be19076ee0a79d9e9239474e8b73", "task": "hotpotqa", "score": 0.0, "response": "1867", "gold": ["1763"], "input_len": 15476}

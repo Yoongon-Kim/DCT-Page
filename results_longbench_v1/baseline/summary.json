@@ -1,0 +1,12 @@
+{
+  "mode": "baseline",
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "run_name": "baseline",
+  "task_scores": {
+    "narrativeqa": 29.18,
+    "qasper": 44.05,
+    "hotpotqa": 58.02,
+    "gov_report": 18.1
+  },
+  "overall": 37.34
+}
