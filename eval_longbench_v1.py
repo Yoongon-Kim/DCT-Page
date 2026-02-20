@@ -341,6 +341,36 @@ def tokenize_and_truncate(prompt_text, tokenizer, max_input_len):
 
 
 # ---------------------------------------------------------------------------
+# Effective KV length computation
+# ---------------------------------------------------------------------------
+def compute_effective_len(input_len, args):
+    """Compute effective KV length during decode after page selection (first decode step)."""
+    if args.mode != "page_attention":
+        return input_len
+
+    kv_len = input_len + 1  # first decode step adds one token to cache
+
+    min_len_for_paging = args.sink_size + args.page_size * (args.top_k + 1) + args.recent_size
+    if kv_len < min_len_for_paging:
+        return kv_len
+
+    pageable_len = kv_len - args.sink_size - args.recent_size
+    num_pages = pageable_len // args.page_size
+    leftover = pageable_len % args.page_size
+    actual_recent = args.recent_size + leftover
+    top_k = min(args.top_k, num_pages)
+
+    if args.unselected_mode == "drop":
+        return args.sink_size + top_k * args.page_size + actual_recent
+    elif args.unselected_mode == "compressed":
+        comp_size = max(1, int(args.page_size * args.compress_ratio))
+        num_unselected = num_pages - top_k
+        return args.sink_size + top_k * args.page_size + num_unselected * comp_size + actual_recent
+    else:
+        return kv_len
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def parse_args():
@@ -382,6 +412,8 @@ def parse_args():
                         help="How to aggregate per-head scores within a GQA group")
     parser.add_argument("--unselected_mode", type=str, default="drop",
                         choices=["drop", "compressed"])
+    parser.add_argument("--continuous_rope", action="store_true",
+                        help="Store KV before RoPE, apply continuous RoPE after assembly")
 
     args = parser.parse_args()
 
@@ -457,6 +489,7 @@ def evaluate_task(model, tokenizer, task, dataset, args):
             "response": response,
             "gold": item["answers"],
             "input_len": input_len,
+            "effective_len": compute_effective_len(input_len, args),
         }
         out_f.write(json.dumps(result, ensure_ascii=False) + "\n")
         out_f.flush()
@@ -525,17 +558,33 @@ def main():
 
     # Conditionally apply monkey-patch (before model loading)
     if args.mode == "page_attention":
-        from dct_page_attention import replace_qwen2_attn
-        replace_qwen2_attn(
-            page_size=args.page_size,
-            top_k=args.top_k,
-            sink_size=args.sink_size,
-            recent_size=args.recent_size,
-            compress_ratio=args.compress_ratio,
-            scoring_method=args.scoring_method,
-            group_agg_method=args.group_agg_method,
-            unselected_mode=args.unselected_mode,
-        )
+        model_name_lower = args.base_model.lower()
+        if "llama" in model_name_lower:
+            from dct_page_attention import replace_llama_attn
+            replace_llama_attn(
+                page_size=args.page_size,
+                top_k=args.top_k,
+                sink_size=args.sink_size,
+                recent_size=args.recent_size,
+                compress_ratio=args.compress_ratio,
+                scoring_method=args.scoring_method,
+                group_agg_method=args.group_agg_method,
+                unselected_mode=args.unselected_mode,
+                continuous_rope=args.continuous_rope,
+            )
+        else:
+            from dct_page_attention import replace_qwen2_attn
+            replace_qwen2_attn(
+                page_size=args.page_size,
+                top_k=args.top_k,
+                sink_size=args.sink_size,
+                recent_size=args.recent_size,
+                compress_ratio=args.compress_ratio,
+                scoring_method=args.scoring_method,
+                group_agg_method=args.group_agg_method,
+                unselected_mode=args.unselected_mode,
+                continuous_rope=args.continuous_rope,
+            )
     else:
         print("Baseline mode: full attention (no monkey-patch)")
 

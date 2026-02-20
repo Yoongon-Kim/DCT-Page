@@ -1,0 +1,19 @@
+{
+  "mode": "page_attention",
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "run_name": "llama_page_attn_0.03_topk32_mean_max_drop_continuous_rope",
+  "task_scores": {
+    "narrativeqa": 28.74,
+    "qasper": 34.9,
+    "gov_report": 17.96,
+    "2wikimqa": 43.53,
+    "multifieldqa_en": 52.11,
+    "triviaqa": 88.1
+  },
+  "overall": 44.22,
+  "top_k": 32,
+  "page_size": 128,
+  "scoring_method": "mean",
+  "group_agg_method": "max",
+  "unselected_mode": "drop"
+}

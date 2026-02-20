@@ -5,7 +5,7 @@
 set -e
 
 # ---- Configuration ----
-BASE_MODEL="${BASE_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
+BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-120000}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
 OUTPUT_DIR="${OUTPUT_DIR:-results_longbench_v1}"
@@ -39,32 +39,37 @@ python eval_longbench_v1.py \
     --max_input_len "$MAX_INPUT_LEN" \
     --num_samples "$NUM_SAMPLES" \
     --output_dir "$OUTPUT_DIR" \
-    --run_name baseline \
+    --run_name llama_baseline \
     $TASK_ARGS
 
-# ---- Step 2: Sweep top_k x group_agg_method (page attention, drop mode) ----
-for TOP_K in 8; do #4 8 16 32; do
-    for GAM in mean max topp; do
-        echo ""
-        echo "============================================================"
-        echo "PAGE ATTENTION (drop): top_k=${TOP_K}, group_agg=${GAM}"
-        echo "============================================================"
-        python eval_longbench_v1.py \
-            --mode page_attention \
-            --base_model "$BASE_MODEL" \
-            --max_input_len "$MAX_INPUT_LEN" \
-            --num_samples "$NUM_SAMPLES" \
-            --output_dir "$OUTPUT_DIR" \
-            --run_name "page_attn_topk${TOP_K}_${GAM}" \
-            --page_size "$PAGE_SIZE" \
-            --top_k "$TOP_K" \
-            --sink_size "$SINK_SIZE" \
-            --recent_size "$RECENT_SIZE" \
-            --compress_ratio "$COMPRESS_RATIO" \
-            --scoring_method "$SCORING_METHOD" \
-            --group_agg_method "$GAM" \
-            --unselected_mode drop \
-            $TASK_ARGS
+# ---- Step 2: Sweep top_k x scoring_method x group_agg_method x mode ----
+for TOP_K in 32 8; do #4 8 16 32; do
+    for SCORING_METHOD in mean max; do
+        for GAM in max mean topp; do
+            for MODE in drop compressed; do
+                echo ""
+                echo "===================================================================="
+                echo "PAGE ATTENTION: top_k=${TOP_K}, scoring_method=${SCORING_METHOD}, group_agg=${GAM}, mode=${MODE}"
+                echo "===================================================================="
+                python eval_longbench_v1.py \
+                    --mode page_attention \
+                    --base_model "$BASE_MODEL" \
+                    --max_input_len "$MAX_INPUT_LEN" \
+                    --num_samples "$NUM_SAMPLES" \
+                    --output_dir "$OUTPUT_DIR" \
+                    --run_name "llama_page_attn_${COMPRESS_RATIO}_topk${TOP_K}_${SCORING_METHOD}_${GAM}_${MODE}_continuous_rope" \
+                    --page_size "$PAGE_SIZE" \
+                    --top_k "$TOP_K" \
+                    --sink_size "$SINK_SIZE" \
+                    --recent_size "$RECENT_SIZE" \
+                    --compress_ratio "$COMPRESS_RATIO" \
+                    --scoring_method "$SCORING_METHOD" \
+                    --group_agg_method "$GAM" \
+                    --unselected_mode "$MODE" \
+                    --continuous_rope \
+                    $TASK_ARGS
+            done
+        done
     done
 done
 

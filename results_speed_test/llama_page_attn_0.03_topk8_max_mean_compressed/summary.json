@@ -1,0 +1,44 @@
+{
+  "label": "dct",
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "overall_decode_tok_per_s": 30.73,
+  "overall_avg_decode_ms_per_tok": 32.536,
+  "per_task": {
+    "narrativeqa": {
+      "n_samples": 20,
+      "avg_prefill_ms": 2831.95,
+      "avg_decode_ms_per_tok": 32.675,
+      "decode_tok_per_s": 30.6,
+      "total_decode_steps": 117
+    },
+    "qasper": {
+      "n_samples": 20,
+      "avg_prefill_ms": 624.31,
+      "avg_decode_ms_per_tok": 32.714,
+      "decode_tok_per_s": 30.57,
+      "total_decode_steps": 391
+    },
+    "multifieldqa_en": {
+      "n_samples": 20,
+      "avg_prefill_ms": 817.13,
+      "avg_decode_ms_per_tok": 32.39,
+      "decode_tok_per_s": 30.87,
+      "total_decode_steps": 315
+    },
+    "gov_report": {
+      "n_samples": 20,
+      "avg_prefill_ms": 1096.35,
+      "avg_decode_ms_per_tok": 32.367,
+      "decode_tok_per_s": 30.9,
+      "total_decode_steps": 9227
+    }
+  },
+  "page_size": 128,
+  "top_k": 8,
+  "sink_size": 4,
+  "recent_size": 128,
+  "compress_ratio": 0.03,
+  "scoring_method": "max",
+  "unselected_mode": "compressed",
+  "selection_mode": "standard"
+}

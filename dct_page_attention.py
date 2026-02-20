@@ -253,6 +253,116 @@ def build_pages_and_compress(key_states, value_states, cfg):
 
 
 # ---------------------------------------------------------------------------
+# KV segmentation without DCT (for incremental compression)
+# ---------------------------------------------------------------------------
+def segment_kv(key_states, value_states, cfg):
+    """
+    Divide KV cache into sink / pages / recent WITHOUT running DCT.
+
+    Identical layout to build_pages_and_compress but skips compression.
+    Used together with _update_comp_cache so DCT is only run once per page.
+
+    Returns:
+        sink_k, sink_v, paged_k, paged_v, recent_k, recent_v, num_pages, actual_recent
+    """
+    bsz, num_kv_heads, kv_len, head_dim = key_states.shape
+
+    pageable_len = kv_len - cfg.sink_size - cfg.recent_size
+    num_pages = pageable_len // cfg.page_size
+    leftover = pageable_len % cfg.page_size
+    actual_recent = cfg.recent_size + leftover
+
+    sink_k = key_states[:, :, :cfg.sink_size]
+    sink_v = value_states[:, :, :cfg.sink_size]
+
+    pages_end = cfg.sink_size + num_pages * cfg.page_size
+    paged_k = key_states[:, :, cfg.sink_size:pages_end].view(
+        bsz, num_kv_heads, num_pages, cfg.page_size, head_dim
+    )
+    paged_v = value_states[:, :, cfg.sink_size:pages_end].view(
+        bsz, num_kv_heads, num_pages, cfg.page_size, head_dim
+    )
+
+    recent_k = key_states[:, :, pages_end:]
+    recent_v = value_states[:, :, pages_end:]
+
+    return sink_k, sink_v, paged_k, paged_v, recent_k, recent_v, num_pages, actual_recent
+
+
+# ---------------------------------------------------------------------------
+# Incremental compressed page cache
+# ---------------------------------------------------------------------------
+def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size):
+    """
+    Incrementally maintain DCT-compressed page representations on the
+    attention module instance.
+
+    A page is finalized (its tokens will never change) as soon as it becomes
+    part of paged_k.  We compress it once and store it.  On the next decode
+    step only the single newly-finalized page (if any) is compressed and
+    appended; all previously cached pages are reused without any FFT work.
+
+    Cache reset: if num_pages drops below the cached count (new sequence) or
+    the batch size / comp_size changes, the cache is wiped and rebuilt.
+
+    Args:
+        attn_module : the Attention instance (cache lives here as attributes)
+        paged_k     : [bsz, num_kv_heads, num_pages, page_size, head_dim]
+        paged_v     : [bsz, num_kv_heads, num_pages, page_size, head_dim]
+        num_pages   : int — total finalized pages in current KV cache
+        comp_size   : int — DCT output length per page
+
+    Returns:
+        comp_k : [bsz, num_kv_heads, num_pages, comp_size, head_dim]
+        comp_v : [bsz, num_kv_heads, num_pages, comp_size, head_dim]
+    """
+    bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
+
+    cached_k = getattr(attn_module, '_dct_comp_k_cache', None)
+    n_cached  = getattr(attn_module, '_dct_n_pages_cached', 0)
+
+    # Invalidate cache when the sequence restarts or config changed
+    if (cached_k is None
+            or num_pages < n_cached
+            or cached_k.shape[0] != bsz
+            or cached_k.shape[3] != comp_size):
+        attn_module._dct_comp_k_cache  = None
+        attn_module._dct_comp_v_cache  = None
+        attn_module._dct_n_pages_cached = 0
+        n_cached = 0
+
+    n_new = num_pages - n_cached
+    if n_new > 0:
+        # Compress only the newly finalized pages
+        new_k = paged_k[:, :, n_cached:num_pages]  # [bsz, num_kv_heads, n_new, page_size, head_dim]
+        new_v = paged_v[:, :, n_cached:num_pages]
+
+        flat_k = new_k.reshape(bsz * num_kv_heads * n_new, 1, page_size, head_dim)
+        flat_v = new_v.reshape(bsz * num_kv_heads * n_new, 1, page_size, head_dim)
+
+        new_comp_k = dct_compress_page(flat_k, comp_size)
+        new_comp_v = dct_compress_page(flat_v, comp_size)
+
+        new_comp_k = new_comp_k.view(bsz, num_kv_heads, n_new, comp_size, head_dim)
+        new_comp_v = new_comp_v.view(bsz, num_kv_heads, n_new, comp_size, head_dim)
+
+        if attn_module._dct_comp_k_cache is None:
+            attn_module._dct_comp_k_cache = new_comp_k
+            attn_module._dct_comp_v_cache = new_comp_v
+        else:
+            attn_module._dct_comp_k_cache = torch.cat(
+                [attn_module._dct_comp_k_cache, new_comp_k], dim=2
+            )
+            attn_module._dct_comp_v_cache = torch.cat(
+                [attn_module._dct_comp_v_cache, new_comp_v], dim=2
+            )
+
+        attn_module._dct_n_pages_cached = num_pages
+
+    return attn_module._dct_comp_k_cache, attn_module._dct_comp_v_cache
+
+
+# ---------------------------------------------------------------------------
 # Page scoring
 # ---------------------------------------------------------------------------
 def score_pages(query_states, compressed_keys, cfg, num_kv_groups):
@@ -647,15 +757,15 @@ def dct_page_attention_forward(
         key_states = key_cached
         value_states = value_cached
 
-    # Pre-compute num_pages to check if page selection is needed
-    pageable_len = kv_len - cfg.sink_size - cfg.recent_size
-    num_pages = pageable_len // cfg.page_size
-
-    # Step 5: Build pages and compress
-    (sink_k, sink_v, paged_k, paged_v, comp_k, comp_v,
-        recent_k, recent_v, num_pages, actual_recent) = build_pages_and_compress(
+    # Step 5: Segment KV cache and update the incremental compressed page cache.
+    # DCT is computed only for pages that are newly finalized since the last
+    # decode step; all previously cached compressed representations are reused.
+    comp_size = max(1, int(cfg.page_size * cfg.compress_ratio))
+    (sink_k, sink_v, paged_k, paged_v,
+        recent_k, recent_v, num_pages, actual_recent) = segment_kv(
         key_states, value_states, cfg
     )
+    comp_k, comp_v = _update_comp_cache(self, paged_k, paged_v, num_pages, comp_size)
 
     # Step 6: Score pages and select top-k
     if cfg.selection_mode == "hierarchical":

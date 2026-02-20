@@ -33,7 +33,7 @@ python eval_longbench.py \
     --run_name llama_baseline
 
 # ---- Step 2: Sweep top_k x group_agg_method (page attention, drop mode) ----
-for TOP_K in 32; do # 4 8 16 32; do
+for TOP_K in 32 8; do # 4 8 16 32; do
     for SCORING_METHOD in mean max; do
         for GAM in max mean topp; do
             for MODE in drop compressed; do

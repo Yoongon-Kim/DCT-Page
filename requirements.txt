@@ -3,3 +3,4 @@ transformers>=4.45.0
 datasets>=2.14.0
 numpy
 tqdm
+accelerate
