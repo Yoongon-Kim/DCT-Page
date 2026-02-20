@@ -82,7 +82,7 @@ def parse_args():
                    help="Override per-task decode budget (None = use official limits)")
     p.add_argument("--max_input_len", type=int, default=120000,
                    help="Truncate inputs longer than this (tokens)")
-    p.add_argument("--min_context_len", type=int, default=4356,
+    p.add_argument("--min_context_len", type=int, default=32000,
                    help="Skip samples shorter than this (default: auto from DCT config)")
     p.add_argument("--warmup_steps", type=int, default=3,
                    help="Decode steps to discard at the start of each sample")
