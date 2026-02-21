@@ -1,7 +1,0 @@
-{"_id": "41ac2a4beb0af8f58d01863a62b90692f7c7d74b5e3a58d9", "task": "2wikimqa", "score": 0.0, "response": "Gyulafehérvár, Transylvania", "gold": ["Ozalj"], "input_len": 7408}
-{"_id": "3924e4ac5039ce3fadda49604bfcb0f5238af81774616e53", "task": "2wikimqa", "score": 0.0, "response": "Elizabeth", "gold": ["John the Baptist"], "input_len": 7153}
-{"_id": "2c952e3e1ca394df975103b3135b3c38e0ee16e25d860258", "task": "2wikimqa", "score": 0.0, "response": "Christophe Honoré", "gold": ["Cahiers du cinéma"], "input_len": 6848}
-{"_id": "aec83da1f2faf6ec8badfd53d632f525c9ef2090d99d1c6c", "task": "2wikimqa", "score": 1.0, "response": "No", "gold": ["no"], "input_len": 11638}
-{"_id": "4b28d517ce1c1e3cfec9282ca7b212c1cb87c254781d7c86", "task": "2wikimqa", "score": 0.0, "response": "c. 1532", "gold": ["1510"], "input_len": 7785}
-{"_id": "81cd47ec621f2228d8bb4ec351ffd6b23d23107e5b287ffb", "task": "2wikimqa", "score": 0.25, "response": "Lewis Watson, 1st Earl of Rockingham", "gold": ["Edward Watson"], "input_len": 7877}
-{"_id": "048e82b64b5651b74d452db7151c2110a718128dfd12a774", "task": "2wikimqa", "score": 0.0, "response": "1275", "gold": ["16 September 1360"], "input_len": 7792}

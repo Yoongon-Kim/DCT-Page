@@ -1,7 +1,0 @@
-{
-  "mode": "baseline",
-  "model": "Qwen/Qwen2.5-7B-Instruct",
-  "run_name": "baseline",
-  "num_samples": 503,
-  "overall_accuracy": 26.04
-}
