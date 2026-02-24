@@ -4,7 +4,7 @@ set -e
 
 # ---- Configuration ----
 MODEL="${MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
-CONTEXT_LENGTHS="${CONTEXT_LENGTHS:-4096,8192,16384,32768,65536}"
+CONTEXT_LENGTHS="${CONTEXT_LENGTHS:-65536}" #4096,8192,16384,32768,65536,120000}"
 NUM_REPEATS="${NUM_REPEATS:-3}"
 OUTPUT_DIR="${OUTPUT_DIR:-results_speed_test_dummy}"
 
@@ -28,26 +28,32 @@ python speed_test_dummy.py \
 
 # ---- Step 2: DCT configurations ----
 for COMPRESS_RATIO in 0.03; do
-    for TOP_K in 8 32; do
-        for SCORING in max; do
-            for GAM in mean; do
+    for TOP_K in 8; do
+        for SCORING in mean; do
+            for GAM in max; do
                 for UMODE in drop compressed; do
-                    echo ""
-                    echo "============================================================"
-                    echo "DCT: compress=${COMPRESS_RATIO} top_k=${TOP_K} scoring=${SCORING} gam=${GAM} unselected=${UMODE}"
-                    echo "============================================================"
-                    python speed_test_dummy.py \
-                        --mode dct \
-                        $COMMON_ARGS \
-                        --page_size        $PAGE_SIZE \
-                        --sink_size        $SINK_SIZE \
-                        --recent_size      $RECENT_SIZE \
-                        --compress_ratio   $COMPRESS_RATIO \
-                        --top_k            $TOP_K \
-                        --scoring_method   $SCORING \
-                        --group_agg_method $GAM \
-                        --unselected_mode  $UMODE \
-                        --continuous_rope
+                    for CROPE in continuous non_continuous; do
+                        ROPE_FLAG=""
+                        if [ "$CROPE" = "continuous" ]; then
+                            ROPE_FLAG="--continuous_rope"
+                        fi
+                        echo ""
+                        echo "============================================================"
+                        echo "DCT: compress=${COMPRESS_RATIO} top_k=${TOP_K} scoring=${SCORING} gam=${GAM} unselected=${UMODE} rope=${CROPE}"
+                        echo "============================================================"
+                        python speed_test_dummy.py \
+                            --mode dct \
+                            $COMMON_ARGS \
+                            --page_size        $PAGE_SIZE \
+                            --sink_size        $SINK_SIZE \
+                            --recent_size      $RECENT_SIZE \
+                            --compress_ratio   $COMPRESS_RATIO \
+                            --top_k            $TOP_K \
+                            --scoring_method   $SCORING \
+                            --group_agg_method $GAM \
+                            --unselected_mode  $UMODE \
+                            $ROPE_FLAG
+                    done
                 done
             done
         done

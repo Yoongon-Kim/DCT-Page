@@ -691,7 +691,7 @@ def dct_page_attention_forward(
 
     if cfg.continuous_rope:
         # Compute RoPE'd Q/K for prefill/short-seq attention only
-        query_rope, key_rope = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_rope, key_rope = apply_rotary_pos_emb(query_states, key_states, cos, sin) # In decoding stage, this is only for short kv_len fallback
         # Cache stores pre-RoPE K/V (continuous RoPE applied after assembly during decode)
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -794,30 +794,39 @@ def dct_page_attention_forward(
     # Step 7.5: Apply continuous RoPE (continuous_rope mode)
     if cfg.continuous_rope:
         assembled_len = final_k.shape[2]
-        k_pos = torch.arange(assembled_len, device=final_k.device)
-        q_pos = torch.tensor([assembled_len - 1], device=final_k.device)
-        cos_k, sin_k = _compute_rope_cos_sin(
-            k_pos, self.head_dim, self.config.rope_parameters['rope_theta'],
-            final_k.device, final_k.dtype
-        )
-        cos_q, sin_q = _compute_rope_cos_sin(
-            q_pos, self.head_dim, self.config.rope_parameters['rope_theta'],
-            final_k.device, final_k.dtype
-        )
+
+        # Cache RoPE cos/sin table on the module to avoid recomputing
+        # trig every decode step.  In drop mode the assembled length is
+        # nearly constant (grows by 1 per step, resets at page boundaries),
+        # so a single cached table (with headroom) covers all steps.
+        cached_len = getattr(self, '_rope_cache_len', 0)
+        if assembled_len > cached_len:
+            max_len = assembled_len + cfg.page_size
+            positions = torch.arange(max_len, device=final_k.device)
+            cos_cached, sin_cached = _compute_rope_cos_sin(
+                positions, self.head_dim,
+                self.config.rope_parameters['rope_theta'],
+                final_k.device, final_k.dtype,
+            )
+            self._rope_cos_cache = cos_cached
+            self._rope_sin_cache = sin_cached
+            self._rope_cache_len = max_len
+
+        cos_k = self._rope_cos_cache[:, :, :assembled_len]
+        sin_k = self._rope_sin_cache[:, :, :assembled_len]
+        cos_q = self._rope_cos_cache[:, :, assembled_len - 1:assembled_len]
+        sin_q = self._rope_sin_cache[:, :, assembled_len - 1:assembled_len]
         final_k = _apply_rope(final_k, cos_k, sin_k)
         query_states = _apply_rope(query_states, cos_q, sin_q)
 
     # Step 8: Compute attention (no causal mask needed for q_len=1)
-    final_k_expanded = repeat_kv(final_k, self.num_key_value_groups)
-    final_v_expanded = repeat_kv(final_v, self.num_key_value_groups)
-
-    attn_weights = torch.matmul(
-        query_states, final_k_expanded.transpose(2, 3)
-    ) * self.scaling
-    attn_weights = nn.functional.softmax(
-        attn_weights, dim=-1, dtype=torch.float32
-    ).to(query_states.dtype)
-    attn_output = torch.matmul(attn_weights, final_v_expanded)
+    # Use SDPA with GQA support — fuses scale/softmax/matmul into one kernel
+    # and avoids repeat_kv memory expansion.
+    attn_output = F.scaled_dot_product_attention(
+        query_states, final_k, final_v,
+        is_causal=False,
+        enable_gqa=True,
+    )
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     # Step 9: Output projection

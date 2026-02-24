@@ -87,8 +87,8 @@ def parse_args():
                    help="Comma-separated context lengths to benchmark")
     p.add_argument("--num_repeats", type=int, default=3,
                    help="Repeats per context length for averaging")
-    p.add_argument("--max_new_tokens", type=int, default=128)
-    p.add_argument("--warmup_steps", type=int, default=3)
+    p.add_argument("--max_new_tokens", type=int, default=32)
+    p.add_argument("--warmup_steps", type=int, default=8)
     p.add_argument("--output_dir", default="results_speed_test_dummy")
     p.add_argument("--run_name", default=None)
 
@@ -117,6 +117,7 @@ def make_run_name(label, args):
     family = model_family(args.model)
     if label == "baseline":
         return f"{family}_baseline_dummy"
+    rope_tag = "crope" if args.continuous_rope else "nocrope"
     parts = [
         family, "page_attn_dummy",
         str(args.compress_ratio),
@@ -124,6 +125,7 @@ def make_run_name(label, args):
         args.scoring_method,
         args.group_agg_method,
         args.unselected_mode,
+        rope_tag,
     ]
     return "_".join(parts)
 
