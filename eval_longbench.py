@@ -87,6 +87,8 @@ def parse_args():
                         choices=["drop", "compressed"])
     parser.add_argument("--continuous_rope", action="store_true",
                         help="Store KV before RoPE, apply continuous RoPE after assembly")
+    parser.add_argument("--no_triton", action="store_true",
+                        help="Disable Triton kernels (use pure PyTorch for comparison)")
 
     args = parser.parse_args()
 
@@ -328,6 +330,7 @@ def main():
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
                 continuous_rope=args.continuous_rope,
+                use_triton=not args.no_triton,
             )
         else:
             from dct_page_attention import replace_qwen2_attn
@@ -341,6 +344,7 @@ def main():
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
                 continuous_rope=args.continuous_rope,
+                use_triton=not args.no_triton,
             )
     elif args.mode == "rope_gap":
         from rope_gap_attention import replace_qwen2_with_rope_gaps

@@ -60,6 +60,8 @@ def parse_args():
     dct.add_argument("--selection_mode", default="standard",
                      choices=["standard", "hierarchical"])
     dct.add_argument("--continuous_rope", action="store_true")
+    dct.add_argument("--no_triton", action="store_true",
+                     help="Disable Triton kernels (use pure PyTorch for comparison)")
 
     return p.parse_args()
 
@@ -152,6 +154,7 @@ def apply_dct_patch(args, model=None):
         unselected_mode=args.unselected_mode,
         selection_mode=args.selection_mode,
         continuous_rope=args.continuous_rope,
+        use_triton=not getattr(args, 'no_triton', False),
     )
     if "llama" in args.model.lower():
         import types

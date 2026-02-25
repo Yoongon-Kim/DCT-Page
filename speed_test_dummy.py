@@ -106,6 +106,8 @@ def parse_args():
     dct.add_argument("--selection_mode", default="standard",
                      choices=["standard", "hierarchical"])
     dct.add_argument("--continuous_rope", action="store_true")
+    dct.add_argument("--no_triton", action="store_true",
+                     help="Disable Triton kernels (use pure PyTorch for comparison)")
 
     return p.parse_args()
 
@@ -118,6 +120,7 @@ def make_run_name(label, args):
     if label == "baseline":
         return f"{family}_baseline_dummy"
     rope_tag = "crope" if args.continuous_rope else "nocrope"
+    triton_tag = "notriton" if getattr(args, 'no_triton', False) else "triton"
     parts = [
         family, "page_attn_dummy",
         str(args.compress_ratio),
@@ -126,6 +129,7 @@ def make_run_name(label, args):
         args.group_agg_method,
         args.unselected_mode,
         rope_tag,
+        triton_tag,
     ]
     return "_".join(parts)
 

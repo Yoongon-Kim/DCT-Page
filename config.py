@@ -13,3 +13,4 @@ class DCTPageConfig:
     unselected_mode: str = "drop"  # "drop" | "compressed"
     selection_mode: str = "standard"  # "standard" | "hierarchical"
     continuous_rope: bool = False      # Store KV before RoPE, apply continuous RoPE after assembly
+    use_triton: bool = True            # Use fused Triton kernels (False = pure PyTorch, for comparison)

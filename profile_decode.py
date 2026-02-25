@@ -4,6 +4,10 @@ Profile DCT Page Attention decode path: break down time per operation.
 Instruments the dct_page_attention_forward to measure GPU time for each step
 in the decode path using CUDA events. Reports per-layer and aggregated timing.
 
+Uses chained CUDA events (end of step N = start of step N+1) so the total
+attention time equals exactly the sum of individual steps — zero unaccounted
+overhead.
+
 Usage:
     CUDA_VISIBLE_DEVICES=0,1 python profile_decode.py --context_length 65536
     CUDA_VISIBLE_DEVICES=0,1 python profile_decode.py --context_length 32768 --top_k 32
@@ -49,12 +53,6 @@ _enabled = False
 _current_layer = 0
 
 
-def _record(name, start_event, end_event):
-    """Record end event and defer elapsed-time computation (no sync)."""
-    end_event.record()
-    _pending_events.append((name, start_event, end_event))
-
-
 def _flush_events():
     """Sync once, then compute all deferred elapsed times."""
     torch.cuda.synchronize()
@@ -75,28 +73,31 @@ def profiled_dct_page_attention_forward(
     cache_position=None,
     **kwargs,
 ):
-    """Instrumented version of dct_page_attention_forward for profiling."""
+    """Instrumented version of dct_page_attention_forward for profiling.
+
+    Uses 8 chained CUDA events so that total attention = sum of steps 1-8
+    with zero gaps.
+    """
     global _current_layer
 
     from dct_page_attention import _dct_page_cfg as cfg
     from typing import Callable
 
-    input_shape = hidden_states.shape[:-1] # (bsz, q_len)
-    hidden_shape = (*input_shape, -1, self.head_dim) # (bsz, q_len, num_heads, head_dim)
+    input_shape = hidden_states.shape[:-1]  # (bsz, q_len)
+    hidden_shape = (*input_shape, -1, self.head_dim)  # (bsz, q_len, num_heads, head_dim)
     bsz, q_len = input_shape
 
     if q_len > 1:
         # Prefill path — always use standard attention (no profiling)
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2) # (bsz, num_heads, q_len, head_dim)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2) # (bsz, num_kv_heads, q_len, head_dim): num_kv_heads for gqa
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2) # (bsz, num_kv_heads, q_len, head_dim): num_kv_heads for gqa
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         if cfg.continuous_rope:
-            # Compute RoPE'd Q/K for prefill/short-seq attention only
             query_rope, key_rope = apply_rotary_pos_emb(query_states, key_states, cos, sin)
             if past_key_values is not None:
-                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position} # Q. Why do we need sin, cos, and cache_position? We will eventually change them in the end! A. on line 151 
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
                 key_cached, value_cached = past_key_values.update(
                     key_states, value_states, self.layer_idx, cache_kwargs
                 )
@@ -104,7 +105,6 @@ def profiled_dct_page_attention_forward(
                 key_cached, value_cached = key_states, value_states
             attn_q, attn_k, attn_v = query_rope, key_rope, value_states
         else:
-            # Standard: apply RoPE then cache
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
             if past_key_values is not None:
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -123,33 +123,26 @@ def profiled_dct_page_attention_forward(
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
-    # ---- DECODE PATH (q_len == 1) — always runs DCT, records events only when _enabled ----
-    device = hidden_states.device
+    # ---- DECODE PATH (q_len == 1) ----
+    # Chained CUDA events: ev[i] is the boundary between step i and step i+1.
+    # Total attention = ev[0] → ev[8] = sum of steps 1-8 by construction.
+    if _enabled:
+        ev = [torch.cuda.Event(enable_timing=True) for _ in range(9)]
+        ev[0].record()
 
     # Step 1: QKV projection
-    if _enabled:
-        s1 = torch.cuda.Event(enable_timing=True) # Create a start marker
-        e1 = torch.cuda.Event(enable_timing=True) # Create an end marker
-        s1.record() # Drop start marker into the GPU command stream
-
-    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2) # These are for the last generated token
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     if _enabled:
-        _record("1_qkv_proj", s1, e1) # Drop end marker(e1) into the GPU stream
+        ev[1].record()
 
     # Step 2: RoPE + KV cache update
-    if _enabled:
-        s2 = torch.cuda.Event(enable_timing=True)
-        e2 = torch.cuda.Event(enable_timing=True)
-        s2.record()
-
     cos, sin = position_embeddings
     if cfg.continuous_rope:
-        # query_rope, key_rope = apply_rotary_pos_emb(query_states, key_states, cos, sin) # this is only for short kv_len fallback
         if past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position} # cache_position: tells the cache where to store the new token / sin, cos: not neede for this cache type, but required by the API contract
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_cached, value_cached = past_key_values.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
@@ -166,7 +159,7 @@ def profiled_dct_page_attention_forward(
         kv_len = key_states.shape[2]
 
     if _enabled:
-        _record("2_rope_cache", s2, e2)
+        ev[2].record()
 
     # Check if DCT path is active
     min_len_for_paging = cfg.sink_size + cfg.page_size * (cfg.top_k + 1) + cfg.recent_size
@@ -199,12 +192,7 @@ def profiled_dct_page_attention_forward(
         key_states = key_cached
         value_states = value_cached
 
-    # Step 5: Segment KV
-    if _enabled:
-        s5 = torch.cuda.Event(enable_timing=True)
-        e5 = torch.cuda.Event(enable_timing=True)
-        s5.record()
-
+    # Step 3: Segment KV
     comp_size = max(1, int(cfg.page_size * cfg.compress_ratio))
     (sink_k, sink_v, paged_k, paged_v,
      recent_k, recent_v, num_pages, actual_recent) = segment_kv(
@@ -212,62 +200,36 @@ def profiled_dct_page_attention_forward(
     )
 
     if _enabled:
-        _record("5_segment_kv", s5, e5)
+        ev[3].record()
 
-    # Step 5b: Update compressed cache
-    if _enabled:
-        s5b = torch.cuda.Event(enable_timing=True)
-        e5b = torch.cuda.Event(enable_timing=True)
-        s5b.record()
-
+    # Step 4: DCT compression
     comp_k, comp_v = _update_comp_cache(self, paged_k, paged_v, num_pages, comp_size)
 
     if _enabled:
-        _record("5b_update_comp_cache", s5b, e5b)
+        ev[4].record()
 
-    # Step 6: Score pages
-    if _enabled:
-        s6 = torch.cuda.Event(enable_timing=True)
-        e6 = torch.cuda.Event(enable_timing=True)
-        s6.record()
-
+    # Step 5: Score pages
     selected_indices, _page_scores = score_pages(
         query_states, comp_k, cfg, self.num_key_value_groups
     )
 
     if _enabled:
-        _record("6_score_pages", s6, e6)
+        ev[5].record()
 
-    # Step 7: Assemble KV
-    if _enabled:
-        s7 = torch.cuda.Event(enable_timing=True)
-        e7 = torch.cuda.Event(enable_timing=True)
-        s7.record()
-
+    # Step 6: Assemble KV
     final_k, final_v = assemble_kv(
         sink_k, sink_v, paged_k, paged_v, comp_k, comp_v,
         recent_k, recent_v, selected_indices, cfg, num_pages
     )
 
     if _enabled:
-        _record("7_assemble_kv", s7, e7)
+        ev[6].record()
 
-    # Step 7.5: Continuous RoPE (apply RoPE to assembled K and Q)
+    # Step 7: Continuous RoPE
     if cfg.continuous_rope:
-        if _enabled:
-            s75 = torch.cuda.Event(enable_timing=True)
-            e75 = torch.cuda.Event(enable_timing=True)
-            s75.record()
-
         assembled_len = final_k.shape[2]
-
-        # Cache RoPE cos/sin table on the module to avoid recomputing
-        # trig every decode step.  In drop mode the assembled length is
-        # nearly constant (grows by 1 per step, resets at page boundaries),
-        # so a single cached table (with headroom) covers all steps.
         cached_len = getattr(self, '_rope_cache_len', 0)
         if assembled_len > cached_len:
-            # (Re)compute with headroom so we don't recompute every step
             max_len = assembled_len + cfg.page_size
             positions = torch.arange(max_len, device=final_k.device)
             cos_cached, sin_cached = _compute_rope_cos_sin(
@@ -279,7 +241,6 @@ def profiled_dct_page_attention_forward(
             self._rope_sin_cache = sin_cached
             self._rope_cache_len = max_len
 
-        # Slice from cache (just views, zero kernels)
         cos_k = self._rope_cos_cache[:, :, :assembled_len]
         sin_k = self._rope_sin_cache[:, :, :assembled_len]
         cos_q = self._rope_cos_cache[:, :, assembled_len - 1:assembled_len]
@@ -287,36 +248,28 @@ def profiled_dct_page_attention_forward(
         final_k = _apply_rope(final_k, cos_k, sin_k)
         query_states = _apply_rope(query_states, cos_q, sin_q)
 
-        if _enabled:
-            _record("7.5_continuous_rope", s75, e75)
-
-    # Step 8: Attention (SDPA with GQA — fused, no repeat_kv needed)
     if _enabled:
-        s8 = torch.cuda.Event(enable_timing=True)
-        e8 = torch.cuda.Event(enable_timing=True)
-        s8.record()
+        ev[7].record()
 
+    # Step 8: Attention + output projection
     attn_output = F.scaled_dot_product_attention(
         query_states, final_k, final_v,
         is_causal=False,
         enable_gqa=True,
     )
     attn_output = attn_output.transpose(1, 2).contiguous()
-
-    if _enabled:
-        _record("8_attention", s8, e8)
-
-    # Step 9: Output projection
-    if _enabled:
-        s9 = torch.cuda.Event(enable_timing=True)
-        e9 = torch.cuda.Event(enable_timing=True)
-        s9.record()
-
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)
 
     if _enabled:
-        _record("9_o_proj", s9, e9)
+        ev[8].record()
+        step_names = [
+            "1_qkv_proj", "2_rope_cache", "3_segment_kv",
+            "4_dct_compress", "5_score_pages", "6_assemble_kv",
+            "7_continuous_rope", "8_attn_output",
+        ]
+        for i, name in enumerate(step_names):
+            _pending_events.append((name, ev[i], ev[i + 1]))
 
     _current_layer += 1
     return attn_output, None
@@ -334,7 +287,11 @@ def profiled_baseline_forward(
     cache_position=None,
     **kwargs,
 ):
-    """Instrumented baseline (standard) attention for comparison."""
+    """Instrumented baseline (standard) attention for comparison.
+
+    Uses 3 chained CUDA events with step names matching the DCT forward
+    (1_qkv_proj, 2_rope_cache, 8_attn_output) for direct comparison.
+    """
     from typing import Callable
 
     input_shape = hidden_states.shape[:-1]
@@ -366,21 +323,18 @@ def profiled_baseline_forward(
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
-    # ---- Instrumented decode path ----
-    s = torch.cuda.Event(enable_timing=True)
-    e = torch.cuda.Event(enable_timing=True)
-    s.record()
+    # ---- Instrumented decode path (chained events) ----
+    ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+    ev[0].record()
 
+    # Step 1: QKV projection
     query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-    _record("1_qkv_proj", s, e)
+    ev[1].record()
 
-    s2 = torch.cuda.Event(enable_timing=True)
-    e2 = torch.cuda.Event(enable_timing=True)
-    s2.record()
-
+    # Step 2: RoPE + KV cache update
     cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     if past_key_values is not None:
@@ -389,12 +343,9 @@ def profiled_baseline_forward(
             key_states, value_states, self.layer_idx, cache_kwargs
         )
 
-    _record("2_rope_cache", s2, e2)
+    ev[2].record()
 
-    s_attn = torch.cuda.Event(enable_timing=True)
-    e_attn = torch.cuda.Event(enable_timing=True)
-    s_attn.record()
-
+    # Step 8: Attention + output projection (named "8" for comparison with DCT)
     attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get("sdpa", eager_attention_forward)
     attn_output, attn_weights = attention_interface(
         self, query_states, key_states, value_states, attention_mask,
@@ -402,17 +353,14 @@ def profiled_baseline_forward(
         sliding_window=getattr(self, "sliding_window", None), **kwargs,
     )
     attn_output = attn_output.transpose(1, 2).contiguous()
-
-    _record("8_sdpa_attention", s_attn, e_attn)
-
-    s9 = torch.cuda.Event(enable_timing=True)
-    e9 = torch.cuda.Event(enable_timing=True)
-    s9.record()
-
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)
 
-    _record("9_o_proj", s9, e9)
+    ev[3].record()
+
+    step_names = ["1_qkv_proj", "2_rope_cache", "8_attn_output"]
+    for i, name in enumerate(step_names):
+        _pending_events.append((name, ev[i], ev[i + 1]))
 
     return attn_output, None
 
@@ -441,6 +389,8 @@ def parse_args():
     p.add_argument("--unselected_mode", default="compressed")
     p.add_argument("--selection_mode", default="standard")
     p.add_argument("--continuous_rope", action="store_true")
+    p.add_argument("--no_triton", action="store_true",
+                   help="Disable Triton kernels (use pure PyTorch for comparison)")
     return p.parse_args()
 
 
@@ -510,46 +460,47 @@ def run_profiled_decode(model, tokenizer, args, mode):
     _enabled = False
 
     # Summarize
-    avg_total = sum(total_times) / len(total_times)
-    tok_s = 1000.0 / avg_total
+    avg_model_total = sum(total_times) / len(total_times)
+    tok_s = 1000.0 / avg_model_total
 
-    return avg_total, tok_s, dict(_step_timings), total_times
+    return avg_model_total, tok_s, dict(_step_timings), total_times
 
 
 # ---------------------------------------------------------------------------
 # Print results
 # ---------------------------------------------------------------------------
-def print_profile(mode, avg_total, tok_s, timings, num_layers=32):
+def print_profile(mode, avg_model_total, tok_s, timings, num_layers=32):
     print(f"\n{'=' * 70}")
     print(f"PROFILE: {mode.upper()}")
     print(f"{'=' * 70}")
-    print(f"  Overall: {avg_total:.2f} ms/tok  ({tok_s:.1f} tok/s)")
-    print()
 
-    # Each step is called num_layers times per decode step
-    # timings[step_name] has num_decode_steps * num_layers entries
-    print(f"  {'Step':<25} {'Per-layer (ms)':>15} {'Per-token (ms)':>15} {'% of total':>12}")
-    print(f"  {'-'*25} {'-'*15} {'-'*15} {'-'*12}")
-
+    # Compute per-token time for each step
     step_order = sorted(timings.keys())
-    accounted = 0.0
+    step_per_token = {}
     for step_name in step_order:
         vals = timings[step_name]
-        n_calls = len(vals)
-        avg_per_call = sum(vals) / n_calls if vals else 0.0
-        # Per-token = average across all calls for one decode step
-        # = avg_per_call * num_layers (calls per token)
-        n_decode_steps = n_calls / num_layers if num_layers > 0 else 1
-        per_token = sum(vals) / n_decode_steps if n_decode_steps > 0 else 0.0
-        pct = per_token / avg_total * 100 if avg_total > 0 else 0.0
-        accounted += per_token
+        n_decode_steps = len(vals) / num_layers if num_layers > 0 else 1
+        step_per_token[step_name] = sum(vals) / n_decode_steps if n_decode_steps > 0 else 0.0
 
+    # Attention total = exact sum of all steps (guaranteed by chained events)
+    attn_total = sum(step_per_token.values())
+
+    print(f"  Attention total: {attn_total:.2f} ms/tok")
+    print(f"  Model total:     {avg_model_total:.2f} ms/tok  ({tok_s:.1f} tok/s)")
+    print()
+
+    print(f"  {'Step':<25} {'Per-layer (ms)':>15} {'Per-token (ms)':>15} {'% of attn':>12}")
+    print(f"  {'-'*25} {'-'*15} {'-'*15} {'-'*12}")
+
+    for step_name in step_order:
+        vals = timings[step_name]
+        avg_per_call = sum(vals) / len(vals) if vals else 0.0
+        per_token = step_per_token[step_name]
+        pct = per_token / attn_total * 100 if attn_total > 0 else 0.0
         print(f"  {step_name:<25} {avg_per_call:>15.4f} {per_token:>15.3f} {pct:>11.1f}%")
 
-    unaccounted = avg_total - accounted
-    pct_unaccounted = unaccounted / avg_total * 100 if avg_total > 0 else 0.0
-    print(f"  {'(unaccounted)':<25} {'':>15} {unaccounted:>15.3f} {pct_unaccounted:>11.1f}%")
-    print(f"  {'TOTAL':<25} {'':>15} {avg_total:>15.3f} {'100.0':>11}%")
+    print(f"  {'-'*25} {'-'*15} {'-'*15} {'-'*12}")
+    print(f"  {'TOTAL':<25} {'':>15} {attn_total:>15.3f} {'100.0':>11}%")
 
 
 # ---------------------------------------------------------------------------
@@ -623,35 +574,40 @@ def main():
         b_avg, b_tok, b_timings = results["baseline"]
         d_avg, d_tok, d_timings = results["dct"]
 
+        def _per_token(timings_dict, step, n_layers):
+            vals = timings_dict.get(step, [])
+            if not vals:
+                return 0.0
+            return sum(vals) / (len(vals) / n_layers)
+
+        b_attn = sum(_per_token(b_timings, s, num_layers) for s in b_timings)
+        d_attn = sum(_per_token(d_timings, s, num_layers) for s in d_timings)
+
         print(f"\n{'=' * 70}")
         print("COMPARISON")
         print(f"{'=' * 70}")
-        print(f"  Baseline: {b_avg:.2f} ms/tok ({b_tok:.1f} tok/s)")
-        print(f"  DCT:      {d_avg:.2f} ms/tok ({d_tok:.1f} tok/s)")
-        print(f"  Ratio:    {b_avg/d_avg:.2f}x (baseline/DCT)")
+        print(f"  Baseline attn: {b_attn:.2f} ms/tok ({b_tok:.1f} tok/s)")
+        print(f"  DCT attn:      {d_attn:.2f} ms/tok ({d_tok:.1f} tok/s)")
+        if d_attn > 0:
+            print(f"  Ratio:         {b_attn/d_attn:.2f}x (baseline/DCT)")
         print()
 
-        # Compare shared steps
         all_steps = sorted(set(list(b_timings.keys()) + list(d_timings.keys())))
         print(f"  {'Step':<25} {'Baseline (ms)':>15} {'DCT (ms)':>15} {'Diff (ms)':>12}")
         print(f"  {'-'*25} {'-'*15} {'-'*15} {'-'*12}")
 
         for step in all_steps:
-            b_vals = b_timings.get(step, [])
-            d_vals = d_timings.get(step, [])
-            n_layers = 32
+            b_per_tok = _per_token(b_timings, step, num_layers)
+            d_per_tok = _per_token(d_timings, step, num_layers)
 
-            b_per_tok = sum(b_vals) / (len(b_vals) / n_layers) if b_vals else 0
-            d_per_tok = sum(d_vals) / (len(d_vals) / n_layers) if d_vals else 0
+            b_str = f"{b_per_tok:.3f}" if step in b_timings else "\u2014"
+            d_str = f"{d_per_tok:.3f}" if step in d_timings else "\u2014"
 
-            b_str = f"{b_per_tok:.3f}" if b_vals else "—"
-            d_str = f"{d_per_tok:.3f}" if d_vals else "—"
-
-            if b_vals and d_vals:
+            if step in b_timings and step in d_timings:
                 diff = d_per_tok - b_per_tok
                 diff_str = f"{diff:+.3f}"
             else:
-                diff_str = "—"
+                diff_str = "\u2014"
 
             print(f"  {step:<25} {b_str:>15} {d_str:>15} {diff_str:>12}")
 

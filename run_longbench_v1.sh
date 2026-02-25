@@ -30,23 +30,23 @@ if [ -n "$TASKS" ]; then
 fi
 
 # ---- Step 1: Baseline (full attention, no monkey-patch) ----
-echo "============================================================"
-echo "BASELINE: Full attention (no monkey-patch)"
-echo "============================================================"
-python eval_longbench_v1.py \
-    --mode baseline \
-    --base_model "$BASE_MODEL" \
-    --max_input_len "$MAX_INPUT_LEN" \
-    --num_samples "$NUM_SAMPLES" \
-    --output_dir "$OUTPUT_DIR" \
-    --run_name llama_baseline \
-    $TASK_ARGS
+# echo "============================================================"
+# echo "BASELINE: Full attention (no monkey-patch)"
+# echo "============================================================"
+# python eval_longbench_v1.py \
+#     --mode baseline \
+#     --base_model "$BASE_MODEL" \
+#     --max_input_len "$MAX_INPUT_LEN" \
+#     --num_samples "$NUM_SAMPLES" \
+#     --output_dir "$OUTPUT_DIR" \
+#     --run_name llama_baseline \
+#     $TASK_ARGS
 
 # ---- Step 2: Sweep top_k x scoring_method x group_agg_method x mode ----
-for TOP_K in 32 8; do #4 8 16 32; do
-    for SCORING_METHOD in mean max; do
-        for GAM in max mean topp; do
-            for MODE in drop compressed; do
+for TOP_K in 8; do #4 8 16 32; do
+    for SCORING_METHOD in mean; do
+        for GAM in max; do
+            for MODE in compressed drop; do
                 echo ""
                 echo "===================================================================="
                 echo "PAGE ATTENTION: top_k=${TOP_K}, scoring_method=${SCORING_METHOD}, group_agg=${GAM}, mode=${MODE}"
@@ -67,6 +67,7 @@ for TOP_K in 32 8; do #4 8 16 32; do
                     --group_agg_method "$GAM" \
                     --unselected_mode "$MODE" \
                     --continuous_rope \
+                    #--no_triton \
                     $TASK_ARGS
             done
         done

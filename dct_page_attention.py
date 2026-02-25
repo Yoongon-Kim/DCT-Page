@@ -386,6 +386,18 @@ def score_pages(query_states, compressed_keys, cfg, num_kv_groups):
     """
     bsz, num_heads, q_len, head_dim = query_states.shape
     _, num_kv_heads, num_pages, comp_size, _ = compressed_keys.shape
+
+    # Fused Triton path for decode (q_len=1) with mean/max aggregation
+    if q_len == 1 and cfg.use_triton and cfg.group_agg_method != "topp":
+        from triton_kernels import score_pages_fused_triton
+        tri_indices, tri_scores = score_pages_fused_triton(
+            query_states, compressed_keys,
+            cfg.scoring_method, cfg.group_agg_method, cfg.top_k,
+            num_kv_groups,
+        )
+        return tri_indices, tri_scores
+
+    # ---- PyTorch path (prefill, or topp aggregation, or use_triton=False) ----
     scaling = head_dim ** -0.5
 
     # Reshape queries into GQA groups: [bsz, num_kv_heads, num_kv_groups, q_len, head_dim]
@@ -580,77 +592,79 @@ def assemble_kv(sink_k, sink_v, paged_k, paged_v, comp_k, comp_v,
         num_unselected = num_pages - top_k
         middle_len = top_k * page_size + num_unselected * comp_size
 
-        # Build selection mask and compute per-page write offsets
-        selected_mask = torch.zeros(
-            bsz, num_kv_heads, num_pages, dtype=torch.bool,
-            device=selected_indices.device
-        )
-        selected_mask.scatter_(2, selected_indices, True)
+        if cfg.use_triton:
+            from triton_kernels import assemble_kv_compressed_triton
+            # Fused path: kernel writes middle directly into final tensor,
+            # eliminating intermediate allocation + torch.cat
+            final_k, final_v = assemble_kv_compressed_triton(
+                paged_k, paged_v, comp_k, comp_v,
+                selected_indices, num_pages,
+                page_size, comp_size, top_k,
+                sink_k, sink_v, recent_k, recent_v,
+            )
+        else:
+            # PyTorch scatter/gather path
+            selected_mask = torch.zeros(
+                bsz, num_kv_heads, num_pages, dtype=torch.bool,
+                device=selected_indices.device
+            )
+            selected_mask.scatter_(2, selected_indices, True)
 
-        # Each page contributes page_size (if selected) or comp_size (if not) tokens
-        token_counts = torch.where(selected_mask, page_size, comp_size)
-        # Exclusive cumsum: page_offsets[p] = start position of page p in middle section
-        page_offsets = torch.zeros(
-            bsz, num_kv_heads, num_pages, dtype=torch.long,
-            device=selected_indices.device
-        )
-        page_offsets[:, :, 1:] = token_counts[:, :, :-1].cumsum(dim=-1) # cumsum is cumulative sum
+            token_counts = torch.where(selected_mask, page_size, comp_size)
+            page_offsets = torch.zeros(
+                bsz, num_kv_heads, num_pages, dtype=torch.long,
+                device=selected_indices.device
+            )
+            page_offsets[:, :, 1:] = token_counts[:, :, :-1].cumsum(dim=-1)
 
-        # Gather selected pages (full resolution) per KV head
-        idx_sel = selected_indices[:, :, :, None, None].expand(
-            bsz, num_kv_heads, top_k, page_size, head_dim
-        )
-        sel_k = torch.gather(paged_k, 2, idx_sel).reshape(
-            bsz, num_kv_heads, top_k * page_size, head_dim
-        )
-        sel_v = torch.gather(paged_v, 2, idx_sel).reshape(
-            bsz, num_kv_heads, top_k * page_size, head_dim
-        )
+            idx_sel = selected_indices[:, :, :, None, None].expand(
+                bsz, num_kv_heads, top_k, page_size, head_dim
+            )
+            sel_k = torch.gather(paged_k, 2, idx_sel).reshape(
+                bsz, num_kv_heads, top_k * page_size, head_dim
+            )
+            sel_v = torch.gather(paged_v, 2, idx_sel).reshape(
+                bsz, num_kv_heads, top_k * page_size, head_dim
+            )
 
-        # Derive unselected indices (positional order via stable argsort)
-        sort_perm = torch.argsort(selected_mask.int(), dim=-1, stable=True) # argsort returns a list of indexs
-        unselected_indices = sort_perm[:, :, :num_unselected]
+            sort_perm = torch.argsort(selected_mask.int(), dim=-1, stable=True)
+            unselected_indices = sort_perm[:, :, :num_unselected]
 
-        # Gather unselected pages (compressed) per KV head
-        idx_unsel = unselected_indices[:, :, :, None, None].expand(
-            bsz, num_kv_heads, num_unselected, comp_size, head_dim
-        )
-        unsel_k = torch.gather(comp_k, 2, idx_unsel).reshape(
-            bsz, num_kv_heads, num_unselected * comp_size, head_dim
-        )
-        unsel_v = torch.gather(comp_v, 2, idx_unsel).reshape(
-            bsz, num_kv_heads, num_unselected * comp_size, head_dim
-        )
+            idx_unsel = unselected_indices[:, :, :, None, None].expand(
+                bsz, num_kv_heads, num_unselected, comp_size, head_dim
+            )
+            unsel_k = torch.gather(comp_k, 2, idx_unsel).reshape(
+                bsz, num_kv_heads, num_unselected * comp_size, head_dim
+            )
+            unsel_v = torch.gather(comp_v, 2, idx_unsel).reshape(
+                bsz, num_kv_heads, num_unselected * comp_size, head_dim
+            )
 
-        # Compute per-token write offsets to interleave in original page order
-        # Selected pages: each contributes page_size tokens at page_offsets[selected_page]
-        sel_offsets = torch.gather(page_offsets, 2, selected_indices)  # sel_offsets: [bsz, num_kv_heads, top_k] - positional offsets of selected pages. selected_indices: [bsz, num_kv_heads, top_k] - the page indices each KV head selected. page_offsets: [bsz, num_kv_heads, num_pages] - the starting write positions of each page in the middle section.
-        sel_dst = (
-            sel_offsets[:, :, :, None] # Adds a dimension for broadcasting (broadcasting: saving individual tokens' positions)
-            + torch.arange(page_size, device=sel_offsets.device) # Broadcasts [0, 1, 2, ... , page_size-1]
-        ).reshape(bsz, num_kv_heads, top_k * page_size) # The result is the token positions for all selected pages' tokens.
+            sel_offsets = torch.gather(page_offsets, 2, selected_indices)
+            sel_dst = (
+                sel_offsets[:, :, :, None]
+                + torch.arange(page_size, device=sel_offsets.device)
+            ).reshape(bsz, num_kv_heads, top_k * page_size)
 
-        # Unselected pages: each contributes comp_size tokens
-        unsel_offsets = torch.gather(page_offsets, 2, unselected_indices)  # unsel_offsets: [bsz, num_kv_heads, num_unselected] - positional offsets of unselected pages. unselected_indices: [bsz, num_kv_heads, num_unselected] - the page indices each KV head not selected.
-        unsel_dst = (
-            unsel_offsets[:, :, :, None]
-            + torch.arange(comp_size, device=unsel_offsets.device)
-        ).reshape(bsz, num_kv_heads, num_unselected * comp_size) # The result is the token positions for all unselected pages' tokens.
+            unsel_offsets = torch.gather(page_offsets, 2, unselected_indices)
+            unsel_dst = (
+                unsel_offsets[:, :, :, None]
+                + torch.arange(comp_size, device=unsel_offsets.device)
+            ).reshape(bsz, num_kv_heads, num_unselected * comp_size)
 
-        # Scatter into middle section preserving original page order
-        middle_k = torch.empty(
-            bsz, num_kv_heads, middle_len, head_dim,
-            dtype=sink_k.dtype, device=sink_k.device
-        )
-        middle_v = torch.empty_like(middle_k)
+            middle_k = torch.empty(
+                bsz, num_kv_heads, middle_len, head_dim,
+                dtype=sink_k.dtype, device=sink_k.device
+            )
+            middle_v = torch.empty_like(middle_k)
 
-        middle_k.scatter_(2, sel_dst[:, :, :, None].expand_as(sel_k), sel_k) # 'sel_dst[:, :, :, None]' adds a head_dim dimension ([bsz, num_kv_heads, top_k*page_size]->[bsz, num_kv_heads, top_k*page_size, 1]). '.expand_as(sel_k)' broadcasts to [bsz, num_kv_heads, top_k*page_size, head_dim]. 'scatter_' writes values from sel_k into middle_k at positions specified by the index tensor, along dim 2 (the sequence dimension).
-        middle_k.scatter_(2, unsel_dst[:, :, :, None].expand_as(unsel_k), unsel_k)
-        middle_v.scatter_(2, sel_dst[:, :, :, None].expand_as(sel_v), sel_v)
-        middle_v.scatter_(2, unsel_dst[:, :, :, None].expand_as(unsel_v), unsel_v)
+            middle_k.scatter_(2, sel_dst[:, :, :, None].expand_as(sel_k), sel_k)
+            middle_k.scatter_(2, unsel_dst[:, :, :, None].expand_as(unsel_k), unsel_k)
+            middle_v.scatter_(2, sel_dst[:, :, :, None].expand_as(sel_v), sel_v)
+            middle_v.scatter_(2, unsel_dst[:, :, :, None].expand_as(unsel_v), unsel_v)
 
-        final_k = torch.cat([sink_k, middle_k, recent_k], dim=2)
-        final_v = torch.cat([sink_v, middle_v, recent_v], dim=2)
+            final_k = torch.cat([sink_k, middle_k, recent_k], dim=2)
+            final_v = torch.cat([sink_v, middle_v, recent_v], dim=2)
 
     else:
         raise ValueError(f"Unknown unselected_mode: {cfg.unselected_mode}")
@@ -849,6 +863,7 @@ def replace_qwen2_attn(
     unselected_mode="drop",
     selection_mode="standard",
     continuous_rope=False,
+    use_triton=True,
 ):
     """
     Replace Qwen2Attention.forward with DCT Page Attention.
@@ -867,6 +882,7 @@ def replace_qwen2_attn(
         unselected_mode=unselected_mode,
         selection_mode=selection_mode,
         continuous_rope=continuous_rope,
+        use_triton=use_triton,
     )
 
     comp_size = max(1, int(page_size * compress_ratio))
@@ -876,7 +892,7 @@ def replace_qwen2_attn(
     print(f"  compress_ratio={compress_ratio} ({page_size} -> {comp_size} tokens)")
     print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}")
     print(f"  unselected_mode={unselected_mode}, selection_mode={selection_mode}")
-    print(f"  continuous_rope={continuous_rope}")
+    print(f"  continuous_rope={continuous_rope}, use_triton={use_triton}")
     print(f"  Page attention active during decode only (prefill uses full attention)")
 
     transformers.models.qwen2.modeling_qwen2.Qwen2Attention.forward = dct_page_attention_forward
@@ -893,6 +909,7 @@ def replace_llama_attn(
     unselected_mode="drop",
     selection_mode="standard",
     continuous_rope=False,
+    use_triton=True,
 ):
     """
     Replace LlamaAttention.forward with DCT Page Attention.
@@ -913,6 +930,7 @@ def replace_llama_attn(
         unselected_mode=unselected_mode,
         selection_mode=selection_mode,
         continuous_rope=continuous_rope,
+        use_triton=use_triton,
     )
 
     comp_size = max(1, int(page_size * compress_ratio))
@@ -922,7 +940,7 @@ def replace_llama_attn(
     print(f"  compress_ratio={compress_ratio} ({page_size} -> {comp_size} tokens)")
     print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}")
     print(f"  unselected_mode={unselected_mode}, selection_mode={selection_mode}")
-    print(f"  continuous_rope={continuous_rope}")
+    print(f"  continuous_rope={continuous_rope}, use_triton={use_triton}")
     print(f"  Page attention active during decode only (prefill uses full attention)")
 
     transformers.models.llama.modeling_llama.LlamaAttention.forward = dct_page_attention_forward

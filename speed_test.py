@@ -107,6 +107,8 @@ def parse_args():
     dct.add_argument("--selection_mode", default="standard",
                      choices=["standard", "hierarchical"])
     dct.add_argument("--continuous_rope", action="store_true")
+    dct.add_argument("--no_triton", action="store_true",
+                     help="Disable Triton kernels (use pure PyTorch for comparison)")
 
     return p.parse_args()
 
@@ -186,6 +188,7 @@ def restore_forward(model_name, original_forward):
 
 
 def apply_dct_patch(args):
+    use_triton = not getattr(args, 'no_triton', False)
     if "llama" in args.model.lower():
         from dct_page_attention import replace_llama_attn
         replace_llama_attn(
@@ -199,6 +202,7 @@ def apply_dct_patch(args):
             unselected_mode=args.unselected_mode,
             selection_mode=args.selection_mode,
             continuous_rope=args.continuous_rope,
+            use_triton=use_triton,
         )
     else:
         from dct_page_attention import replace_qwen2_attn
@@ -213,6 +217,7 @@ def apply_dct_patch(args):
             unselected_mode=args.unselected_mode,
             selection_mode=args.selection_mode,
             continuous_rope=args.continuous_rope,
+            use_triton=use_triton,
         )
 
 
