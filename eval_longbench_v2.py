@@ -85,12 +85,13 @@ def parse_args():
                         help="How to aggregate per-head scores within a GQA group")
     parser.add_argument("--unselected_mode", type=str, default="drop",
                         choices=["drop", "compressed"])
-    parser.add_argument("--continuous_rope", action="store_true",
-                        help="Store KV before RoPE, apply continuous RoPE after assembly")
+    parser.add_argument("--no_continuous_rope", action="store_true",
+                        help="Disable continuous RoPE (enabled by default)")
     parser.add_argument("--no_triton", action="store_true",
                         help="Disable Triton kernels (use pure PyTorch for comparison)")
 
     args = parser.parse_args()
+    args.continuous_rope = not args.no_continuous_rope
 
     if args.run_name is None:
         if args.mode == "baseline":

@@ -23,7 +23,7 @@ MODE="drop"
 echo "============================================================"
 echo "BASELINE: Full attention (no monkey-patch)"
 echo "============================================================"
-python eval_longbench.py \
+python eval_longbench_v2.py \
     --mode baseline \
     --base_model "$BASE_MODEL" \
     --max_input_len "$MAX_INPUT_LEN" \
@@ -56,8 +56,7 @@ for TOP_K in 32 8; do # 4 8 16 32; do
                     --compress_ratio "$COMPRESS_RATIO" \
                     --scoring_method "$SCORING_METHOD" \
                     --group_agg_method "$GAM" \
-                    --unselected_mode "$MODE" \
-                    --continuous_rope
+                    --unselected_mode "$MODE"
             done
         done
     done

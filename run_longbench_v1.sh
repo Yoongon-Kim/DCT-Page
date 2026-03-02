@@ -66,7 +66,6 @@ for TOP_K in 8; do #4 8 16 32; do
                     --scoring_method "$SCORING_METHOD" \
                     --group_agg_method "$GAM" \
                     --unselected_mode "$MODE" \
-                    --continuous_rope \
                     #--no_triton \
                     $TASK_ARGS
             done

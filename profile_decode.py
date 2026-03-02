@@ -20,12 +20,46 @@ from collections import defaultdict
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from speed_test_v2 import (
+from speed_test_dummy import (
     load_model_and_tokenizer,
     get_original_forward,
     restore_forward,
-    apply_dct_patch,
 )
+
+
+def apply_dct_patch(args, model=None):
+    """Apply DCT patch (imports from dct_page_attention)."""
+    import types
+    import transformers
+
+    patch_kwargs = dict(
+        page_size=args.page_size,
+        top_k=args.top_k,
+        sink_size=args.sink_size,
+        recent_size=args.recent_size,
+        compress_ratio=args.compress_ratio,
+        scoring_method=args.scoring_method,
+        group_agg_method=args.group_agg_method,
+        unselected_mode=args.unselected_mode,
+        continuous_rope=args.continuous_rope,
+        use_triton=not getattr(args, 'no_triton', False),
+    )
+    if "llama" in args.model.lower():
+        from dct_page_attention import replace_llama_attn, dct_page_attention_forward
+        replace_llama_attn(**patch_kwargs)
+        if model is not None:
+            attn_cls = transformers.models.llama.modeling_llama.LlamaAttention
+            for module in model.modules():
+                if isinstance(module, attn_cls) and hasattr(module, "_old_forward"):
+                    module._old_forward = types.MethodType(dct_page_attention_forward, module)
+    else:
+        from dct_page_attention import replace_qwen2_attn, dct_page_attention_forward
+        replace_qwen2_attn(**patch_kwargs)
+        if model is not None:
+            attn_cls = transformers.models.qwen2.modeling_qwen2.Qwen2Attention
+            for module in model.modules():
+                if isinstance(module, attn_cls) and hasattr(module, "_old_forward"):
+                    module._old_forward = types.MethodType(dct_page_attention_forward, module)
 from dct_page_attention import (
     _dct_page_cfg,
     segment_kv,
@@ -37,6 +71,7 @@ from dct_page_attention import (
     _apply_rope,
     _compute_rope_cos_sin,
 )
+# New fused kernels imported inside profiled_dct_page_attention_forward
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen2.modeling_qwen2 import eager_attention_forward
 
@@ -54,8 +89,9 @@ _current_layer = 0
 
 
 def _flush_events():
-    """Sync once, then compute all deferred elapsed times."""
-    torch.cuda.synchronize()
+    """Sync all devices, then compute all deferred elapsed times."""
+    for i in range(torch.cuda.device_count()):
+        torch.cuda.synchronize(device=i)
     for name, s, e in _pending_events:
         _step_timings[name].append(s.elapsed_time(e))
     _pending_events.clear()
@@ -75,7 +111,7 @@ def profiled_dct_page_attention_forward(
 ):
     """Instrumented version of dct_page_attention_forward for profiling.
 
-    Uses 8 chained CUDA events so that total attention = sum of steps 1-8
+    Uses 8 chained CUDA events so that total attention = sum of steps 1-7
     with zero gaps.
     """
     global _current_layer
@@ -125,10 +161,13 @@ def profiled_dct_page_attention_forward(
 
     # ---- DECODE PATH (q_len == 1) ----
     # Chained CUDA events: ev[i] is the boundary between step i and step i+1.
-    # Total attention = ev[0] → ev[8] = sum of steps 1-8 by construction.
+    # Total attention = ev[0] → ev[9] = sum of steps 1-7 by construction.
     if _enabled:
-        ev = [torch.cuda.Event(enable_timing=True) for _ in range(9)]
-        ev[0].record()
+        # Record events on the correct device's stream (critical for multi-GPU)
+        _dev = hidden_states.device
+        _stream = torch.cuda.current_stream(_dev)
+        ev = [torch.cuda.Event(enable_timing=True) for _ in range(10)]
+        ev[0].record(_stream)
 
     # Step 1: QKV projection
     query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
@@ -136,7 +175,7 @@ def profiled_dct_page_attention_forward(
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     if _enabled:
-        ev[1].record()
+        ev[1].record(_stream)
 
     # Step 2: RoPE + KV cache update
     cos, sin = position_embeddings
@@ -159,7 +198,7 @@ def profiled_dct_page_attention_forward(
         kv_len = key_states.shape[2]
 
     if _enabled:
-        ev[2].record()
+        ev[2].record(_stream)
 
     # Check if DCT path is active
     min_len_for_paging = cfg.sink_size + cfg.page_size * (cfg.top_k + 1) + cfg.recent_size
@@ -167,10 +206,10 @@ def profiled_dct_page_attention_forward(
         if cfg.continuous_rope:
             all_pos = torch.arange(kv_len, device=key_cached.device)
             cos_all, sin_all = _compute_rope_cos_sin(
-                all_pos, self.head_dim, self.config.rope_parameters['rope_theta'],
+                all_pos, self.head_dim, getattr(self.config, 'rope_theta', self.config.rope_parameters['rope_theta'] if hasattr(self.config, 'rope_parameters') else 500000.0),
                 key_cached.device, key_cached.dtype
             )
-            attn_q = query_rope
+            attn_q, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
             attn_k = _apply_rope(key_cached, cos_all, sin_all)
             attn_v = value_cached
         else:
@@ -200,58 +239,76 @@ def profiled_dct_page_attention_forward(
     )
 
     if _enabled:
-        ev[3].record()
+        ev[3].record(_stream)
 
     # Step 4: DCT compression
     comp_k, comp_v = _update_comp_cache(self, paged_k, paged_v, num_pages, comp_size)
 
     if _enabled:
-        ev[4].record()
+        ev[4].record(_stream)
 
-    # Step 5: Score pages
-    selected_indices, _page_scores = score_pages(
-        query_states, comp_k, cfg, self.num_key_value_groups
+    # Step 5: Score pages (Triton kernel 1)
+    from triton_kernels import score_pages_triton, assemble_kv_full_triton, assemble_kv_split_triton, apply_rope_q_triton
+    page_scores = score_pages_triton(
+        query_states, comp_k,
+        cfg.scoring_method, cfg.group_agg_method,
+        self.num_key_value_groups,
     )
 
     if _enabled:
-        ev[5].record()
+        ev[5].record(_stream)
 
-    # Step 6: Assemble KV
-    final_k, final_v = assemble_kv(
-        sink_k, sink_v, paged_k, paged_v, comp_k, comp_v,
-        recent_k, recent_v, selected_indices, cfg, num_pages
-    )
+    # Step 6a: TopK + sort
+    actual_top_k = min(cfg.top_k, num_pages)
+    _, top_indices = torch.topk(page_scores, actual_top_k, dim=-1)
+    selected_indices, _ = top_indices.sort(dim=-1)
 
-    if _enabled:
-        ev[6].record()
+    num_unselected = num_pages - actual_top_k
+    middle_len = actual_top_k * cfg.page_size + num_unselected * comp_size
+    assembled_len = cfg.sink_size + middle_len + actual_recent
 
-    # Step 7: Continuous RoPE
+    cos_table = None
+    sin_table = None
     if cfg.continuous_rope:
-        assembled_len = final_k.shape[2]
         cached_len = getattr(self, '_rope_cache_len', 0)
         if assembled_len > cached_len:
             max_len = assembled_len + cfg.page_size
-            positions = torch.arange(max_len, device=final_k.device)
+            positions = torch.arange(max_len, device=comp_k.device)
             cos_cached, sin_cached = _compute_rope_cos_sin(
                 positions, self.head_dim,
-                self.config.rope_parameters['rope_theta'],
-                final_k.device, final_k.dtype,
+                getattr(self.config, 'rope_theta', self.config.rope_parameters['rope_theta'] if hasattr(self.config, 'rope_parameters') else 500000.0),
+                comp_k.device, comp_k.dtype,
             )
             self._rope_cos_cache = cos_cached
             self._rope_sin_cache = sin_cached
             self._rope_cache_len = max_len
-
-        cos_k = self._rope_cos_cache[:, :, :assembled_len]
-        sin_k = self._rope_sin_cache[:, :, :assembled_len]
-        cos_q = self._rope_cos_cache[:, :, assembled_len - 1:assembled_len]
-        sin_q = self._rope_sin_cache[:, :, assembled_len - 1:assembled_len]
-        final_k = _apply_rope(final_k, cos_k, sin_k)
-        query_states = _apply_rope(query_states, cos_q, sin_q)
+        cos_table = self._rope_cos_cache[0, 0, :assembled_len].contiguous()
+        sin_table = self._rope_sin_cache[0, 0, :assembled_len].contiguous()
 
     if _enabled:
-        ev[7].record()
+        ev[6].record(_stream)
 
-    # Step 8: Attention + output projection
+    # Step 6b: Assemble + K-RoPE (Triton kernel 2 — split version)
+    final_k, final_v = assemble_kv_split_triton(
+        paged_k, paged_v, comp_k, comp_v,
+        sink_k, sink_v, recent_k, recent_v,
+        selected_indices,
+        cos_table, sin_table,
+    )
+
+    if _enabled:
+        ev[7].record(_stream)
+
+    # Step 6c: Q-RoPE (Triton kernel 3)
+    if cfg.continuous_rope:
+        cos_q = self._rope_cos_cache[:, :, assembled_len - 1:assembled_len]
+        sin_q = self._rope_sin_cache[:, :, assembled_len - 1:assembled_len]
+        query_states = apply_rope_q_triton(query_states, cos_q, sin_q)
+
+    if _enabled:
+        ev[8].record(_stream)
+
+    # Step 7: Attention + output projection
     attn_output = F.scaled_dot_product_attention(
         query_states, final_k, final_v,
         is_causal=False,
@@ -262,11 +319,11 @@ def profiled_dct_page_attention_forward(
     attn_output = self.o_proj(attn_output)
 
     if _enabled:
-        ev[8].record()
+        ev[9].record(_stream)
         step_names = [
             "1_qkv_proj", "2_rope_cache", "3_segment_kv",
-            "4_dct_compress", "5_score_pages", "6_assemble_kv",
-            "7_continuous_rope", "8_attn_output",
+            "4_dct_compress", "5_score_pages", "6a_topk",
+            "6b_assemble", "6c_q_rope", "7_attn_output",
         ]
         for i, name in enumerate(step_names):
             _pending_events.append((name, ev[i], ev[i + 1]))
@@ -290,7 +347,7 @@ def profiled_baseline_forward(
     """Instrumented baseline (standard) attention for comparison.
 
     Uses 3 chained CUDA events with step names matching the DCT forward
-    (1_qkv_proj, 2_rope_cache, 8_attn_output) for direct comparison.
+    (1_qkv_proj, 2_rope_cache, 7_attn_output) for direct comparison.
     """
     from typing import Callable
 
@@ -324,15 +381,17 @@ def profiled_baseline_forward(
         return attn_output, attn_weights
 
     # ---- Instrumented decode path (chained events) ----
+    _dev = hidden_states.device
+    _stream = torch.cuda.current_stream(_dev)
     ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
-    ev[0].record()
+    ev[0].record(_stream)
 
     # Step 1: QKV projection
     query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-    ev[1].record()
+    ev[1].record(_stream)
 
     # Step 2: RoPE + KV cache update
     cos, sin = position_embeddings
@@ -343,9 +402,9 @@ def profiled_baseline_forward(
             key_states, value_states, self.layer_idx, cache_kwargs
         )
 
-    ev[2].record()
+    ev[2].record(_stream)
 
-    # Step 8: Attention + output projection (named "8" for comparison with DCT)
+    # Step 7: Attention + output projection (named "7" for comparison with DCT)
     attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get("sdpa", eager_attention_forward)
     attn_output, attn_weights = attention_interface(
         self, query_states, key_states, value_states, attention_mask,
@@ -356,9 +415,9 @@ def profiled_baseline_forward(
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)
 
-    ev[3].record()
+    ev[3].record(_stream)
 
-    step_names = ["1_qkv_proj", "2_rope_cache", "8_attn_output"]
+    step_names = ["1_qkv_proj", "2_rope_cache", "7_attn_output"]
     for i, name in enumerate(step_names):
         _pending_events.append((name, ev[i], ev[i + 1]))
 
@@ -371,8 +430,8 @@ def profiled_baseline_forward(
 def parse_args():
     p = argparse.ArgumentParser(description="Profile DCT Page decode path")
     p.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
-    p.add_argument("--context_length", type=int, default=65536)
-    p.add_argument("--num_decode_steps", type=int, default=32,
+    p.add_argument("--context_length", type=int, default=32768)
+    p.add_argument("--num_decode_steps", type=int, default=128,
                    help="Decode steps to profile (after warmup)")
     p.add_argument("--warmup_steps", type=int, default=8,
                    help="Warmup decode steps (not profiled)")
@@ -383,15 +442,17 @@ def parse_args():
     p.add_argument("--top_k", type=int, default=8)
     p.add_argument("--sink_size", type=int, default=4)
     p.add_argument("--recent_size", type=int, default=128)
-    p.add_argument("--compress_ratio", type=float, default=0.03)
+    p.add_argument("--compress_ratio", type=float, default=4/128)
     p.add_argument("--scoring_method", default="mean")
     p.add_argument("--group_agg_method", default="max")
     p.add_argument("--unselected_mode", default="compressed")
-    p.add_argument("--selection_mode", default="standard")
-    p.add_argument("--continuous_rope", action="store_true")
+    p.add_argument("--no_continuous_rope", action="store_true",
+                   help="Disable continuous RoPE (enabled by default)")
     p.add_argument("--no_triton", action="store_true",
                    help="Disable Triton kernels (use pure PyTorch for comparison)")
-    return p.parse_args()
+    args = p.parse_args()
+    args.continuous_rope = not args.no_continuous_rope
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -549,16 +610,20 @@ def main():
         print(f"DCT PAGE ATTENTION (profiled, top_k={args.top_k})")
         print(f"{'=' * 65}")
 
-        # Restore original, then apply DCT patch, then override with profiled version
+        # Step 1: apply DCT patch (sets _dct_page_cfg + non-profiled forward)
         restore_forward(args.model, original_forward, model)
         apply_dct_patch(args, model)
 
-        # Now override with profiled version
+        # Step 2: overwrite with profiled version — same pattern as baseline
         attn_cls = transformers.models.llama.modeling_llama.LlamaAttention
         attn_cls.forward = profiled_dct_page_attention_forward
         for module in model.modules():
             if isinstance(module, attn_cls) and hasattr(module, "_old_forward"):
                 module._old_forward = types.MethodType(profiled_dct_page_attention_forward, module)
+
+        # Verify
+        assert attn_cls.__dict__['forward'] is profiled_dct_page_attention_forward, \
+            "Patching failed: LlamaAttention.forward is not profiled_dct_page_attention_forward"
 
         avg_total, tok_s, timings, total_times = run_profiled_decode(
             model, tokenizer, args, "dct"

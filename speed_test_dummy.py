@@ -17,18 +17,95 @@ Usage:
 import argparse
 import json
 import time
+import types
 from pathlib import Path
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from speed_test_v2 import (
-    load_model_and_tokenizer,
-    get_original_forward,
-    restore_forward,
-    apply_dct_patch,
-    model_family,
-)
+
+# ---------------------------------------------------------------------------
+# Shared utilities (formerly in speed_test_v2.py)
+# ---------------------------------------------------------------------------
+def model_family(model_name):
+    name = model_name.lower()
+    if "llama" in name:
+        return "llama"
+    elif "qwen" in name:
+        return "qwen2"
+    return model_name.split("/")[-1].lower()
+
+
+def load_model_and_tokenizer(model_name):
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation="sdpa",
+    )
+    model.eval()
+    n_params = sum(p.numel() for p in model.parameters()) / 1e9
+    print(f"Loaded: {model_name} ({n_params:.2f}B params)")
+    return model, tokenizer
+
+
+def get_original_forward(model_name):
+    import transformers
+    if "llama" in model_name.lower():
+        return transformers.models.llama.modeling_llama.LlamaAttention.forward
+    return transformers.models.qwen2.modeling_qwen2.Qwen2Attention.forward
+
+
+def restore_forward(model_name, original_forward, model=None):
+    import transformers
+    if "llama" in model_name.lower():
+        transformers.models.llama.modeling_llama.LlamaAttention.forward = original_forward
+        if model is not None:
+            attn_cls = transformers.models.llama.modeling_llama.LlamaAttention
+            for module in model.modules():
+                if isinstance(module, attn_cls) and hasattr(module, "_old_forward"):
+                    module._old_forward = types.MethodType(original_forward, module)
+    else:
+        transformers.models.qwen2.modeling_qwen2.Qwen2Attention.forward = original_forward
+        if model is not None:
+            attn_cls = transformers.models.qwen2.modeling_qwen2.Qwen2Attention
+            for module in model.modules():
+                if isinstance(module, attn_cls) and hasattr(module, "_old_forward"):
+                    module._old_forward = types.MethodType(original_forward, module)
+
+
+def apply_dct_patch(args, model=None):
+    patch_kwargs = dict(
+        page_size=args.page_size,
+        top_k=args.top_k,
+        sink_size=args.sink_size,
+        recent_size=args.recent_size,
+        compress_ratio=args.compress_ratio,
+        scoring_method=args.scoring_method,
+        group_agg_method=args.group_agg_method,
+        unselected_mode=args.unselected_mode,
+        continuous_rope=args.continuous_rope,
+        use_triton=not getattr(args, 'no_triton', False),
+    )
+    if "llama" in args.model.lower():
+        import transformers
+        from dct_page_attention import replace_llama_attn, dct_page_attention_forward
+        replace_llama_attn(**patch_kwargs)
+        if model is not None:
+            attn_cls = transformers.models.llama.modeling_llama.LlamaAttention
+            for module in model.modules():
+                if isinstance(module, attn_cls) and hasattr(module, "_old_forward"):
+                    module._old_forward = types.MethodType(dct_page_attention_forward, module)
+    else:
+        import transformers
+        from dct_page_attention import replace_qwen2_attn, dct_page_attention_forward
+        replace_qwen2_attn(**patch_kwargs)
+        if model is not None:
+            attn_cls = transformers.models.qwen2.modeling_qwen2.Qwen2Attention
+            for module in model.modules():
+                if isinstance(module, attn_cls) and hasattr(module, "_old_forward"):
+                    module._old_forward = types.MethodType(dct_page_attention_forward, module)
 
 
 # ---------------------------------------------------------------------------
@@ -103,13 +180,14 @@ def parse_args():
                      choices=["mean", "max", "topp"])
     dct.add_argument("--unselected_mode", default="drop",
                      choices=["drop", "compressed"])
-    dct.add_argument("--selection_mode", default="standard",
-                     choices=["standard", "hierarchical"])
-    dct.add_argument("--continuous_rope", action="store_true")
+    dct.add_argument("--no_continuous_rope", action="store_true",
+                     help="Disable continuous RoPE (enabled by default)")
     dct.add_argument("--no_triton", action="store_true",
                      help="Disable Triton kernels (use pure PyTorch for comparison)")
 
-    return p.parse_args()
+    args = p.parse_args()
+    args.continuous_rope = not args.no_continuous_rope
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +347,6 @@ def save_summary(stats, run_dir, args, label):
             "compress_ratio": args.compress_ratio,
             "scoring_method": args.scoring_method,
             "unselected_mode": args.unselected_mode,
-            "selection_mode": args.selection_mode,
         })
     path = Path(run_dir) / "summary.json"
     path.write_text(json.dumps(summary, indent=2))

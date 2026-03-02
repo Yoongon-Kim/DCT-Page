@@ -34,8 +34,8 @@ for COMPRESS_RATIO in 0.03; do
                 for UMODE in compressed; do
                     for CROPE in continuous; do
                         ROPE_FLAG=""
-                        if [ "$CROPE" = "continuous" ]; then
-                            ROPE_FLAG="--continuous_rope"
+                        if [ "$CROPE" = "nocontinuous" ]; then
+                            ROPE_FLAG="--no_continuous_rope"
                         fi
                         for TRITON in triton notriton; do
                             TRITON_FLAG=""
