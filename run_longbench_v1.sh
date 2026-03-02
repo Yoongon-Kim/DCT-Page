@@ -19,9 +19,9 @@ TASKS="${TASKS:-narrativeqa qasper gov_report 2wikimqa multifieldqa_en triviaqa}
 PAGE_SIZE=128
 SINK_SIZE=4
 RECENT_SIZE=128
-COMPRESS_RATIO=0.03
-SCORING_METHOD="max"
-GROUP_AGG_METHOD="mean"
+COMPRESS_RATIO=0.032
+SCORING_METHOD="mean"
+GROUP_AGG_METHOD="max"
 
 # Build task args
 TASK_ARGS=""
@@ -46,7 +46,7 @@ fi
 for TOP_K in 8; do #4 8 16 32; do
     for SCORING_METHOD in mean; do
         for GAM in max; do
-            for MODE in compressed drop; do
+            for MODE in compressed; do
                 echo ""
                 echo "===================================================================="
                 echo "PAGE ATTENTION: top_k=${TOP_K}, scoring_method=${SCORING_METHOD}, group_agg=${GAM}, mode=${MODE}"
@@ -66,7 +66,6 @@ for TOP_K in 8; do #4 8 16 32; do
                     --scoring_method "$SCORING_METHOD" \
                     --group_agg_method "$GAM" \
                     --unselected_mode "$MODE" \
-                    #--no_triton \
                     $TASK_ARGS
             done
         done

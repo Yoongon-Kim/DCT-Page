@@ -78,6 +78,63 @@ from transformers.models.qwen2.modeling_qwen2 import eager_attention_forward
 import torch.nn as nn
 import torch.nn.functional as F
 
+from transformers.cache_utils import DynamicLayer
+
+
+# ---------------------------------------------------------------------------
+# Pre-allocated KV cache (avoids torch.cat during decode)
+# ---------------------------------------------------------------------------
+class PreAllocatedLayer(DynamicLayer):
+    """Drop-in replacement for DynamicLayer that uses pre-allocated buffers.
+
+    Instead of torch.cat (O(seq_len) alloc+copy per step), uses index
+    assignment into a pre-allocated buffer (O(1) write per step).
+    """
+
+    @classmethod
+    def from_dynamic_layer(cls, layer, extra_tokens):
+        """Convert a populated DynamicLayer into a pre-allocated version."""
+        new_layer = cls()
+        k, v = layer.keys, layer.values
+        bsz, heads, seq_len, dim = k.shape
+
+        alloc_len = seq_len + extra_tokens
+        new_layer.keys = torch.empty(bsz, heads, alloc_len, dim,
+                                     dtype=k.dtype, device=k.device)
+        new_layer.values = torch.empty(bsz, heads, alloc_len, dim,
+                                       dtype=v.dtype, device=v.device)
+        new_layer.keys[:, :, :seq_len, :] = k
+        new_layer.values[:, :, :seq_len, :] = v
+
+        new_layer._seen = seq_len
+        new_layer._alloc_len = alloc_len
+        new_layer.is_initialized = True
+        new_layer.dtype = k.dtype
+        new_layer.device = k.device
+        return new_layer
+
+    def update(self, key_states, value_states, cache_kwargs=None):
+        seq_len = key_states.shape[-2]
+        start = self._seen
+        end = start + seq_len
+
+        self.keys[:, :, start:end, :] = key_states
+        self.values[:, :, start:end, :] = value_states
+        self._seen = end
+
+        # Return view of valid portion (zero-copy)
+        return self.keys[:, :, :end, :], self.values[:, :, :end, :]
+
+    def get_seq_length(self):
+        return self._seen
+
+
+def pre_allocate_cache(cache, extra_tokens=256):
+    """Convert a DynamicCache (after prefill) to use pre-allocated layers."""
+    for i, layer in enumerate(cache.layers):
+        cache.layers[i] = PreAllocatedLayer.from_dynamic_layer(layer, extra_tokens)
+    return cache
+
 
 # ---------------------------------------------------------------------------
 # Timing storage
@@ -411,7 +468,6 @@ def profiled_baseline_forward(
         dropout=0.0, scaling=self.scaling,
         sliding_window=getattr(self, "sliding_window", None), **kwargs,
     )
-    attn_output = attn_output.transpose(1, 2).contiguous()
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)
 
@@ -482,6 +538,14 @@ def run_profiled_decode(model, tokenizer, args, mode):
     past_key_values = out.past_key_values
     next_token = out.logits[:, -1:].argmax(dim=-1)
     prefill_len = args.context_length
+
+    # Pre-allocated cache avoids torch.cat during decode.
+    # Only useful for DCT mode — baseline needs contiguous KV for SDPA anyway,
+    # so the .contiguous() copy in step 7 would negate the savings.
+    if mode == "dct":
+        extra = args.warmup_steps + args.num_decode_steps + 16
+        past_key_values = pre_allocate_cache(past_key_values, extra_tokens=extra)
+        print(f"  Converted to pre-allocated cache (+{extra} tokens)")
 
     # Warmup decode steps (not profiled)
     print(f"  Warming up ({args.warmup_steps} steps)...")
