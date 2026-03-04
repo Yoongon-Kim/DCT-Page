@@ -863,3 +863,40 @@ def apply_rope_q_triton(
         )
 
     return out
+
+
+def apply_rope_q_direct(
+    query: torch.Tensor,
+    cos_flat: torch.Tensor,
+    sin_flat: torch.Tensor,
+    out_buf: torch.Tensor,
+) -> torch.Tensor:
+    """Apply RoPE to decode query — zero-overhead wrapper.
+
+    Unlike apply_rope_q_triton, this expects pre-flattened cos/sin
+    and a pre-allocated output buffer to avoid .contiguous() copies
+    and torch.empty_like allocation on every call.
+
+    Args:
+        query:    [bsz, num_heads, 1, head_dim]
+        cos_flat: [head_dim] — already contiguous (e.g. rope_cache[0, 0, pos])
+        sin_flat: [head_dim] — already contiguous
+        out_buf:  [bsz, num_heads, 1, head_dim] — pre-allocated output
+
+    Returns:
+        out_buf with RoPE applied
+    """
+    bsz, num_heads, _, head_dim = query.shape
+    q_flat = query.view(bsz * num_heads, head_dim)
+    o_flat = out_buf.view(bsz * num_heads, head_dim)
+    BLOCK_D = triton.next_power_of_2(head_dim)
+
+    with torch.cuda.device(query.device):
+        _apply_rope_q_kernel[(bsz * num_heads,)](
+            q_flat, cos_flat, sin_flat, o_flat,
+            q_flat.stride(0),
+            head_dim,
+            BLOCK_D=BLOCK_D,
+        )
+
+    return out_buf

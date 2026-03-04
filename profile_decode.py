@@ -72,6 +72,7 @@ from dct_page_attention import (
     _compute_rope_cos_sin,
 )
 # New fused kernels imported inside profiled_dct_page_attention_forward
+from triton_kernels import apply_rope_q_direct
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen2.modeling_qwen2 import eager_attention_forward
 
@@ -223,7 +224,7 @@ def profiled_dct_page_attention_forward(
         # Record events on the correct device's stream (critical for multi-GPU)
         _dev = hidden_states.device
         _stream = torch.cuda.current_stream(_dev)
-        ev = [torch.cuda.Event(enable_timing=True) for _ in range(10)]
+        ev = [torch.cuda.Event(enable_timing=True) for _ in range(11)]
         ev[0].record(_stream)
 
     # Step 1: QKV projection
@@ -356,31 +357,44 @@ def profiled_dct_page_attention_forward(
     if _enabled:
         ev[7].record(_stream)
 
-    # Step 6c: Q-RoPE (Triton kernel 3)
+    # Step 6c: Q-RoPE (zero-overhead wrapper — pre-flattened cos/sin, pre-allocated buf)
     if cfg.continuous_rope:
-        cos_q = self._rope_cos_cache[:, :, assembled_len - 1:assembled_len]
-        sin_q = self._rope_sin_cache[:, :, assembled_len - 1:assembled_len]
-        query_states = apply_rope_q_triton(query_states, cos_q, sin_q)
+        cos_q_flat = self._rope_cos_cache[0, 0, assembled_len - 1]  # [head_dim], contiguous
+        sin_q_flat = self._rope_sin_cache[0, 0, assembled_len - 1]  # [head_dim], contiguous
+        if not hasattr(self, '_q_rope_buf') or self._q_rope_buf.shape != query_states.shape:
+            self._q_rope_buf = torch.empty_like(query_states)
+        query_states = apply_rope_q_direct(query_states, cos_q_flat, sin_q_flat, self._q_rope_buf)
 
     if _enabled:
         ev[8].record(_stream)
 
     # Step 7: Attention + output projection
+    # from flash_attn import flash_attn_func
+    # attn_output = flash_attn_func(
+    #     query_states.transpose(1, 2),
+    #     final_k.transpose(1, 2),
+    #     final_v.transpose(1, 2),
+    #     causal=False,
+    # )
     attn_output = F.scaled_dot_product_attention(
         query_states, final_k, final_v,
         is_causal=False,
         enable_gqa=True,
     )
-    attn_output = attn_output.transpose(1, 2).contiguous()
+
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-    attn_output = self.o_proj(attn_output)
 
     if _enabled:
         ev[9].record(_stream)
+
+    attn_output = self.o_proj(attn_output)
+
+    if _enabled:
+        ev[10].record(_stream)
         step_names = [
             "1_qkv_proj", "2_rope_cache", "3_segment_kv",
             "4_dct_compress", "5_score_pages", "6a_topk",
-            "6b_assemble", "6c_q_rope", "7_attn_output",
+            "6b_assemble", "6c_q_rope", "7a_sdpa", "7b_o_proj",
         ]
         for i, name in enumerate(step_names):
             _pending_events.append((name, ev[i], ev[i + 1]))
@@ -440,7 +454,7 @@ def profiled_baseline_forward(
     # ---- Instrumented decode path (chained events) ----
     _dev = hidden_states.device
     _stream = torch.cuda.current_stream(_dev)
-    ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+    ev = [torch.cuda.Event(enable_timing=True) for _ in range(5)]
     ev[0].record(_stream)
 
     # Step 1: QKV projection
@@ -462,18 +476,27 @@ def profiled_baseline_forward(
     ev[2].record(_stream)
 
     # Step 7: Attention + output projection (named "7" for comparison with DCT)
-    attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get("sdpa", eager_attention_forward)
-    attn_output, attn_weights = attention_interface(
-        self, query_states, key_states, value_states, attention_mask,
-        dropout=0.0, scaling=self.scaling,
-        sliding_window=getattr(self, "sliding_window", None), **kwargs,
+    # from flash_attn import flash_attn_func
+    # attn_output = flash_attn_func(
+    #     query_states.transpose(1, 2),
+    #     key_states.transpose(1, 2),
+    #     value_states.transpose(1, 2),
+    #     causal=True,
+    # )
+    attn_output = F.scaled_dot_product_attention(
+        query_states, key_states, value_states,
+        is_causal=False,  # q_len=1 decode: no future positions to mask
+        enable_gqa=True,
     )
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-    attn_output = self.o_proj(attn_output)
 
     ev[3].record(_stream)
 
-    step_names = ["1_qkv_proj", "2_rope_cache", "7_attn_output"]
+    attn_output = self.o_proj(attn_output)
+
+    ev[4].record(_stream)
+
+    step_names = ["1_qkv_proj", "2_rope_cache", "7a_sdpa", "7b_o_proj"]
     for i, name in enumerate(step_names):
         _pending_events.append((name, ev[i], ev[i + 1]))
 
