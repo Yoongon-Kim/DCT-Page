@@ -224,7 +224,7 @@ def profiled_dct_page_attention_forward(
         # Record events on the correct device's stream (critical for multi-GPU)
         _dev = hidden_states.device
         _stream = torch.cuda.current_stream(_dev)
-        ev = [torch.cuda.Event(enable_timing=True) for _ in range(11)]
+        ev = [torch.cuda.Event(enable_timing=True) for _ in range(12)]
         ev[0].record(_stream)
 
     # Step 1: QKV projection
@@ -306,7 +306,7 @@ def profiled_dct_page_attention_forward(
         ev[4].record(_stream)
 
     # Step 5: Score pages (Triton kernel 1)
-    from triton_kernels import score_pages_triton, assemble_kv_full_triton, assemble_kv_split_triton, apply_rope_q_triton
+    from triton_kernels import score_pages_triton, assemble_kv_full_triton, assemble_kv_split_triton, apply_rope_q_triton, topk_sort_triton
     page_scores = score_pages_triton(
         query_states, comp_k,
         cfg.scoring_method, cfg.group_agg_method,
@@ -316,10 +316,12 @@ def profiled_dct_page_attention_forward(
     if _enabled:
         ev[5].record(_stream)
 
-    # Step 6a: TopK + sort
+    # Step 6a: TopK + sort (fused Triton kernel — replaces torch.topk + .sort + .to(int32))
     actual_top_k = min(cfg.top_k, num_pages)
-    _, top_indices = torch.topk(page_scores, actual_top_k, dim=-1)
-    selected_indices, _ = top_indices.sort(dim=-1)
+    selected_indices = topk_sort_triton(page_scores, actual_top_k)
+
+    if _enabled:
+        ev[6].record(_stream)
 
     num_unselected = num_pages - actual_top_k
     middle_len = actual_top_k * cfg.page_size + num_unselected * comp_size
@@ -340,11 +342,21 @@ def profiled_dct_page_attention_forward(
             self._rope_cos_cache = cos_cached
             self._rope_sin_cache = sin_cached
             self._rope_cache_len = max_len
-        cos_table = self._rope_cos_cache[0, 0, :assembled_len].contiguous()
-        sin_table = self._rope_sin_cache[0, 0, :assembled_len].contiguous()
+        cos_table = self._rope_cos_cache[0, 0, :assembled_len]
+        sin_table = self._rope_sin_cache[0, 0, :assembled_len]
+
+    # Pre-allocate or expand output buffers (avoids torch.empty per step)
+    _buf_len = getattr(self, '_assemble_buf_len', 0)
+    if assembled_len > _buf_len:
+        _max_len = assembled_len + cfg.page_size
+        num_kv_heads = comp_k.shape[1]
+        self._final_k_buf = torch.empty(bsz, num_kv_heads, _max_len, self.head_dim, dtype=comp_k.dtype, device=comp_k.device)
+        self._final_v_buf = torch.empty_like(self._final_k_buf)
+        self._sel_idx_buf = torch.empty(bsz, num_kv_heads, actual_top_k, dtype=torch.int32, device=comp_k.device)
+        self._assemble_buf_len = _max_len
 
     if _enabled:
-        ev[6].record(_stream)
+        ev[7].record(_stream)
 
     # Step 6b: Assemble + K-RoPE (Triton kernel 2 — split version)
     final_k, final_v = assemble_kv_split_triton(
@@ -352,10 +364,13 @@ def profiled_dct_page_attention_forward(
         sink_k, sink_v, recent_k, recent_v,
         selected_indices,
         cos_table, sin_table,
+        out_k=self._final_k_buf,
+        out_v=self._final_v_buf,
+        out_sel_idx=self._sel_idx_buf,
     )
 
     if _enabled:
-        ev[7].record(_stream)
+        ev[8].record(_stream)
 
     # Step 6c: Q-RoPE (zero-overhead wrapper — pre-flattened cos/sin, pre-allocated buf)
     if cfg.continuous_rope:
@@ -366,7 +381,7 @@ def profiled_dct_page_attention_forward(
         query_states = apply_rope_q_direct(query_states, cos_q_flat, sin_q_flat, self._q_rope_buf)
 
     if _enabled:
-        ev[8].record(_stream)
+        ev[9].record(_stream)
 
     # Step 7: Attention + output projection
     # from flash_attn import flash_attn_func
@@ -385,16 +400,16 @@ def profiled_dct_page_attention_forward(
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
 
     if _enabled:
-        ev[9].record(_stream)
+        ev[10].record(_stream)
 
     attn_output = self.o_proj(attn_output)
 
     if _enabled:
-        ev[10].record(_stream)
+        ev[11].record(_stream)
         step_names = [
             "1_qkv_proj", "2_rope_cache", "3_segment_kv",
             "4_dct_compress", "5_score_pages", "6a_topk",
-            "6b_assemble", "6c_q_rope", "7a_sdpa", "7b_o_proj",
+            "6a_rope", "6b_assemble", "6c_q_rope", "7a_sdpa", "7b_o_proj",
         ]
         for i, name in enumerate(step_names):
             _pending_events.append((name, ev[i], ev[i + 1]))

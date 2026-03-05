@@ -731,11 +731,61 @@ def dct_page_attention_forward(
         query_states, comp_k, cfg, self.num_key_value_groups
     )
 
-    if selected_indices_or_none is not None:
-        # Non-Triton path returned indices directly
+    if selected_indices_or_none is None:
+        # Triton scoring path: page_scores returned, do topk here
+        actual_top_k = min(cfg.top_k, num_pages)
+        _, top_indices = torch.topk(page_scores, actual_top_k, dim=-1)
+        selected_indices, _ = top_indices.sort(dim=-1)
+    else:
+        selected_indices = selected_indices_or_none
+
+    use_triton_assemble = cfg.use_triton and cfg.unselected_mode == "compressed"
+
+    if use_triton_assemble:
+        # Fused Triton assemble (only for compressed mode)
+        from triton_kernels import assemble_kv_split_triton, apply_rope_q_triton
+
+        actual_top_k = selected_indices.shape[2]
+        num_unselected = num_pages - actual_top_k
+        middle_len = actual_top_k * cfg.page_size + num_unselected * comp_size
+        assembled_len = cfg.sink_size + middle_len + actual_recent
+
+        cos_table = None
+        sin_table = None
+        if cfg.continuous_rope:
+            cached_len = getattr(self, '_rope_cache_len', 0)
+            if assembled_len > cached_len:
+                max_len = assembled_len + cfg.page_size
+                positions = torch.arange(max_len, device=comp_k.device)
+                cos_cached, sin_cached = _compute_rope_cos_sin(
+                    positions, self.head_dim,
+                    getattr(self.config, 'rope_theta', self.config.rope_parameters['rope_theta'] if hasattr(self.config, 'rope_parameters') else 500000.0),
+                    comp_k.device, comp_k.dtype,
+                )
+                self._rope_cos_cache = cos_cached
+                self._rope_sin_cache = sin_cached
+                self._rope_cache_len = max_len
+            # cos/sin: [1, 1, len, head_dim] → [len, head_dim] for kernel
+            cos_table = self._rope_cos_cache[0, 0, :assembled_len]
+            sin_table = self._rope_sin_cache[0, 0, :assembled_len]
+
+        final_k, final_v = assemble_kv_split_triton(
+            paged_k, paged_v, comp_k, comp_v,
+            sink_k, sink_v, recent_k, recent_v,
+            selected_indices,
+            cos_table, sin_table,
+        )
+
+        # Q-RoPE (Triton kernel)
+        if cfg.continuous_rope:
+            cos_q = self._rope_cos_cache[:, :, assembled_len - 1:assembled_len]
+            sin_q = self._rope_sin_cache[:, :, assembled_len - 1:assembled_len]
+            query_states = apply_rope_q_triton(query_states, cos_q, sin_q)
+    else:
+        # PyTorch path (drop mode, or use_triton=False)
         final_k, final_v = assemble_kv(
             sink_k, sink_v, paged_k, paged_v, comp_k, comp_v,
-            recent_k, recent_v, selected_indices_or_none, cfg, num_pages
+            recent_k, recent_v, selected_indices, cfg, num_pages
         )
         if cfg.continuous_rope:
             assembled_len = final_k.shape[2]
@@ -757,51 +807,6 @@ def dct_page_attention_forward(
             sin_q = self._rope_sin_cache[:, :, assembled_len - 1:assembled_len]
             final_k = _apply_rope(final_k, cos_k, sin_k)
             query_states = _apply_rope(query_states, cos_q, sin_q)
-    else:
-        # Triton path: page_scores returned, do topk then assemble
-        from triton_kernels import assemble_kv_split_triton, apply_rope_q_triton
-
-        # Step 6.5: TopK selection (torch.topk — trivially fast on small tensor)
-        actual_top_k = min(cfg.top_k, num_pages)
-        _, top_indices = torch.topk(page_scores, actual_top_k, dim=-1)
-        selected_indices, _ = top_indices.sort(dim=-1)
-
-        # Step 7: Precompute RoPE tables + fused assemble (Triton kernel 2)
-        num_unselected = num_pages - actual_top_k
-        middle_len = actual_top_k * cfg.page_size + num_unselected * comp_size
-        assembled_len = cfg.sink_size + middle_len + actual_recent
-
-        cos_table = None
-        sin_table = None
-        if cfg.continuous_rope:
-            cached_len = getattr(self, '_rope_cache_len', 0)
-            if assembled_len > cached_len:
-                max_len = assembled_len + cfg.page_size
-                positions = torch.arange(max_len, device=comp_k.device)
-                cos_cached, sin_cached = _compute_rope_cos_sin(
-                    positions, self.head_dim,
-                    getattr(self.config, 'rope_theta', self.config.rope_parameters['rope_theta'] if hasattr(self.config, 'rope_parameters') else 500000.0),
-                    comp_k.device, comp_k.dtype,
-                )
-                self._rope_cos_cache = cos_cached
-                self._rope_sin_cache = sin_cached
-                self._rope_cache_len = max_len
-            # cos/sin: [1, 1, len, head_dim] → [len, head_dim] for kernel
-            cos_table = self._rope_cos_cache[0, 0, :assembled_len].contiguous()
-            sin_table = self._rope_sin_cache[0, 0, :assembled_len].contiguous()
-
-        final_k, final_v = assemble_kv_split_triton(
-            paged_k, paged_v, comp_k, comp_v,
-            sink_k, sink_v, recent_k, recent_v,
-            selected_indices,
-            cos_table, sin_table,
-        )
-
-        # Step 7.5: Q-RoPE (Triton kernel 3)
-        if cfg.continuous_rope:
-            cos_q = self._rope_cos_cache[:, :, assembled_len - 1:assembled_len]
-            sin_q = self._rope_sin_cache[:, :, assembled_len - 1:assembled_len]
-            query_states = apply_rope_q_triton(query_states, cos_q, sin_q)
 
     # Step 8: Compute attention (no causal mask needed for q_len=1)
     attn_output = F.scaled_dot_product_attention(

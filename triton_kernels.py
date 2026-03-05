@@ -153,6 +153,100 @@ def score_pages_triton(
 
 
 # ---------------------------------------------------------------------------
+# Kernel 1b: Fused TopK + Sort (replaces torch.topk + .sort + .to(int32))
+# ---------------------------------------------------------------------------
+@triton.jit
+def _topk_sort_kernel(
+    scores_ptr,       # [bsz * num_kv_heads, num_pages] (flat)
+    out_ptr,          # [bsz * num_kv_heads, top_k] (flat)
+    s_stride_bh,      # stride for (batch*head) dim of scores
+    o_stride_bh,      # stride for (batch*head) dim of output
+    num_pages,
+    TOP_K: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+):
+    """One program per (batch, kv_head). Finds top-k page indices sorted ascending.
+
+    Algorithm: k rounds of argmax (mask-and-repeat), then vectorized bubble sort.
+    """
+    pid = tl.program_id(0)
+    base_s = scores_ptr + pid * s_stride_bh
+    base_o = out_ptr + pid * o_stride_bh
+
+    # Load all page scores
+    p_idx = tl.arange(0, BLOCK_P)
+    mask = p_idx < num_pages
+    scores = tl.load(base_s + p_idx, mask=mask, other=float('-inf'))
+
+    # Phase 1: iterative argmax to find top-k indices
+    k_idx = tl.arange(0, TOP_K)
+    top_indices = tl.zeros([TOP_K], dtype=tl.int32)
+
+    for _k in range(TOP_K):
+        best_val = tl.max(scores, axis=0)
+        is_best = (scores == best_val) & mask
+        best_idx = tl.min(tl.where(is_best, p_idx, BLOCK_P), axis=0)
+        top_indices = tl.where(k_idx == _k, best_idx.to(tl.int32), top_indices)
+        scores = tl.where(p_idx == best_idx, float('-inf'), scores)
+
+    # Phase 2: bubble sort ascending (TOP_K is small, fully unrolled)
+    for i in range(TOP_K - 1):
+        for j in range(TOP_K - 1):
+            # Load pair
+            left_mask = k_idx == j
+            right_mask = k_idx == (j + 1)
+            left_val = tl.sum(tl.where(left_mask, top_indices, 0))
+            right_val = tl.sum(tl.where(right_mask, top_indices, 0))
+            # Swap if out of order
+            do_swap = left_val > right_val
+            new_left = tl.where(do_swap, right_val, left_val)
+            new_right = tl.where(do_swap, left_val, right_val)
+            top_indices = tl.where(left_mask, new_left.to(tl.int32), top_indices)
+            top_indices = tl.where(right_mask, new_right.to(tl.int32), top_indices)
+
+    # Store sorted int32 indices
+    tl.store(base_o + k_idx, top_indices)
+
+
+def topk_sort_triton(
+    page_scores: torch.Tensor,
+    top_k: int,
+) -> torch.Tensor:
+    """Fused top-k selection + ascending sort + int32 cast in one kernel.
+
+    Replaces: torch.topk() + .sort() + .to(int32)
+
+    Args:
+        page_scores: [bsz, num_kv_heads, num_pages] float32
+        top_k: number of pages to select
+
+    Returns:
+        selected_indices: [bsz, num_kv_heads, top_k] int32, sorted ascending
+    """
+    bsz, num_kv_heads, num_pages = page_scores.shape
+    BLOCK_P = triton.next_power_of_2(num_pages)
+
+    selected = torch.empty(
+        bsz, num_kv_heads, top_k,
+        dtype=torch.int32, device=page_scores.device,
+    )
+
+    grid = (bsz * num_kv_heads,)
+
+    with torch.cuda.device(page_scores.device):
+        _topk_sort_kernel[grid](
+            page_scores, selected,
+            page_scores.stride(1),  # stride per (batch*head) in scores
+            selected.stride(1),     # stride per (batch*head) in output
+            num_pages,
+            TOP_K=top_k,
+            BLOCK_P=BLOCK_P,
+        )
+
+    return selected
+
+
+# ---------------------------------------------------------------------------
 # Kernel 2: Fused Assemble + K-RoPE + sink/recent
 # ---------------------------------------------------------------------------
 @triton.jit
@@ -331,6 +425,9 @@ def assemble_kv_full_triton(
     selected_indices: torch.Tensor,
     cos_table: torch.Tensor = None,
     sin_table: torch.Tensor = None,
+    out_k: torch.Tensor = None,
+    out_v: torch.Tensor = None,
+    out_sel_idx: torch.Tensor = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused assemble: sink/middle/recent copy + K-RoPE in one kernel.
 
@@ -344,6 +441,8 @@ def assemble_kv_full_triton(
         selected_indices: [bsz, num_kv_heads, top_k] (int64, sorted ascending)
         cos_table:        [total_len, head_dim] (optional, for K-RoPE)
         sin_table:        [total_len, head_dim] (optional, for K-RoPE)
+        out_k/v:          Pre-allocated output buffers (optional)
+        out_sel_idx:      Pre-allocated int32 index buffer (optional)
 
     Returns:
         final_k, final_v: [bsz, num_kv_heads, total_len, head_dim]
@@ -363,15 +462,25 @@ def assemble_kv_full_triton(
     if not comp_v.is_contiguous():
         comp_v = comp_v.contiguous()
 
-    # Ensure int32 for Triton (torch.topk returns int64)
-    sel_idx = selected_indices.to(torch.int32).contiguous()
-
     apply_rope = cos_table is not None and sin_table is not None
+    device = paged_k.device
+    dtype = paged_k.dtype
 
-    # Allocate output
-    final_k = torch.empty(bsz, num_kv_heads, total_len, head_dim,
-                           dtype=paged_k.dtype, device=paged_k.device)
-    final_v = torch.empty_like(final_k)
+    # Reuse pre-allocated output buffers if provided and large enough
+    if out_k is not None and out_k.shape[2] >= total_len:
+        final_k = out_k[:, :, :total_len, :]
+        final_v = out_v[:, :, :total_len, :]
+    else:
+        final_k = torch.empty(bsz, num_kv_heads, total_len, head_dim,
+                               dtype=dtype, device=device)
+        final_v = torch.empty_like(final_k)
+
+    # Reuse pre-allocated sel_idx buffer if provided
+    if out_sel_idx is not None and out_sel_idx.shape[2] >= top_k:
+        sel_idx = out_sel_idx[:, :, :top_k]
+        sel_idx.copy_(selected_indices)
+    else:
+        sel_idx = selected_indices.to(torch.int32)
 
     # --- Diagnostic: time wrapper vs kernel ---
     _diag = getattr(assemble_kv_full_triton, '_diag', False)
@@ -391,8 +500,6 @@ def assemble_kv_full_triton(
 
     # RoPE strides (or dummy if not applying)
     if apply_rope:
-        cos_table = cos_table.contiguous()
-        sin_table = sin_table.contiguous()
         rope_stride_t = cos_table.stride(0)
         cos_ptr = cos_table
         sin_ptr = sin_table
@@ -687,12 +794,18 @@ def assemble_kv_split_triton(
     selected_indices: torch.Tensor,
     cos_table: torch.Tensor = None,
     sin_table: torch.Tensor = None,
+    out_k: torch.Tensor = None,
+    out_v: torch.Tensor = None,
+    out_sel_idx: torch.Tensor = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Assemble KV using split kernels. Same API as assemble_kv_full_triton.
 
     Kernel A: sink + selected pages + recent (all inside Triton)
     Kernel B: unselected compressed pages (branch-free)
     No PyTorch tensor ops between kernel launches.
+
+    Optional pre-allocated buffers (out_k, out_v, out_sel_idx) can be passed
+    to avoid per-step memory allocation.
     """
     bsz, num_kv_heads, num_pages, page_size, head_dim = paged_k.shape
     comp_size = comp_k.shape[3]
@@ -703,27 +816,28 @@ def assemble_kv_split_triton(
     middle_len = top_k * page_size + num_unselected * comp_size
     total_len = sink_len + middle_len + recent_len
 
-    if not comp_k.is_contiguous():
-        comp_k = comp_k.contiguous()
-    if not comp_v.is_contiguous():
-        comp_v = comp_v.contiguous()
-
     apply_rope = cos_table is not None and sin_table is not None
     device = paged_k.device
     dtype = paged_k.dtype
 
-    # Allocate output
-    final_k = torch.empty(bsz, num_kv_heads, total_len, head_dim, dtype=dtype, device=device)
-    final_v = torch.empty_like(final_k)
+    # Reuse pre-allocated output buffers if provided and large enough
+    if out_k is not None and out_k.shape[2] >= total_len:
+        final_k = out_k[:, :, :total_len, :]
+        final_v = out_v[:, :, :total_len, :]
+    else:
+        final_k = torch.empty(bsz, num_kv_heads, total_len, head_dim, dtype=dtype, device=device)
+        final_v = torch.empty_like(final_k)
 
-    # Int32 indices for Triton
-    sel_idx = selected_indices.to(torch.int32).contiguous()
+    # Reuse pre-allocated sel_idx buffer if provided
+    if out_sel_idx is not None and out_sel_idx.shape[2] >= top_k:
+        sel_idx = out_sel_idx[:, :, :top_k]
+        sel_idx.copy_(selected_indices)
+    else:
+        sel_idx = selected_indices.to(torch.int32)
 
     # RoPE setup
     BLOCK_D = triton.next_power_of_2(head_dim)
     if apply_rope:
-        cos_table = cos_table.contiguous()
-        sin_table = sin_table.contiguous()
         rope_stride_t = cos_table.stride(0)
         cos_ptr = cos_table
         sin_ptr = sin_table

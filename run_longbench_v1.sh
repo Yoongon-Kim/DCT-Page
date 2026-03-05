@@ -43,10 +43,10 @@ fi
 #     $TASK_ARGS
 
 # ---- Step 2: Sweep top_k x scoring_method x group_agg_method x mode ----
-for TOP_K in 16; do #4 8 16 32; do
+for TOP_K in 4; do #4 8 16 32; do
     for SCORING_METHOD in mean; do
         for GAM in max; do
-            for MODE in compressed drop; do
+            for MODE in drop; do
                 echo ""
                 echo "===================================================================="
                 echo "PAGE ATTENTION: top_k=${TOP_K}, scoring_method=${SCORING_METHOD}, group_agg=${GAM}, mode=${MODE}"
