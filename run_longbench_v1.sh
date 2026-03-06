@@ -46,7 +46,7 @@ fi
 for TOP_K in 4; do #4 8 16 32; do
     for SCORING_METHOD in mean; do
         for GAM in max; do
-            for MODE in drop; do
+            for MODE in compressed; do
                 echo ""
                 echo "===================================================================="
                 echo "PAGE ATTENTION: top_k=${TOP_K}, scoring_method=${SCORING_METHOD}, group_agg=${GAM}, mode=${MODE}"

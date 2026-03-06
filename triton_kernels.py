@@ -322,11 +322,6 @@ def _assemble_kv_full_kernel(
     count_before = tl.sum((sel_indices < page_idx).to(tl.int32))
 
     # Token count and write offset for this segment
-    # Sink: sink_len tokens, starts at 0
-    # Page p: page_size (selected) or comp_size (unselected)
-    #         write_start = sink_len + p * comp_size + count_selected_before * (page_size - comp_size)
-    # Recent: recent_len tokens, starts at total_len - recent_len
-
     if is_sink:
         num_tokens = sink_len
         write_start = 0
