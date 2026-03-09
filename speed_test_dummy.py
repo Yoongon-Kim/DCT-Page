@@ -22,6 +22,7 @@ from pathlib import Path
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.cache_utils import DynamicLayer
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +110,59 @@ def apply_dct_patch(args, model=None):
 
 
 # ---------------------------------------------------------------------------
+# Pre-allocated KV cache (avoids torch.cat during decode)
+# ---------------------------------------------------------------------------
+class PreAllocatedLayer(DynamicLayer):
+    """Drop-in replacement for DynamicLayer that uses pre-allocated buffers."""
+
+    @classmethod
+    def from_dynamic_layer(cls, layer, extra_tokens):
+        new_layer = cls()
+        k, v = layer.keys, layer.values
+        bsz, heads, seq_len, dim = k.shape
+
+        alloc_len = seq_len + extra_tokens
+        new_layer.keys = torch.empty(bsz, heads, alloc_len, dim,
+                                     dtype=k.dtype, device=k.device)
+        new_layer.values = torch.empty(bsz, heads, alloc_len, dim,
+                                       dtype=v.dtype, device=v.device)
+        new_layer.keys[:, :, :seq_len, :] = k
+        new_layer.values[:, :, :seq_len, :] = v
+
+        new_layer._seen = seq_len
+        new_layer._alloc_len = alloc_len
+        new_layer.is_initialized = True
+        new_layer.dtype = k.dtype
+        new_layer.device = k.device
+        return new_layer
+
+    def update(self, key_states, value_states, cache_kwargs=None):
+        seq_len = key_states.shape[-2]
+        start = self._seen
+        end = start + seq_len
+
+        self.keys[:, :, start:end, :] = key_states
+        self.values[:, :, start:end, :] = value_states
+        self._seen = end
+
+        return self.keys[:, :, :end, :], self.values[:, :, :end, :]
+
+    def get_seq_length(self):
+        return self._seen
+
+
+def pre_allocate_cache(cache, extra_tokens=256):
+    """Convert a DynamicCache (after prefill) to use pre-allocated layers."""
+    for i, layer in enumerate(cache.layers):
+        cache.layers[i] = PreAllocatedLayer.from_dynamic_layer(layer, extra_tokens)
+    return cache
+
+
+# ---------------------------------------------------------------------------
 # Per-sample timing (no EOS stopping — always generates max_new_tokens)
 # ---------------------------------------------------------------------------
-def time_sample(model, tokenizer, input_ids, max_new_tokens, warmup_steps):
+def time_sample(model, tokenizer, input_ids, max_new_tokens, warmup_steps,
+                use_pre_alloc=False):
     device = input_ids.device
     prefill_len = input_ids.shape[1]
 
@@ -124,6 +175,10 @@ def time_sample(model, tokenizer, input_ids, max_new_tokens, warmup_steps):
 
     past_key_values = out.past_key_values
     next_token = out.logits[:, -1:].argmax(dim=-1)
+
+    if use_pre_alloc:
+        extra = max_new_tokens + 16
+        past_key_values = pre_allocate_cache(past_key_values, extra_tokens=extra)
 
     step_times = []
     for step in range(max_new_tokens):
@@ -218,12 +273,14 @@ def make_run_name(label, args):
 def benchmark_dummy(model, tokenizer, args, label, context_lengths):
     device = next(model.parameters()).device
     vocab_size = tokenizer.vocab_size
+    use_pre_alloc = (label == "dct") and not getattr(args, 'no_triton', False)
 
     # Warmup run: triggers CUDA kernel compilation and memory allocation
     warmup_len = min(context_lengths)
     warmup_ids = torch.randint(0, vocab_size, (1, warmup_len), dtype=torch.long, device=device)
     print(f"  [{label}] Warmup run (ctx={warmup_len})...")
-    time_sample(model, tokenizer, warmup_ids, min(16, args.max_new_tokens), 0)
+    time_sample(model, tokenizer, warmup_ids, min(16, args.max_new_tokens), 0,
+                use_pre_alloc=use_pre_alloc)
     del warmup_ids
     torch.cuda.empty_cache()
 
@@ -246,7 +303,8 @@ def benchmark_dummy(model, tokenizer, args, label, context_lengths):
             )
 
             prefill_time, step_times, n_generated = time_sample(
-                model, tokenizer, input_ids, args.max_new_tokens, args.warmup_steps
+                model, tokenizer, input_ids, args.max_new_tokens, args.warmup_steps,
+                use_pre_alloc=use_pre_alloc,
             )
 
             per_length_stats[ctx_len]["prefill_times"].append(prefill_time)
@@ -347,6 +405,7 @@ def save_summary(stats, run_dir, args, label):
             "compress_ratio": args.compress_ratio,
             "scoring_method": args.scoring_method,
             "unselected_mode": args.unselected_mode,
+            "use_triton": not getattr(args, 'no_triton', False),
         })
     path = Path(run_dir) / "summary.json"
     path.write_text(json.dumps(summary, indent=2))
