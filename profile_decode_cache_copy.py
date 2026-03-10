@@ -229,7 +229,7 @@ def profiled_dct_page_attention_forward(
         # Record events on the correct device's stream (critical for multi-GPU)
         _dev = hidden_states.device
         _stream = torch.cuda.current_stream(_dev)
-        ev = [torch.cuda.Event(enable_timing=True) for _ in range(12)]
+        ev = [torch.cuda.Event(enable_timing=True) for _ in range(11)]
         _cpu_ts = []
 
         def _rec(i):
@@ -454,7 +454,7 @@ def profiled_dct_page_attention_forward(
         step_names = [
             "1_qkv_proj", "2_rope_cache", "3_segment_kv",
             "4_dct_compress", "5_score_pages", "6a_topk_sort",
-            "6a_ropetable_buffersetting", "6b_assemble", "6c_q_rope", "7a_sdpa", "7b_o_proj",
+            "6a_ropetable_buffersetting", "6b_assemble", "7a_sdpa", "7b_o_proj",
         ]
         for i, name in enumerate(step_names):
             _pending_events.append((name, ev[i], ev[i + 1]))
