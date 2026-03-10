@@ -375,29 +375,11 @@ def segment_kv(key_states, value_states, cfg):
 # ---------------------------------------------------------------------------
 def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size):
     """
-    Incrementally maintain DCT-compressed page representations on the
-    attention module instance using pre-allocated buffers.
+    Incrementally maintain DCT-compressed page representations.
 
-    Uses index assignment into a pre-allocated buffer instead of torch.cat,
-    so tensor strides remain fixed across all decode steps (enabling stride
-    caching in Triton kernels).
-
-    The buffer is allocated for max_pages = (max_position_embeddings - sink_size
-    - recent_size) // page_size on first use.
-
-    Cache reset: if num_pages drops below the cached count (new sequence) or
-    the batch size / comp_size changes, the cache is wiped and rebuilt.
-
-    Args:
-        attn_module : the Attention instance (cache lives here as attributes)
-        paged_k     : [bsz, num_kv_heads, num_pages, page_size, head_dim]
-        paged_v     : [bsz, num_kv_heads, num_pages, page_size, head_dim]
-        num_pages   : int — total finalized pages in current KV cache
-        comp_size   : int — DCT output length per page
-
-    Returns:
-        comp_k : [bsz, num_kv_heads, num_pages, comp_size, head_dim]  (view)
-        comp_v : [bsz, num_kv_heads, num_pages, comp_size, head_dim]  (view)
+    Uses torch.cat to append new compressed pages. Output is always contiguous,
+    which keeps score_pages_triton L2-cache-friendly.  The comp_k strides change
+    every step (dim-2 grows), so they must NOT be cached — compute them live.
     """
     bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
 
@@ -409,43 +391,36 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size):
             or num_pages < n_cached
             or cached_k.shape[0] != bsz
             or cached_k.shape[3] != comp_size):
-        # Pre-allocate for max possible pages using model config
-        cfg = _dct_page_cfg
-        max_pos = getattr(attn_module.config, 'max_position_embeddings', 131072)
-        max_pages = (max_pos - cfg.sink_size - cfg.recent_size) // cfg.page_size
-        attn_module._dct_comp_k_cache = torch.zeros(
-            bsz, num_kv_heads, max_pages, comp_size, head_dim,
-            dtype=paged_k.dtype, device=paged_k.device,
-        )
-        attn_module._dct_comp_v_cache = torch.zeros_like(attn_module._dct_comp_k_cache)
+        attn_module._dct_comp_k_cache  = None
+        attn_module._dct_comp_v_cache  = None
         attn_module._dct_n_pages_cached = 0
         n_cached = 0
 
     n_new = num_pages - n_cached
     if n_new > 0:
-        # Compress only the newly finalized pages
-        new_k = paged_k[:, :, n_cached:num_pages]  # [bsz, num_kv_heads, n_new, page_size, head_dim]
+        new_k = paged_k[:, :, n_cached:num_pages]
         new_v = paged_v[:, :, n_cached:num_pages]
 
-        # Projection matrix: single matmul replaces ~30 FFT kernel launches
         M = _get_or_build_projection_matrix(
             attn_module, page_size, comp_size, new_k.device, new_k.dtype
         )
-        # M: [comp_size, page_size]
-        # new_k: [bsz, num_kv_heads, n_new, page_size, head_dim]
-        # result: [bsz, num_kv_heads, n_new, comp_size, head_dim]
         new_comp_k = torch.einsum('cs,bhnsd->bhncd', M, new_k)
         new_comp_v = torch.einsum('cs,bhnsd->bhncd', M, new_v)
 
-        # Index assignment into pre-allocated buffer (strides stay fixed)
-        attn_module._dct_comp_k_cache[:, :, n_cached:num_pages, :, :] = new_comp_k
-        attn_module._dct_comp_v_cache[:, :, n_cached:num_pages, :, :] = new_comp_v
+        if attn_module._dct_comp_k_cache is None:
+            attn_module._dct_comp_k_cache = new_comp_k
+            attn_module._dct_comp_v_cache = new_comp_v
+        else:
+            attn_module._dct_comp_k_cache = torch.cat(
+                [attn_module._dct_comp_k_cache, new_comp_k], dim=2
+            )
+            attn_module._dct_comp_v_cache = torch.cat(
+                [attn_module._dct_comp_v_cache, new_comp_v], dim=2
+            )
 
         attn_module._dct_n_pages_cached = num_pages
 
-    # Return view of valid portion (strides same as parent buffer)
-    return (attn_module._dct_comp_k_cache[:, :, :num_pages, :, :],
-            attn_module._dct_comp_v_cache[:, :, :num_pages, :, :])
+    return attn_module._dct_comp_k_cache, attn_module._dct_comp_v_cache
 
 
 # ---------------------------------------------------------------------------

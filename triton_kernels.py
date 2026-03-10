@@ -1037,7 +1037,7 @@ def build_assemble_stride_cache(
         'sink_strides': (sink_k.stride(0), sink_k.stride(1), sink_k.stride(2)),
         'recent_strides': (recent_k.stride(0), recent_k.stride(1), recent_k.stride(2)),
         'out_strides': (out_k.stride(0), out_k.stride(1), out_k.stride(2)),
-        'comp_strides': (comp_k.stride(0), comp_k.stride(1), comp_k.stride(2), comp_k.stride(3)),
+        # comp_strides NOT cached — comp_k from torch.cat changes strides every step
         'sel_strides': (selected_indices.stride(0), selected_indices.stride(1)) if selected_indices is not None else (0, 0),
         'rope_stride_t': rope_stride_t,
         'q_stride_h': q_stride_h,
@@ -1086,12 +1086,12 @@ def _assemble_kv_split_stride_cached(
         q_rope_cos = final_k
         q_rope_sin = final_k
 
-    # All strides cached (PreAllocatedLayer + pre-allocated comp buffers ensure fixed strides)
+    # Strides: most cached, comp_strides computed live (torch.cat changes them each step)
     ps = c['paged_strides']
     ss = c['sink_strides']
     rs = c['recent_strides']
     os = c['out_strides']
-    cs = c['comp_strides']
+    cs = (comp_k.stride(0), comp_k.stride(1), comp_k.stride(2), comp_k.stride(3))
     si = c['sel_strides']
 
     # Recompute grids (cheap integer ops)
@@ -1190,7 +1190,7 @@ def build_assemble_cache(
         'sink_strides': (sink_k.stride(0), sink_k.stride(1), sink_k.stride(2)),
         'recent_strides': (recent_k.stride(0), recent_k.stride(1), recent_k.stride(2)),
         'out_strides': (out_k.stride(0), out_k.stride(1), out_k.stride(2)),
-        'comp_strides': (comp_k.stride(0), comp_k.stride(1), comp_k.stride(2), comp_k.stride(3)),
+        # comp_strides NOT cached — comp_k from torch.cat changes strides every step
         'sel_strides': (selected_indices.stride(0), selected_indices.stride(1)),
         'rope_stride_t': rope_stride_t,
         'q_stride_h': q_stride_h,
@@ -1240,7 +1240,7 @@ def _assemble_kv_split_cached(
     ss = c['sink_strides']
     rs = c['recent_strides']
     os = c['out_strides']
-    cs = c['comp_strides']
+    cs = (comp_k.stride(0), comp_k.stride(1), comp_k.stride(2), comp_k.stride(3))
     si = c['sel_strides']
 
     # Ensure correct CUDA device context for Triton kernel launch (multi-GPU)
