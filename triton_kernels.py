@@ -93,18 +93,25 @@ def _score_pages_fused_kernel(
     tl.store(out_ptrs, agg_scores, mask=p_mask)
 
 
+_SCORING_MAP = {"max": 0, "mean": 1, "sum": 2}
+_GROUP_AGG_MAP = {"mean": 0, "max": 1}
+
+
 def score_pages_triton(
     query_states: torch.Tensor,
     compressed_keys: torch.Tensor,
     scoring_method: str,
     group_agg_method: str,
     num_kv_groups: int,
+    out: torch.Tensor = None,
 ) -> torch.Tensor:
     """Score all pages. Returns page_scores only (topk deferred to assemble kernel).
 
     Args:
         query_states:    [bsz, num_heads, 1, head_dim]
         compressed_keys: [bsz, num_kv_heads, num_pages, comp_size, head_dim]
+        out: optional pre-allocated [bsz, num_kv_heads, capacity] float32 buffer
+             (capacity >= num_pages). Stride(1) may differ from num_pages.
 
     Returns:
         page_scores: [bsz, num_kv_heads, num_pages] (float32)
@@ -118,27 +125,42 @@ def score_pages_triton(
     query = query_states.squeeze(2).reshape(bsz, num_kv_heads, num_kv_groups, head_dim).contiguous()
     compressed_keys = compressed_keys.contiguous()
 
-    page_scores = torch.empty(
-        bsz, num_kv_heads, num_pages,
-        dtype=torch.float32, device=query.device,
-    )
+    if out is not None:
+        page_scores = out[:, :, :num_pages]
+        ps_stride_bh = out.shape[2]   # stride(1) = alloc capacity
+    else:
+        page_scores = torch.empty(
+            bsz, num_kv_heads, num_pages,
+            dtype=torch.float32, device=query.device,
+        )
+        ps_stride_bh = num_pages
 
-    SCORING = {"max": 0, "mean": 1, "sum": 2}[scoring_method]
-    GROUP_AGG = {"mean": 0, "max": 1}[group_agg_method]
+    SCORING = _SCORING_MAP[scoring_method]
+    GROUP_AGG = _GROUP_AGG_MAP[group_agg_method]
     BLOCK_D = triton.next_power_of_2(head_dim)
     BLOCK_P = 32
+
+    # query is contiguous [bsz, num_kv_heads, num_kv_groups, head_dim] — compute strides
+    q_stride_0 = num_kv_heads * num_kv_groups * head_dim
+    q_stride_1 = num_kv_groups * head_dim
+    q_stride_2 = head_dim
+    # compressed_keys is contiguous [bsz, num_kv_heads, num_pages, comp_size, head_dim]
+    ck_stride_3 = head_dim
+    ck_stride_2 = comp_size * head_dim
+    ck_stride_1 = num_pages * ck_stride_2
+    ck_stride_0 = num_kv_heads * ck_stride_1
+    # page_scores stride(0) based on actual buffer stride(1)
+    ps_stride_0 = num_kv_heads * ps_stride_bh
 
     num_page_tiles = (num_pages + BLOCK_P - 1) // BLOCK_P
     grid = (bsz * num_kv_heads, num_page_tiles)
 
-    # Ensure correct CUDA device context for Triton kernel launch (multi-GPU)
     with torch.cuda.device(query.device):
         _score_pages_fused_kernel[grid](
             query, compressed_keys, page_scores,
-            query.stride(0), query.stride(1), query.stride(2),
-            compressed_keys.stride(0), compressed_keys.stride(1),
-            compressed_keys.stride(2), compressed_keys.stride(3),
-            page_scores.stride(0), page_scores.stride(1),
+            q_stride_0, q_stride_1, q_stride_2,
+            ck_stride_0, ck_stride_1, ck_stride_2, ck_stride_3,
+            ps_stride_0, ps_stride_bh,
             num_kv_heads, num_pages, head_dim,
             scaling,
             NUM_KV_GROUPS=num_kv_groups,
@@ -211,6 +233,7 @@ def _topk_sort_kernel(
 def topk_sort_triton(
     page_scores: torch.Tensor,
     top_k: int,
+    out: torch.Tensor = None,
 ) -> torch.Tensor:
     """Fused top-k selection + ascending sort + int32 cast in one kernel.
 
@@ -219,6 +242,7 @@ def topk_sort_triton(
     Args:
         page_scores: [bsz, num_kv_heads, num_pages] float32
         top_k: number of pages to select
+        out: optional pre-allocated [bsz, num_kv_heads, top_k] int32 buffer
 
     Returns:
         selected_indices: [bsz, num_kv_heads, top_k] int32, sorted ascending
@@ -226,18 +250,21 @@ def topk_sort_triton(
     bsz, num_kv_heads, num_pages = page_scores.shape
     BLOCK_P = triton.next_power_of_2(num_pages)
 
-    selected = torch.empty(
-        bsz, num_kv_heads, top_k,
-        dtype=torch.int32, device=page_scores.device,
-    )
+    if out is not None:
+        selected = out
+    else:
+        selected = torch.empty(
+            bsz, num_kv_heads, top_k,
+            dtype=torch.int32, device=page_scores.device,
+        )
 
     grid = (bsz * num_kv_heads,)
 
     with torch.cuda.device(page_scores.device):
         _topk_sort_kernel[grid](
             page_scores, selected,
-            page_scores.stride(1),  # stride per (batch*head) in scores
-            selected.stride(1),     # stride per (batch*head) in output
+            num_pages,       # scores contiguous: stride(1) = num_pages
+            top_k,           # output contiguous: stride(1) = top_k
             num_pages,
             TOP_K=top_k,
             BLOCK_P=BLOCK_P,

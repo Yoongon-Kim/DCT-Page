@@ -77,7 +77,7 @@ class PreAllocatedLayer(DynamicLayer):
         return self._seen
 
 
-def pre_allocate_cache(cache, extra_tokens):
+def pre_allocate_cache(cache, extra_tokens=256):
     """Convert a DynamicCache (after prefill) to use pre-allocated layers."""
     for i, layer in enumerate(cache.layers):
         cache.layers[i] = PreAllocatedLayer.from_dynamic_layer(layer, extra_tokens)
@@ -426,7 +426,7 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size):
 # ---------------------------------------------------------------------------
 # Page scoring
 # ---------------------------------------------------------------------------
-def score_pages(query_states, compressed_keys, cfg, num_kv_groups):
+def score_pages(query_states, compressed_keys, cfg, num_kv_groups, out=None):
     """
     Score each page per KV-head group (group-aware selection).
     Each GQA group independently selects its own top-k pages.
@@ -441,6 +441,7 @@ def score_pages(query_states, compressed_keys, cfg, num_kv_groups):
         compressed_keys: [bsz, num_kv_heads, num_pages, comp_size, head_dim]
         cfg: DCTPageConfig
         num_kv_groups: int (num_heads // num_kv_heads, for GQA)
+        out: optional pre-allocated page_scores buffer for Triton path
 
     Returns:
         selected_indices: [bsz, num_kv_heads, actual_top_k] — sorted page indices per group
@@ -455,6 +456,7 @@ def score_pages(query_states, compressed_keys, cfg, num_kv_groups):
             query_states, compressed_keys,
             cfg.scoring_method, cfg.group_agg_method,
             num_kv_groups,
+            out=out,
         )
         # TopK deferred to assemble kernel — but callers expect (indices, scores).
         # Return (None, page_scores); the decode path handles the None case.
@@ -665,7 +667,7 @@ def dct_page_attention_forward(
     **kwargs,
 ) -> tuple:
     """
-    Replacement for Qwen2Attention.forward.
+    Replacement for Qwen2Attention.forward or LlamaAttention.forward
 
     - Prefill (q_len > 1): standard full causal attention.
     - Decode (q_len == 1, long KV cache): DCT page attention.
@@ -774,9 +776,18 @@ def dct_page_attention_forward(
     )
     comp_k, comp_v = _update_comp_cache(self, paged_k, paged_v, num_pages, comp_size)
 
+    # Pre-allocate page_scores buffer (reallocate only when num_pages changes)
+    if getattr(self, '_page_scores_np', 0) != num_pages:
+        self._page_scores_buf = torch.empty(
+            bsz, self.config.num_key_value_heads, num_pages,
+            dtype=torch.float32, device=comp_k.device,
+        )
+        self._page_scores_np = num_pages
+
     # Step 6: Score pages (Triton kernel 1 — returns page_scores only)
     selected_indices_or_none, page_scores = score_pages(
-        query_states, comp_k, cfg, self.num_key_value_groups
+        query_states, comp_k, cfg, self.num_key_value_groups,
+        out=self._page_scores_buf,
     )
 
     if selected_indices_or_none is None:
@@ -784,7 +795,13 @@ def dct_page_attention_forward(
         actual_top_k = min(cfg.top_k, num_pages)
         if cfg.use_triton:
             from triton_kernels import topk_sort_triton
-            selected_indices = topk_sort_triton(page_scores, actual_top_k)
+            # Pre-allocate topk output buffer (constant shape)
+            if not hasattr(self, '_topk_out_buf'):
+                self._topk_out_buf = torch.empty(
+                    bsz, self.config.num_key_value_heads, actual_top_k,
+                    dtype=torch.int32, device=comp_k.device,
+                )
+            selected_indices = topk_sort_triton(page_scores, actual_top_k, out=self._topk_out_buf)
         else:
             _, top_indices = torch.topk(page_scores, actual_top_k, dim=-1)
             selected_indices, _ = top_indices.sort(dim=-1)
@@ -814,28 +831,29 @@ def dct_page_attention_forward(
                     getattr(self.config, 'rope_theta', self.config.rope_parameters['rope_theta'] if hasattr(self.config, 'rope_parameters') else 500000.0),
                     comp_k.device, comp_k.dtype,
                 )
-                self._rope_cos_cache = cos_cached
-                self._rope_sin_cache = sin_cached
+                # Store pre-squeezed 2D [max_len, head_dim]
+                self._rope_cos_2d = cos_cached[0, 0]
+                self._rope_sin_2d = sin_cached[0, 0]
                 self._rope_cache_len = max_len
-            # cos/sin: [1, 1, len, head_dim] → [len, head_dim] for kernel
-            cos_table = self._rope_cos_cache[0, 0, :assembled_len]
-            sin_table = self._rope_sin_cache[0, 0, :assembled_len]
+            # Pass full 2D table — kernel only reads positions 0..total_len-1
+            cos_table = self._rope_cos_2d
+            sin_table = self._rope_sin_2d
 
         # Pre-allocate or expand output buffers (avoids torch.empty per step)
         _buf_len = getattr(self, '_assemble_buf_len', 0)
         if assembled_len > _buf_len:
             _max_len = assembled_len + cfg.page_size
-            num_kv_heads = comp_k.shape[1]
-            self._final_k_buf = torch.empty(bsz, num_kv_heads, _max_len, self.head_dim, dtype=comp_k.dtype, device=comp_k.device)
+            _nkv = self.config.num_key_value_heads
+            self._final_k_buf = torch.empty(bsz, _nkv, _max_len, self.head_dim, dtype=comp_k.dtype, device=comp_k.device)
             self._final_v_buf = torch.empty_like(self._final_k_buf)
             self._assemble_buf_len = _max_len
 
         # Pre-allocate Q-RoPE buffer
         if cfg.continuous_rope:
-            if not hasattr(self, '_q_rope_buf') or self._q_rope_buf.shape != query_states.shape:
+            if not hasattr(self, '_q_rope_buf'):
                 self._q_rope_buf = torch.empty_like(query_states)
-            q_rope_cos = self._rope_cos_cache[0, 0, assembled_len - 1]
-            q_rope_sin = self._rope_sin_cache[0, 0, assembled_len - 1]
+            q_rope_cos = self._rope_cos_2d[assembled_len - 1]
+            q_rope_sin = self._rope_sin_2d[assembled_len - 1]
 
         # Build stride cache on first call (strides never change)
         if not hasattr(self, '_assemble_stride_cache'):

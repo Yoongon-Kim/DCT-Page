@@ -321,10 +321,18 @@ def profiled_dct_page_attention_forward(
 
     # Step 5: Score pages (Triton kernel 1)
     from triton_kernels import score_pages_triton, assemble_kv_full_triton, assemble_kv_split_triton, apply_rope_q_triton, topk_sort_triton
+
+    # Pre-allocate page_scores buffer (reallocate only when num_pages changes, ~every 128 steps)
+    _num_kv_heads = self.config.num_key_value_heads  # 8 for Llama-3.1-8B
+    if getattr(self, '_page_scores_np', 0) != num_pages:
+        self._page_scores_buf = torch.empty(bsz, _num_kv_heads, num_pages, dtype=torch.float32, device=comp_k.device)
+        self._page_scores_np = num_pages
+
     page_scores = score_pages_triton(
         query_states, comp_k,
         cfg.scoring_method, cfg.group_agg_method,
         self.num_key_value_groups,
+        out=self._page_scores_buf,
     )
 
     if _enabled:
@@ -332,7 +340,12 @@ def profiled_dct_page_attention_forward(
 
     # Step 6a: TopK + sort (fused Triton kernel — replaces torch.topk + .sort + .to(int32))
     actual_top_k = min(cfg.top_k, num_pages)
-    selected_indices = topk_sort_triton(page_scores, actual_top_k) # Doing sort because of later assemble maneuver
+
+    # Pre-allocate selected_indices buffer (constant shape across all decode steps)
+    if not hasattr(self, '_topk_out_buf'):
+        self._topk_out_buf = torch.empty(bsz, _num_kv_heads, actual_top_k, dtype=torch.int32, device=comp_k.device)
+
+    selected_indices = topk_sort_triton(page_scores, actual_top_k, out=self._topk_out_buf)
 
     if _enabled:
         _rec(6)
@@ -357,28 +370,30 @@ def profiled_dct_page_attention_forward(
                 getattr(self.config, 'rope_theta', self.config.rope_parameters['rope_theta'] if hasattr(self.config, 'rope_parameters') else 500000.0),
                 comp_k.device, comp_k.dtype,
             )
-            self._rope_cos_cache = cos_cached
-            self._rope_sin_cache = sin_cached
+            # Store pre-squeezed 2D [max_len, head_dim] — eliminates [0,0,:N] indexing
+            self._rope_cos_2d = cos_cached[0, 0]  # [max_len, head_dim]
+            self._rope_sin_2d = sin_cached[0, 0]  # [max_len, head_dim]
             self._rope_cache_len = max_len
-        cos_table = self._rope_cos_cache[0, 0, :assembled_len]
-        sin_table = self._rope_sin_cache[0, 0, :assembled_len]
+        # Pass full 2D table — kernel only reads positions 0..total_len-1 anyway
+        cos_table = self._rope_cos_2d
+        sin_table = self._rope_sin_2d
 
     # Pre-allocate or expand output buffers (avoids torch.empty per step)
     _buf_len = getattr(self, '_assemble_buf_len', 0)
     if assembled_len > _buf_len:
         _max_len = assembled_len + cfg.page_size
-        num_kv_heads = comp_k.shape[1]
-        self._final_k_buf = torch.empty(bsz, num_kv_heads, _max_len, self.head_dim, dtype=comp_k.dtype, device=comp_k.device)
+        _nkv = _num_kv_heads
+        self._final_k_buf = torch.empty(bsz, _nkv, _max_len, self.head_dim, dtype=comp_k.dtype, device=comp_k.device)
         self._final_v_buf = torch.empty_like(self._final_k_buf)
-        self._sel_idx_buf = torch.empty(bsz, num_kv_heads, actual_top_k, dtype=torch.int32, device=comp_k.device)
+        self._sel_idx_buf = torch.empty(bsz, _nkv, actual_top_k, dtype=torch.int32, device=comp_k.device)
         self._assemble_buf_len = _max_len
 
     # Pre-allocate Q-RoPE buffer and fetch cos/sin
     if cfg.continuous_rope:
-        if not hasattr(self, '_q_rope_buf') or self._q_rope_buf.shape != query_states.shape:
+        if not hasattr(self, '_q_rope_buf'):
             self._q_rope_buf = torch.empty_like(query_states)
-        q_rope_cos = self._rope_cos_cache[0, 0, assembled_len - 1]  # [head_dim]
-        q_rope_sin = self._rope_sin_cache[0, 0, assembled_len - 1]  # [head_dim]
+        q_rope_cos = self._rope_cos_2d[assembled_len - 1]  # [head_dim] — 1D index, fast
+        q_rope_sin = self._rope_sin_2d[assembled_len - 1]  # [head_dim]
 
     if _enabled:
         _rec(7)
