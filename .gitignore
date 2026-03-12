@@ -2,4 +2,4 @@ page_selections.json
 old_tests/
 results*/
 data/
-__pycache__
+__pycache__/
