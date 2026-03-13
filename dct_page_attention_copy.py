@@ -432,11 +432,11 @@ def dct_page_attention_forward(
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
 
-        # Convert DynamicCache → PreAllocatedLayer at end of prefill (layer 0 only).
+        # Convert DynamicCache → PreAllocatedLayer at end of prefill (last layer only).
         # All layers are converted at once, so by the first decode step every
         # layer's cache.update() already uses PreAllocatedLayer (fixed strides).
         if (past_key_values is not None
-                and self.layer_idx == 0
+                and self.layer_idx == self.config.num_hidden_layers - 1
                 and not getattr(past_key_values, '_preallocated', False)):
             extra_tokens = cfg.page_size*2
             pre_allocate_cache(past_key_values, extra_tokens=extra_tokens)
@@ -510,7 +510,7 @@ def dct_page_attention_forward(
         self._page_scores_np = num_pages
 
     page_scores = score_pages_triton(
-        query_states, comp_k, cfg, self.num_key_value_groups,
+        query_states, comp_k, cfg.scoring_method, cfg.group_agg_method, self.num_key_value_groups,
         out=self._page_scores_buf,
     )
     

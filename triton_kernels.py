@@ -1092,10 +1092,11 @@ def _assemble_kv_split_stride_cached(
 
     # Recompute shape-dependent values (cheap integer ops)
     num_pages = paged_k.shape[2]
+    recent_len = recent_k.shape[2]  # live — actual_recent changes every step
     top_k = selected_indices.shape[2]
     num_unselected = num_pages - top_k
     middle_len = top_k * c['page_size'] + num_unselected * c['comp_size']
-    total_len = c['sink_len'] + middle_len + c['recent_len']
+    total_len = c['sink_len'] + middle_len + recent_len
 
     final_k = out_k[:, :, :total_len, :]
     final_v = out_v[:, :, :total_len, :]
