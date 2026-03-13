@@ -622,40 +622,48 @@ def _copy_full_segments_kernel(
 ):
     """Copy sink + selected pages + recent to output with optional K-RoPE.
 
-    Grid: (bsz * kv_heads * (top_k + 2), tiles_per_full_segment)
-    Work items: 0=sink, 1..top_k=selected pages, top_k+1=recent.
-    Rank for selected pages is directly (work_id - 1) — no selected_indices scan.
+    Grid: (bsz * kv_heads, tiles_per_head)
+    tiles_per_head = sink_tiles + top_k * page_tiles + recent_tiles (no wasted tiles).
+    Flat tile index maps to segment type via cumulative tile counts.
     """
-    pid_bhw = tl.program_id(0)
+    pid_bh = tl.program_id(0)
     pid_tile = tl.program_id(1)
 
-    num_work_items = top_k + 2
-    w = pid_bhw % num_work_items
-    tmp = pid_bhw // num_work_items
-    h = tmp % num_kv_heads
-    b = tmp // num_kv_heads
+    h = pid_bh % num_kv_heads
+    b = pid_bh // num_kv_heads
 
-    is_sink = (w == 0)
-    is_recent = (w == top_k + 1)
+    # Flat tile -> segment mapping (zero wasted tiles)
+    sink_tiles = (sink_len + BLOCK_T - 1) // BLOCK_T
+    page_tiles = (PAGE_SIZE + BLOCK_T - 1) // BLOCK_T  # constexpr
+    page_end = sink_tiles + top_k * page_tiles
 
-    # Load selected page index (1 int32). Clamped rank is safe for all work items.
-    rank = w - 1
+    # Segment flags — comparisons, not Python bools (Triton runtime values)
+    is_sink = (pid_tile < sink_tiles)
+    is_recent = (pid_tile >= page_end)
+
+    # Page-local offset — unconditional, safe for all segments (clamped >= 0)
+    local = tl.maximum(pid_tile - sink_tiles, 0)
+    rank = local // page_tiles  # only meaningful for pages; clamped via safe_rank elsewhere
+
+    # Load selected page index unconditionally (clamped rank is safe for all segments)
     safe_rank = tl.maximum(tl.minimum(rank, top_k - 1), 0)
     page_idx = tl.load(sel_indices_ptr + b * si_stride_b + h * si_stride_h + safe_rank).to(tl.int32)
 
-    # Determine token count and write position
+    # Single if/elif/else for ALL per-segment values (one merge point)
     if is_sink:
+        t_start = pid_tile * BLOCK_T
         num_tokens = sink_len
         write_start = 0
     elif is_recent:
+        t_start = (pid_tile - page_end) * BLOCK_T
         num_tokens = recent_len
         write_start = total_len - recent_len
     else:
+        t_start = (local % page_tiles) * BLOCK_T
         num_tokens = PAGE_SIZE
         write_start = sink_len + page_idx * COMP_SIZE + rank * (PAGE_SIZE - COMP_SIZE)
 
-    # Early exit for tiles beyond this segment's token count
-    t_start = pid_tile * BLOCK_T
+    # Early exit for partial last tile of each segment
     if t_start >= num_tokens:
         return
 
@@ -722,7 +730,7 @@ def _copy_full_segments_kernel(
     # Q is [bsz, num_q_heads, 1, head_dim]. Since data is tiny (32 heads × 128 dims),
     # a single program handles all Q heads via a loop. This avoids a separate kernel launch.
     if FUSE_Q_ROPE == 1:
-        if pid_bhw == 0 and pid_tile == 0:
+        if pid_bh == 0 and pid_tile == 0:
             q_d_idx = tl.arange(0, BLOCK_D)
             q_d_mask = q_d_idx < head_dim
             q_half_d = head_dim // 2
@@ -961,9 +969,11 @@ def assemble_kv_split_triton(
     with torch.cuda.device(device):
         # ---- Kernel A: sink + selected + recent (+ fused Q-RoPE) ----
         BLOCK_T_FULL = 64
-        max_seg_len = max(sink_len, page_size, recent_len)
-        tiles_per_seg = (max_seg_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
-        grid_full = (bsz * num_kv_heads * (top_k + 2), tiles_per_seg)
+        sink_tiles = (sink_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
+        page_tiles = (page_size + BLOCK_T_FULL - 1) // BLOCK_T_FULL
+        recent_tiles = (recent_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
+        tiles_per_head = sink_tiles + top_k * page_tiles + recent_tiles
+        grid_full = (bsz * num_kv_heads, tiles_per_head)
 
         _copy_full_segments_kernel[grid_full](
             paged_k, paged_v,
@@ -1050,8 +1060,8 @@ def build_assemble_stride_cache(
     num_q_heads = query_states.shape[1] if fuse_q_rope else 0
     q_stride_h = head_dim if fuse_q_rope else 0
 
-    max_seg_len = max(sink_len, page_size, recent_len)
-    tiles_per_seg = (max_seg_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
+    sink_tiles = (sink_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
+    page_tiles = (page_size + BLOCK_T_FULL - 1) // BLOCK_T_FULL
 
     return {
         'device': paged_k.device,
@@ -1074,7 +1084,8 @@ def build_assemble_stride_cache(
         'APPLY_ROPE': 1 if apply_rope else 0,
         'FUSE_Q_ROPE': 1 if fuse_q_rope else 0,
         'NUM_Q_HEADS': num_q_heads,
-        'tiles_per_seg': tiles_per_seg,
+        'sink_tiles': sink_tiles,
+        'page_tiles': page_tiles,
         # Flags
         'fuse_q_rope': fuse_q_rope,
     }
@@ -1123,7 +1134,9 @@ def _assemble_kv_split_stride_cached(
     si = c['sel_strides']
 
     # Recompute grids (cheap integer ops)
-    grid_full = (c['bsz'] * c['num_kv_heads'] * (top_k + 2), c['tiles_per_seg'])
+    recent_tiles = (recent_len + c['BLOCK_T_FULL'] - 1) // c['BLOCK_T_FULL']
+    tiles_per_head = c['sink_tiles'] + top_k * c['page_tiles'] + recent_tiles
+    grid_full = (c['bsz'] * c['num_kv_heads'], tiles_per_head)
     num_groups = (num_pages + c['PAGES_PER_PROG'] - 1) // c['PAGES_PER_PROG']
 
     with torch.cuda.device(c['device']):
@@ -1142,7 +1155,7 @@ def _assemble_kv_split_stride_cached(
             os[0], os[1], os[2],
             c['rope_stride_t'],
             si[0], si[1],
-            c['num_kv_heads'], top_k, head_dim, c['sink_len'], c['recent_len'], total_len,
+            c['num_kv_heads'], top_k, head_dim, c['sink_len'], recent_len, total_len,
             COMP_SIZE=c['comp_size'], PAGE_SIZE=c['page_size'],
             BLOCK_D=c['BLOCK_D'], BLOCK_T=c['BLOCK_T_FULL'],
             APPLY_ROPE=c['APPLY_ROPE'],
@@ -1192,8 +1205,10 @@ def build_assemble_cache(
 
     BLOCK_D = triton.next_power_of_2(head_dim)
     BLOCK_T_FULL = 64
-    max_seg_len = max(sink_len, page_size, recent_len)
-    tiles_per_seg = (max_seg_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
+    sink_tiles = (sink_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
+    page_tiles = (page_size + BLOCK_T_FULL - 1) // BLOCK_T_FULL
+    recent_tiles = (recent_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
+    tiles_per_head = sink_tiles + top_k * page_tiles + recent_tiles
     BLOCK_T_COMP = max(triton.next_power_of_2(comp_size), 4)
     PAGES_PER_PROG = 16
     num_groups = (num_pages + PAGES_PER_PROG - 1) // PAGES_PER_PROG
@@ -1223,7 +1238,7 @@ def build_assemble_cache(
         'rope_stride_t': rope_stride_t,
         'q_stride_h': q_stride_h,
         # Grid dims
-        'grid_full': (bsz * num_kv_heads * (top_k + 2), tiles_per_seg),
+        'grid_full': (bsz * num_kv_heads, tiles_per_head),
         'grid_comp': (bsz * num_kv_heads * num_groups,),
         'num_groups': num_groups,
         # Constexprs
@@ -1379,9 +1394,11 @@ def assemble_kv_drop_triton(
 
     with torch.cuda.device(device):
         BLOCK_T_FULL = 64
-        max_seg_len = max(sink_len, page_size, recent_len)
-        tiles_per_seg = (max_seg_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
-        grid_full = (bsz * num_kv_heads * (top_k + 2), tiles_per_seg)
+        sink_tiles = (sink_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
+        page_tiles = (page_size + BLOCK_T_FULL - 1) // BLOCK_T_FULL
+        recent_tiles = (recent_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
+        tiles_per_head = sink_tiles + top_k * page_tiles + recent_tiles
+        grid_full = (bsz * num_kv_heads, tiles_per_head)
 
         _copy_full_segments_kernel[grid_full](
             paged_k, paged_v,

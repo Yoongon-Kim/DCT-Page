@@ -578,8 +578,12 @@ def dct_page_attention_forward(
         query_states = apply_rope_q_direct(query_states, q_rope_cos, q_rope_sin, self._q_rope_buf)
     
     else:
-        # Build stride cache on first call (strides never change)
-        if not hasattr(self, '_assemble_stride_cache'):
+        # Build stride cache on first call; rebuild when strides change
+        # (strides are fixed within one sample's decode, but change across
+        # samples because the pre-allocated KV cache is re-created)
+        _cur_paged_strides = (paged_k.stride(0), paged_k.stride(1), paged_k.stride(2), paged_k.stride(3))
+        if (not hasattr(self, '_assemble_stride_cache')
+                or self._assemble_stride_cache['paged_strides'] != _cur_paged_strides):
             self._assemble_stride_cache = build_assemble_stride_cache(
                 paged_k, comp_k, sink_k, recent_k, selected_indices,
                 cos_table, self._final_k_buf,
