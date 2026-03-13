@@ -17,15 +17,90 @@ from torch import nn
 import torch.nn.functional as F
 
 import transformers
-from transformers.models.qwen2.modeling_qwen2 import (
+from transformers.models.llama.modeling_llama import (
     apply_rotary_pos_emb,
     repeat_kv,
     eager_attention_forward,
 )
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-from transformers.cache_utils import Cache
+from transformers.cache_utils import Cache, DynamicLayer
 
 from config import DCTPageConfig
+from triton_kernels import (
+    assemble_kv_split_triton, 
+    apply_rope_q_direct, 
+    build_assemble_stride_cache, 
+    topk_sort_triton, 
+    assemble_kv_drop_triton, 
+    score_pages_triton,
+)
+
+# ---------------------------------------------------------------------------
+# Pre-allocated KV cache (avoids torch.cat during decode, fixes strides)
+# ---------------------------------------------------------------------------
+class PreAllocatedLayer(DynamicLayer):
+    """Drop-in replacement for DynamicLayer that uses pre-allocated buffers.
+
+    Instead of torch.cat (O(seq_len) alloc+copy per step), uses index
+    assignment into a pre-allocated buffer (O(1) write per step).
+    Strides remain fixed across all decode steps.
+    """
+
+    @classmethod
+    def from_dynamic_layer(cls, layer, extra_tokens):
+        """Convert a populated DynamicLayer into a pre-allocated version."""
+        new_layer = cls()
+        k, v = layer.keys, layer.values
+        bsz, heads, seq_len, dim = k.shape
+
+        alloc_len = seq_len + extra_tokens
+        new_layer.keys = torch.empty(bsz, heads, alloc_len, dim,
+                                     dtype=k.dtype, device=k.device)
+        new_layer.values = torch.empty(bsz, heads, alloc_len, dim,
+                                       dtype=v.dtype, device=v.device)
+        new_layer.keys[:, :, :seq_len, :] = k
+        new_layer.values[:, :, :seq_len, :] = v
+
+        new_layer._seen = seq_len
+        new_layer._alloc_len = alloc_len
+        new_layer.is_initialized = True
+        new_layer.dtype = k.dtype
+        new_layer.device = k.device
+        return new_layer
+
+    def update(self, key_states, value_states, cache_kwargs=None):
+        seq_len = key_states.shape[-2]
+        start = self._seen
+        end = start + seq_len
+        
+        if end > self._alloc_len:
+            # Grow the buffer by 4*page_size
+            new_alloc = max(end, self._alloc_len + _dct_page_cfg.page_size*4)
+            new_k = torch.empty(*self.keys.shape[:2], new_alloc, self.keys.shape[-1],
+                                dtype=self.dtype, device=self.device)
+            new_v = torch.empty_like(new_k)
+            new_k[:, :, :start, :] = self.keys[:, :, :start, :]
+            new_v[:, :, :start, :] = self.values[:, :, :start, :]
+            self.keys = new_k
+            self.values = new_v
+            self._alloc_len = new_alloc
+
+        self.keys[:, :, start:end, :] = key_states
+        self.values[:, :, start:end, :] = value_states
+        self._seen = end
+
+        # Return view of valid portion (zero-copy, strides unchanged)
+        return self.keys[:, :, :end, :], self.values[:, :, :end, :]
+
+    def get_seq_length(self):
+        return self._seen
+
+
+def pre_allocate_cache(cache, extra_tokens=256):
+    """Convert a DynamicCache (after prefill) to use pre-allocated layers."""
+    for i, layer in enumerate(cache.layers):
+        cache.layers[i] = PreAllocatedLayer.from_dynamic_layer(layer, extra_tokens)
+    return cache
 
 
 # ---------------------------------------------------------------------------
@@ -214,70 +289,6 @@ def _compute_rope_cos_sin(positions, head_dim, rope_theta, device, dtype):
 
 
 # ---------------------------------------------------------------------------
-# Page construction and compression
-# ---------------------------------------------------------------------------
-def build_pages_and_compress(key_states, value_states, cfg):
-    """
-    Divide KV cache into sink / pages / recent and compress pages via DCT.
-
-    Layout: [sink | page_0 | page_1 | ... | page_{N-1} | recent + leftover]
-
-    All pages are exactly `page_size` tokens. The last partial page (leftover)
-    is merged into the recent window.
-
-    Args:
-        key_states:   [bsz, num_kv_heads, kv_len, head_dim]
-        value_states: [bsz, num_kv_heads, kv_len, head_dim]
-        cfg: DCTPageConfig
-
-    Returns:
-        sink_k, sink_v, paged_k, paged_v, comp_k, comp_v,
-        recent_k, recent_v, num_pages, actual_recent
-    """
-    bsz, num_kv_heads, kv_len, head_dim = key_states.shape
-
-    # Segmentation
-    pageable_len = kv_len - cfg.sink_size - cfg.recent_size
-    num_pages = pageable_len // cfg.page_size
-    leftover = pageable_len % cfg.page_size
-    actual_recent = cfg.recent_size + leftover
-
-    # Sink
-    sink_k = key_states[:, :, :cfg.sink_size]
-    sink_v = value_states[:, :, :cfg.sink_size]
-
-    # Pages: [sink_size, sink_size + num_pages * page_size)
-    pages_end = cfg.sink_size + num_pages * cfg.page_size
-    pages_k = key_states[:, :, cfg.sink_size:pages_end]
-    pages_v = value_states[:, :, cfg.sink_size:pages_end]
-
-    # Reshape to [bsz, num_kv_heads, num_pages, page_size, head_dim]
-    paged_k = pages_k.view(bsz, num_kv_heads, num_pages, cfg.page_size, head_dim)
-    paged_v = pages_v.view(bsz, num_kv_heads, num_pages, cfg.page_size, head_dim)
-
-    # Recent (includes leftover)
-    recent_k = key_states[:, :, pages_end:]
-    recent_v = value_states[:, :, pages_end:]
-
-    # Batched DCT compression of all pages
-    comp_size = max(1, int(cfg.page_size * cfg.compress_ratio))
-
-    # Flatten pages into batch dim: [bsz * num_kv_heads * num_pages, 1, page_size, head_dim]
-    flat_k = paged_k.reshape(bsz * num_kv_heads * num_pages, 1, cfg.page_size, head_dim)
-    flat_v = paged_v.reshape(bsz * num_kv_heads * num_pages, 1, cfg.page_size, head_dim)
-
-    comp_k = dct_compress_page(flat_k, comp_size)
-    comp_v = dct_compress_page(flat_v, comp_size)
-
-    # Reshape back: [bsz, num_kv_heads, num_pages, comp_size, head_dim]
-    comp_k = comp_k.view(bsz, num_kv_heads, num_pages, comp_size, head_dim)
-    comp_v = comp_v.view(bsz, num_kv_heads, num_pages, comp_size, head_dim)
-
-    return (sink_k, sink_v, paged_k, paged_v, comp_k, comp_v,
-            recent_k, recent_v, num_pages, actual_recent)
-
-
-# ---------------------------------------------------------------------------
 # KV segmentation without DCT (for incremental compression)
 # ---------------------------------------------------------------------------
 def segment_kv(key_states, value_states, cfg):
@@ -319,27 +330,11 @@ def segment_kv(key_states, value_states, cfg):
 # ---------------------------------------------------------------------------
 def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size):
     """
-    Incrementally maintain DCT-compressed page representations on the
-    attention module instance.
+    Incrementally maintain DCT-compressed page representations.
 
-    A page is finalized (its tokens will never change) as soon as it becomes
-    part of paged_k.  We compress it once and store it.  On the next decode
-    step only the single newly-finalized page (if any) is compressed and
-    appended; all previously cached pages are reused without any FFT work.
-
-    Cache reset: if num_pages drops below the cached count (new sequence) or
-    the batch size / comp_size changes, the cache is wiped and rebuilt.
-
-    Args:
-        attn_module : the Attention instance (cache lives here as attributes)
-        paged_k     : [bsz, num_kv_heads, num_pages, page_size, head_dim]
-        paged_v     : [bsz, num_kv_heads, num_pages, page_size, head_dim]
-        num_pages   : int — total finalized pages in current KV cache
-        comp_size   : int — DCT output length per page
-
-    Returns:
-        comp_k : [bsz, num_kv_heads, num_pages, comp_size, head_dim]
-        comp_v : [bsz, num_kv_heads, num_pages, comp_size, head_dim]
+    Uses torch.cat to append new compressed pages. Output is always contiguous,
+    which keeps score_pages_triton L2-cache-friendly.  The comp_k strides change
+    every step (dim-2 grows), so they must NOT be cached — compute them live.
     """
     bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
 
@@ -358,17 +353,12 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size):
 
     n_new = num_pages - n_cached
     if n_new > 0:
-        # Compress only the newly finalized pages
-        new_k = paged_k[:, :, n_cached:num_pages]  # [bsz, num_kv_heads, n_new, page_size, head_dim]
+        new_k = paged_k[:, :, n_cached:num_pages]
         new_v = paged_v[:, :, n_cached:num_pages]
 
-        # Projection matrix: single matmul replaces ~30 FFT kernel launches
         M = _get_or_build_projection_matrix(
             attn_module, page_size, comp_size, new_k.device, new_k.dtype
         )
-        # M: [comp_size, page_size]
-        # new_k: [bsz, num_kv_heads, n_new, page_size, head_dim]
-        # result: [bsz, num_kv_heads, n_new, comp_size, head_dim]
         new_comp_k = torch.einsum('cs,bhnsd->bhncd', M, new_k)
         new_comp_v = torch.einsum('cs,bhnsd->bhncd', M, new_v)
 
@@ -389,239 +379,10 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size):
 
 
 # ---------------------------------------------------------------------------
-# Page scoring
-# ---------------------------------------------------------------------------
-def score_pages(query_states, compressed_keys, cfg, num_kv_groups):
-    """
-    Score each page per KV-head group (group-aware selection).
-    Each GQA group independently selects its own top-k pages.
-
-    Scoring uses all query heads without expanding keys: queries are reshaped
-    into groups, and einsum broadcasts the KV head over query heads in the
-    group. Per-head max scores are averaged within each group to produce one
-    score per page per group.
-
-    Args:
-        query_states:    [bsz, num_heads, q_len, head_dim]  (q_len=1 during decode)
-        compressed_keys: [bsz, num_kv_heads, num_pages, comp_size, head_dim]
-        cfg: DCTPageConfig
-        num_kv_groups: int (num_heads // num_kv_heads, for GQA)
-
-    Returns:
-        selected_indices: [bsz, num_kv_heads, actual_top_k] — sorted page indices per group
-    """
-    bsz, num_heads, q_len, head_dim = query_states.shape
-    _, num_kv_heads, num_pages, comp_size, _ = compressed_keys.shape
-
-    # Fused Triton path for decode (q_len=1) with mean/max aggregation
-    if q_len == 1 and cfg.use_triton and cfg.group_agg_method != "topp":
-        from triton_kernels import score_pages_triton
-        page_scores = score_pages_triton(
-            query_states, compressed_keys,
-            cfg.scoring_method, cfg.group_agg_method,
-            num_kv_groups,
-        )
-        # TopK deferred to assemble kernel — but callers expect (indices, scores).
-        # Return (None, page_scores); the decode path handles the None case.
-        return None, page_scores
-
-    # ---- PyTorch path (prefill, or topp aggregation, or use_triton=False) ----
-    scaling = head_dim ** -0.5
-
-    # Reshape queries into GQA groups: [bsz, num_kv_heads, num_kv_groups, q_len, head_dim]
-    query_grouped = query_states.view(bsz, num_kv_heads, num_kv_groups, q_len, head_dim)
-
-    # Score each query head against its group's KV head (no key expansion needed).
-    # einsum broadcasts compressed_keys over the num_kv_groups dim.
-    # -> [bsz, num_kv_heads, num_kv_groups, q_len, num_pages, comp_size]
-    scores = torch.einsum(
-        'bgiqd,bgncd->bgiqnc',
-        query_grouped * scaling, compressed_keys
-    )
-
-    # Reduce over comp_size (compressed tokens within each page)
-    if cfg.scoring_method == "max":
-        page_scores = scores.max(dim=-1).values   # [bsz, num_kv_heads, num_kv_groups, q_len, num_pages]
-    elif cfg.scoring_method == "mean":
-        page_scores = scores.mean(dim=-1)
-    elif cfg.scoring_method == "sum":
-        page_scores = scores.sum(dim=-1)
-    else:
-        raise ValueError(f"Unknown scoring method: {cfg.scoring_method}")
-
-    # Reduce over query positions -> [bsz, num_kv_heads, num_kv_groups, num_pages]
-    page_scores = page_scores.mean(dim=3)
-
-    # Aggregate per-head scores within each GQA group -> [bsz, num_kv_heads, num_pages]
-    if cfg.group_agg_method == "mean":
-        page_scores = page_scores.mean(dim=2)
-    elif cfg.group_agg_method == "max":
-        page_scores = page_scores.max(dim=2).values
-    elif cfg.group_agg_method == "topp":
-        # Each head votes for its top-p pages, then pages are ranked by vote count.
-        # p = top_k so each head nominates as many pages as will be selected.
-        p = min(cfg.top_k, num_pages)
-        _, head_topk = torch.topk(page_scores, p, dim=-1)  # [bsz, num_kv_heads, num_kv_groups, p]
-        votes = torch.zeros(
-            bsz, num_kv_heads, num_pages,
-            dtype=page_scores.dtype, device=page_scores.device
-        )
-        votes.scatter_add_(
-            2,
-            head_topk.reshape(bsz, num_kv_heads, num_kv_groups * p),
-            torch.ones(bsz, num_kv_heads, num_kv_groups * p,
-                        dtype=page_scores.dtype, device=page_scores.device)
-        )
-        # Use vote count as primary score, mean attention score as tiebreaker
-        mean_scores = page_scores.mean(dim=2)
-        # Normalize tiebreaker to [0, 1) so it never outweighs a single vote
-        score_range = mean_scores.max(dim=-1, keepdim=True).values - mean_scores.min(dim=-1, keepdim=True).values
-        tiebreaker = (mean_scores - mean_scores.min(dim=-1, keepdim=True).values) / (score_range + 1e-8)
-        page_scores = votes + tiebreaker
-    else:
-        raise ValueError(f"Unknown group_agg_method: {cfg.group_agg_method}")
-
-    # Select top-k per KV head group
-    actual_top_k = min(cfg.top_k, num_pages)
-    _, selected_indices = torch.topk(page_scores, actual_top_k, dim=-1)
-
-    # Sort for positional ordering within each group
-    selected_indices, _ = selected_indices.sort(dim=-1)
-
-    return selected_indices, page_scores
-
-
-
-
-# ---------------------------------------------------------------------------
-# KV assembly
-# ---------------------------------------------------------------------------
-def assemble_kv(sink_k, sink_v, paged_k, paged_v, comp_k, comp_v,
-                recent_k, recent_v, selected_indices, cfg, num_pages):
-    """
-    Assemble the final K/V tensors from sink + selected pages + recent.
-    Each KV head independently gathers its own selected pages (group-aware).
-
-    Args:
-        sink_k/v:     [bsz, num_kv_heads, sink_size, head_dim]
-        paged_k/v:    [bsz, num_kv_heads, num_pages, page_size, head_dim]
-        comp_k/v:     [bsz, num_kv_heads, num_pages, comp_size, head_dim]
-        recent_k/v:   [bsz, num_kv_heads, actual_recent, head_dim]
-        selected_indices: [bsz, num_kv_heads, top_k]
-        cfg: DCTPageConfig
-        num_pages: int
-
-    Returns:
-        final_k, final_v: [bsz, num_kv_heads, assembled_len, head_dim]
-    """
-    bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
-    top_k = selected_indices.shape[2]
-
-    if cfg.unselected_mode == "drop":
-        # Gather selected full pages per KV head
-        idx = selected_indices[:, :, :, None, None].expand(
-            bsz, num_kv_heads, top_k, page_size, head_dim
-        )
-        sel_k = torch.gather(paged_k, 2, idx)  # [bsz, num_kv_heads, top_k, page_size, head_dim]
-        sel_v = torch.gather(paged_v, 2, idx)
-
-        # Flatten: [bsz, num_kv_heads, top_k * page_size, head_dim]
-        sel_k = sel_k.reshape(bsz, num_kv_heads, top_k * page_size, head_dim)
-        sel_v = sel_v.reshape(bsz, num_kv_heads, top_k * page_size, head_dim)
-
-        final_k = torch.cat([sink_k, sel_k, recent_k], dim=2)
-        final_v = torch.cat([sink_v, sel_v, recent_v], dim=2)
-
-    elif cfg.unselected_mode == "compressed":
-        comp_size = comp_k.shape[3]
-        num_unselected = num_pages - top_k
-        middle_len = top_k * page_size + num_unselected * comp_size
-
-        if cfg.use_triton:
-            from triton_kernels import assemble_kv_compressed_triton
-            # Fused path: kernel writes middle directly into final tensor,
-            # eliminating intermediate allocation + torch.cat
-            final_k, final_v = assemble_kv_compressed_triton(
-                paged_k, paged_v, comp_k, comp_v,
-                selected_indices, num_pages,
-                page_size, comp_size, top_k,
-                sink_k, sink_v, recent_k, recent_v,
-            )
-        else:
-            # PyTorch scatter/gather path
-            selected_mask = torch.zeros(
-                bsz, num_kv_heads, num_pages, dtype=torch.bool,
-                device=selected_indices.device
-            )
-            selected_mask.scatter_(2, selected_indices, True)
-
-            token_counts = torch.where(selected_mask, page_size, comp_size)
-            page_offsets = torch.zeros(
-                bsz, num_kv_heads, num_pages, dtype=torch.long,
-                device=selected_indices.device
-            )
-            page_offsets[:, :, 1:] = token_counts[:, :, :-1].cumsum(dim=-1)
-
-            idx_sel = selected_indices[:, :, :, None, None].expand(
-                bsz, num_kv_heads, top_k, page_size, head_dim
-            )
-            sel_k = torch.gather(paged_k, 2, idx_sel).reshape(
-                bsz, num_kv_heads, top_k * page_size, head_dim
-            )
-            sel_v = torch.gather(paged_v, 2, idx_sel).reshape(
-                bsz, num_kv_heads, top_k * page_size, head_dim
-            )
-
-            sort_perm = torch.argsort(selected_mask.int(), dim=-1, stable=True)
-            unselected_indices = sort_perm[:, :, :num_unselected]
-
-            idx_unsel = unselected_indices[:, :, :, None, None].expand(
-                bsz, num_kv_heads, num_unselected, comp_size, head_dim
-            )
-            unsel_k = torch.gather(comp_k, 2, idx_unsel).reshape(
-                bsz, num_kv_heads, num_unselected * comp_size, head_dim
-            )
-            unsel_v = torch.gather(comp_v, 2, idx_unsel).reshape(
-                bsz, num_kv_heads, num_unselected * comp_size, head_dim
-            )
-
-            sel_offsets = torch.gather(page_offsets, 2, selected_indices)
-            sel_dst = (
-                sel_offsets[:, :, :, None]
-                + torch.arange(page_size, device=sel_offsets.device)
-            ).reshape(bsz, num_kv_heads, top_k * page_size)
-
-            unsel_offsets = torch.gather(page_offsets, 2, unselected_indices)
-            unsel_dst = (
-                unsel_offsets[:, :, :, None]
-                + torch.arange(comp_size, device=unsel_offsets.device)
-            ).reshape(bsz, num_kv_heads, num_unselected * comp_size)
-
-            middle_k = torch.empty(
-                bsz, num_kv_heads, middle_len, head_dim,
-                dtype=sink_k.dtype, device=sink_k.device
-            )
-            middle_v = torch.empty_like(middle_k)
-
-            middle_k.scatter_(2, sel_dst[:, :, :, None].expand_as(sel_k), sel_k)
-            middle_k.scatter_(2, unsel_dst[:, :, :, None].expand_as(unsel_k), unsel_k)
-            middle_v.scatter_(2, sel_dst[:, :, :, None].expand_as(sel_v), sel_v)
-            middle_v.scatter_(2, unsel_dst[:, :, :, None].expand_as(unsel_v), unsel_v)
-
-            final_k = torch.cat([sink_k, middle_k, recent_k], dim=2)
-            final_v = torch.cat([sink_v, middle_v, recent_v], dim=2)
-
-    else:
-        raise ValueError(f"Unknown unselected_mode: {cfg.unselected_mode}")
-
-    return final_k, final_v
-
-
-# ---------------------------------------------------------------------------
-# Main attention forward (replaces Qwen2Attention.forward)
+# Main attention forward
 # ---------------------------------------------------------------------------
 def dct_page_attention_forward(
-    self, # the Qwen2Attention instance (we access its projections like self.q_proj, config like self.config, etc.)
+    self, # the Qwen2Attention/LlamaAttention instance (we access its projections like self.q_proj, config like self.config, etc.)
     hidden_states: torch.Tensor,
     position_embeddings: tuple,
     attention_mask: Optional[torch.Tensor] = None, # The type can be torch.Tensor or None, and the default value is None
@@ -630,7 +391,7 @@ def dct_page_attention_forward(
     **kwargs,
 ) -> tuple:
     """
-    Replacement for Qwen2Attention.forward.
+    Replacement for Qwen2Attention.forward or LlamaAttention.forward
 
     - Prefill (q_len > 1): standard full causal attention.
     - Decode (q_len == 1, long KV cache): DCT page attention.
@@ -638,61 +399,25 @@ def dct_page_attention_forward(
     cfg = _dct_page_cfg
     input_shape = hidden_states.shape[:-1] # (bsz, q_len)
     hidden_shape = (*input_shape, -1, self.head_dim) # (bsz, q_len, num_heads, head_dim)
-    bsz, q_len = input_shape
+    bsz, q_len = input_shape     
 
-    # Step 1: Q/K/V projection
-    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2) # (bsz, num_heads, q_len, head_dim)
-    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2) # (bsz, num_kv_heads, q_len, head_dim): num_kv_heads for gqa
-    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2) # (bsz, num_kv_heads, q_len, head_dim): num_kv_heads for gqa
-
-    # Step 2 & 3: RoPE and KV cache
-    cos, sin = position_embeddings
-
-    if cfg.continuous_rope:
-        # Compute RoPE'd Q/K for prefill/short-seq attention only
-        query_rope, key_rope = apply_rotary_pos_emb(query_states, key_states, cos, sin) # In decoding stage, this is only for short kv_len fallback
-        # Cache stores pre-RoPE K/V (continuous RoPE applied after assembly during decode)
-        if past_key_values is not None:
+    if q_len>1:
+        # Step 1: Q/K/V projection
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2) # (bsz, num_heads, q_len, head_dim)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2) # (bsz, num_kv_heads, q_len, head_dim): num_kv_heads for gqa
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2) # (bsz, num_kv_heads, q_len, head_dim): num_kv_heads for gqa
+        
+        # Step 2 & 3: RoPE and KV cache
+        cos, sin = position_embeddings
+        query_rope, key_rope = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if past_key_values is not None: # unless we call the model directly with use_cache=False, past_key_values is not None.
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_cached, value_cached = past_key_values.update(
+            past_key_values.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
-        else:
-            key_cached, value_cached = key_states, value_states
-        kv_len = key_cached.shape[2]
-    else:
-        # Standard: apply RoPE then cache
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        if past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
-        kv_len = key_states.shape[2]
-
-    # Step 4: Branch — prefill vs decode
-    min_len_for_paging = cfg.sink_size + cfg.page_size*(cfg.top_k+1) + cfg.recent_size # If the number of formed pages is smaller than top-k config, we do full attention
-    if q_len > 1 or kv_len < min_len_for_paging:
-        # PREFILL or SHORT SEQUENCE
-        if cfg.continuous_rope:
-            if q_len > 1:
-                # Prefill: use locally RoPE'd Q/K (assumes single prefill call)
-                attn_q, attn_k, attn_v = query_rope, key_rope, value_states
-            else:
-                # Short decode: apply standard RoPE to all cached pre-RoPE KV
-                all_pos = torch.arange(kv_len, device=key_cached.device)
-                cos_all, sin_all = _compute_rope_cos_sin(
-                    all_pos, self.head_dim, getattr(self.config, 'rope_theta', self.config.rope_parameters['rope_theta'] if hasattr(self.config, 'rope_parameters') else 500000.0),
-                    key_cached.device, key_cached.dtype
-                )
-                attn_q = query_rope
-                attn_k = _apply_rope(key_cached, cos_all, sin_all)
-                attn_v = value_cached
-        else:
-            attn_q, attn_k, attn_v = query_states, key_states, value_states
+        attn_q, attn_k, attn_v = query_rope, key_rope, value_states
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get("sdpa", eager_attention_forward)
-
         attn_output, attn_weights = attention_interface(
             self,
             attn_q,
@@ -704,19 +429,65 @@ def dct_page_attention_forward(
             sliding_window=getattr(self, "sliding_window", None),
             **kwargs,
         )
-
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
+
+        # Convert DynamicCache → PreAllocatedLayer at end of prefill (last layer only).
+        # All layers are converted at once, so by the first decode step every
+        # layer's cache.update() already uses PreAllocatedLayer (fixed strides).
+        if (past_key_values is not None
+                and self.layer_idx == self.config.num_hidden_layers - 1
+                and not getattr(past_key_values, '_preallocated', False)):
+            extra_tokens = cfg.page_size*2
+            pre_allocate_cache(past_key_values, extra_tokens=extra_tokens)
+            past_key_values._preallocated = True
+
         return attn_output, attn_weights
 
     # ---- DECODE PATH (q_len == 1, long KV cache) ----
+    # Step 1: QKV projection
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    
+    # Step 2: RoPE + KV cache update
+    cos, sin = position_embeddings
+    if past_key_values is not None:
+        # cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        key_cached, value_cached = past_key_values.update(
+            key_states, value_states, self.layer_idx, # cache_kwargs # commented out because we will compute rope table later.
+        )
+    else:
+        key_cached, value_cached = key_states, value_states
+    kv_len = key_cached.shape[2]
+    
+    # Check if DCT path is active
+    min_len_for_paging = cfg.sink_size + cfg.page_size * (cfg.top_k + 1) + cfg.recent_size
+    if kv_len < min_len_for_paging:
+        all_pos = torch.arange(kv_len, device=key_cached.device)
+        cos_all, sin_all = _compute_rope_cos_sin(
+            all_pos, self.head_dim, getattr(self.config, 'rope_theta', self.config.rope_parameters['rope_theta'] if hasattr(self.config, 'rope_parameters') else 500000.0),
+            key_cached.device, key_cached.dtype
+        )
+        attn_q, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
+        attn_k = _apply_rope(key_cached, cos_all, sin_all)
+        attn_v = value_cached
 
-    if cfg.continuous_rope:
-        # Use pre-RoPE KV from cache for page building and scoring
-        key_states = key_cached
-        value_states = value_cached
-
-    # Step 5: Segment KV cache and update the incremental compressed page cache.
+        attention_interface = ALL_ATTENTION_FUNCTIONS.get("sdpa", eager_attention_forward)
+        attn_output, attn_weights = attention_interface(
+            self, attn_q, attn_k, attn_v, attention_mask,
+            dropout=0.0, scaling=self.scaling,
+            sliding_window=getattr(self, "sliding_window", None), **kwargs,
+        )
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+    
+    # Use pre-RoPE KV for page building in continuous_rope mode
+    key_states = key_cached
+    value_states = value_cached
+    
+    # Step 3: Segment KV cache and update the incremental compressed page cache.
     # DCT is computed only for pages that are newly finalized since the last
     # decode step; all previously cached compressed representations are reused.
     comp_size = max(1, int(cfg.page_size * cfg.compress_ratio))
@@ -724,100 +495,127 @@ def dct_page_attention_forward(
         recent_k, recent_v, num_pages, actual_recent) = segment_kv(
         key_states, value_states, cfg
     )
+    
+    # Step 4: DCT compression (torch.cat - always contiguous, L2-warm)
     comp_k, comp_v = _update_comp_cache(self, paged_k, paged_v, num_pages, comp_size)
 
-    # Step 6: Score pages (Triton kernel 1 — returns page_scores only)
-    selected_indices_or_none, page_scores = score_pages(
-        query_states, comp_k, cfg, self.num_key_value_groups
+    # Step 5: Score pages (Triton kernel 1 — returns page_scores only)
+    # Pre-allocate page_scores buffer (reallocate only when num_pages changes)
+    _num_kv_heads = self.config.num_key_value_heads # 8 for Llama-3.1-8B
+    if getattr(self, '_page_scores_np', 0) != num_pages:
+        self._page_scores_buf = torch.empty(
+            bsz, _num_kv_heads, num_pages,
+            dtype=torch.float32, device=comp_k.device,
+        )
+        self._page_scores_np = num_pages
+
+    page_scores = score_pages_triton(
+        query_states, comp_k, cfg.scoring_method, cfg.group_agg_method, self.num_key_value_groups,
+        out=self._page_scores_buf,
     )
+    
+    actual_top_k = min(cfg.top_k, num_pages)
+    
+    # Pre-allocate selected_indices buffer (constant shape across all decode steps)
+    if not hasattr(self, '_topk_out_buf'):
+        self._topk_out_buf = torch.empty(bsz, _num_kv_heads, actual_top_k, dtype=torch.int32, device=comp_k.device)
 
-    if selected_indices_or_none is None:
-        # Triton scoring path: page_scores returned, do topk here
-        actual_top_k = min(cfg.top_k, num_pages)
-        _, top_indices = torch.topk(page_scores, actual_top_k, dim=-1)
-        selected_indices, _ = top_indices.sort(dim=-1)
+    selected_indices = topk_sort_triton(page_scores, actual_top_k, out=self._topk_out_buf)
+    
+    if cfg.unselected_mode == "drop":
+        assembled_len = cfg.sink_size + actual_top_k * cfg.page_size + actual_recent
     else:
-        selected_indices = selected_indices_or_none
-
-    use_triton_assemble = cfg.use_triton and cfg.unselected_mode == "compressed"
-
-    if use_triton_assemble:
-        # Fused Triton assemble (only for compressed mode)
-        from triton_kernels import assemble_kv_split_triton, apply_rope_q_triton
-
-        actual_top_k = selected_indices.shape[2]
         num_unselected = num_pages - actual_top_k
         middle_len = actual_top_k * cfg.page_size + num_unselected * comp_size
         assembled_len = cfg.sink_size + middle_len + actual_recent
 
-        cos_table = None
-        sin_table = None
-        if cfg.continuous_rope:
-            cached_len = getattr(self, '_rope_cache_len', 0)
-            if assembled_len > cached_len:
-                max_len = assembled_len + cfg.page_size
-                positions = torch.arange(max_len, device=comp_k.device)
-                cos_cached, sin_cached = _compute_rope_cos_sin(
-                    positions, self.head_dim,
-                    getattr(self.config, 'rope_theta', self.config.rope_parameters['rope_theta'] if hasattr(self.config, 'rope_parameters') else 500000.0),
-                    comp_k.device, comp_k.dtype,
-                )
-                self._rope_cos_cache = cos_cached
-                self._rope_sin_cache = sin_cached
-                self._rope_cache_len = max_len
-            # cos/sin: [1, 1, len, head_dim] → [len, head_dim] for kernel
-            cos_table = self._rope_cos_cache[0, 0, :assembled_len]
-            sin_table = self._rope_sin_cache[0, 0, :assembled_len]
+    cos_table = None
+    sin_table = None
+    cached_len = getattr(self, '_rope_cache_len', 0)
+    if assembled_len > cached_len:
+        max_len = assembled_len + cfg.page_size
+        positions = torch.arange(max_len, device=comp_k.device)
+        cos_cached, sin_cached = _compute_rope_cos_sin(
+            positions, self.head_dim,
+            getattr(self.config, 'rope_theta', self.config.rope_parameters['rope_theta'] if hasattr(self.config, 'rope_parameters') else 500000.0),
+            comp_k.device, comp_k.dtype,
+        )
+        # Store pre-squeezed 2D [max_len, head_dim] — eliminates [0,0,:N] indexing
+        self._rope_cos_2d = cos_cached[0, 0] # [max_len, head_dim]
+        self._rope_sin_2d = sin_cached[0, 0] # [max_len, head_dim]
+        self._rope_cache_len = max_len
+    # Pass full 2D table — kernel only reads positions 0..total_len-1
+    cos_table = self._rope_cos_2d
+    sin_table = self._rope_sin_2d
 
-        final_k, final_v = assemble_kv_split_triton(
-            paged_k, paged_v, comp_k, comp_v,
+    # Pre-allocate or expand output buffers (avoids torch.empty per step)
+    _buf_len = getattr(self, '_assemble_buf_len', 0)
+    if assembled_len > _buf_len:
+        _max_len = assembled_len + cfg.page_size
+        _nkv = _num_kv_heads
+        self._final_k_buf = torch.empty(bsz, _nkv, _max_len, self.head_dim, dtype=comp_k.dtype, device=comp_k.device)
+        self._final_v_buf = torch.empty_like(self._final_k_buf)
+        self._sel_idx_buf = torch.empty(bsz, _nkv, actual_top_k, dtype=torch.int32, device=comp_k.device)
+        self._assemble_buf_len = _max_len
+
+    # Pre-allocate Q-RoPE buffer
+    if not hasattr(self, '_q_rope_buf'):
+        self._q_rope_buf = torch.empty_like(query_states)
+    q_rope_cos = self._rope_cos_2d[assembled_len - 1] # [head_dim] — 1D index, fast
+    q_rope_sin = self._rope_sin_2d[assembled_len - 1] # [head_dim]
+
+    # Step 6b: Assemble + K-RoPE (+ fused Q-RoPE in Kernel A for split mode)
+    if cfg.unselected_mode == "drop":
+        final_k, final_v = assemble_kv_drop_triton(
+            paged_k, paged_v,
             sink_k, sink_v, recent_k, recent_v,
             selected_indices,
             cos_table, sin_table,
+            out_k=self._final_k_buf,
+            out_v=self._final_v_buf,
+            out_sel_idx=self._sel_idx_buf,
         )
-
-        # Q-RoPE (Triton kernel)
-        if cfg.continuous_rope:
-            cos_q = self._rope_cos_cache[:, :, assembled_len - 1:assembled_len]
-            sin_q = self._rope_sin_cache[:, :, assembled_len - 1:assembled_len]
-            query_states = apply_rope_q_triton(query_states, cos_q, sin_q)
+        query_states = apply_rope_q_direct(query_states, q_rope_cos, q_rope_sin, self._q_rope_buf)
+    
     else:
-        # PyTorch path (drop mode, or use_triton=False)
-        final_k, final_v = assemble_kv(
-            sink_k, sink_v, paged_k, paged_v, comp_k, comp_v,
-            recent_k, recent_v, selected_indices, cfg, num_pages
-        )
-        if cfg.continuous_rope:
-            assembled_len = final_k.shape[2]
-            cached_len = getattr(self, '_rope_cache_len', 0)
-            if assembled_len > cached_len:
-                max_len = assembled_len + cfg.page_size
-                positions = torch.arange(max_len, device=final_k.device)
-                cos_cached, sin_cached = _compute_rope_cos_sin(
-                    positions, self.head_dim,
-                    getattr(self.config, 'rope_theta', self.config.rope_parameters['rope_theta'] if hasattr(self.config, 'rope_parameters') else 500000.0),
-                    final_k.device, final_k.dtype,
-                )
-                self._rope_cos_cache = cos_cached
-                self._rope_sin_cache = sin_cached
-                self._rope_cache_len = max_len
-            cos_k = self._rope_cos_cache[:, :, :assembled_len]
-            sin_k = self._rope_sin_cache[:, :, :assembled_len]
-            cos_q = self._rope_cos_cache[:, :, assembled_len - 1:assembled_len]
-            sin_q = self._rope_sin_cache[:, :, assembled_len - 1:assembled_len]
-            final_k = _apply_rope(final_k, cos_k, sin_k)
-            query_states = _apply_rope(query_states, cos_q, sin_q)
+        # Build stride cache on first call; rebuild when strides change
+        # (strides are fixed within one sample's decode, but change across
+        # samples because the pre-allocated KV cache is re-created)
+        _cur_paged_strides = (paged_k.stride(0), paged_k.stride(1), paged_k.stride(2), paged_k.stride(3))
+        if (not hasattr(self, '_assemble_stride_cache')
+                or self._assemble_stride_cache['paged_strides'] != _cur_paged_strides):
+            self._assemble_stride_cache = build_assemble_stride_cache(
+                paged_k, comp_k, sink_k, recent_k, selected_indices,
+                cos_table, self._final_k_buf,
+                query_states=query_states if cfg.continuous_rope else None,
+            )
 
-    # Step 8: Compute attention (no causal mask needed for q_len=1)
+    # Fused assemble + Q-RoPE with stride cache
+    final_k, final_v, q_rope_out = assemble_kv_split_triton(
+        paged_k, paged_v, comp_k, comp_v,
+        sink_k, sink_v, recent_k, recent_v,
+        selected_indices,
+        cos_table, sin_table,
+        out_k=self._final_k_buf,
+        out_v=self._final_v_buf,
+        query_states=query_states,
+        q_rope_cos=q_rope_cos,
+        q_rope_sin=q_rope_sin,
+        q_rope_buf=self._q_rope_buf,
+        stride_cache=self._assemble_stride_cache,
+    )
+    query_states = q_rope_out
+
+    # Step 7a: Compute attention (no causal mask needed for q_len=1)
     attn_output = F.scaled_dot_product_attention(
         query_states, final_k, final_v,
         is_causal=False,
         enable_gqa=True,
     )
     attn_output = attn_output.transpose(1, 2).contiguous()
-
-    # Step 9: Output projection
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+
+    # Step 7b: Output projection
     attn_output = self.o_proj(attn_output)
     return attn_output, None
 

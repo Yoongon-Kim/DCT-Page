@@ -383,7 +383,7 @@ def parse_args():
     # Model
     parser.add_argument("--base_model", type=str,
                         default="Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--max_input_len", type=int, default=120000)
+    parser.add_argument("--max_input_len", type=int, default=127500)
     parser.add_argument("--max_new_tokens_override", type=int, default=-1,
                         help="Override per-task max_new_tokens (-1 = use official)")
 
@@ -563,7 +563,7 @@ def main():
     if args.mode == "page_attention":
         model_name_lower = args.base_model.lower()
         if "llama" in model_name_lower:
-            from dct_page_attention_copy import replace_llama_attn
+            from dct_page_attention import replace_llama_attn
             replace_llama_attn(
                 page_size=args.page_size,
                 top_k=args.top_k,
@@ -577,7 +577,7 @@ def main():
                 use_triton=not args.no_triton,
             )
         else:
-            from dct_page_attention_copy import replace_qwen2_attn
+            from dct_page_attention import replace_qwen2_attn
             replace_qwen2_attn(
                 page_size=args.page_size,
                 top_k=args.top_k,
@@ -613,7 +613,7 @@ def main():
     all_task_results = {}
     for task in args.tasks:
         print(f"\n--- Loading task: {task} ---")
-        # ds = load_dataset("THUDM/LongBench", task, split="test")
+        #ds = load_dataset("THUDM/LongBench", task, split="test")
         ds = load_dataset("json", data_files=f"data/{task}.jsonl", split="train")
         print(f"  {len(ds)} samples")
         all_task_results[task] = evaluate_task(model, tokenizer, task, ds, args)
