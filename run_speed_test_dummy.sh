@@ -4,7 +4,7 @@ set -e
 
 # ---- Configuration ----
 MODEL="${MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
-CONTEXT_LENGTHS="${CONTEXT_LENGTHS:-120000}" #4096,8192,16384,32768,65536,120000}"
+CONTEXT_LENGTHS="${CONTEXT_LENGTHS:-65536}" #4096,8192,16384,32768,65536,120000}"
 NUM_REPEATS="${NUM_REPEATS:-3}"
 OUTPUT_DIR="${OUTPUT_DIR:-results_speed_test_dummy}"
 
@@ -27,45 +27,35 @@ python speed_test_dummy.py \
     $COMMON_ARGS
 
 # ---- Step 2: DCT configurations ----
-# for COMPRESS_RATIO in 0.03; do
-#     for TOP_K in 8; do
-#         for SCORING in mean; do
-#             for GAM in max; do
-#                 for UMODE in compressed; do
-#                     for CROPE in continuous; do
-#                         ROPE_FLAG=""
-#                         if [ "$CROPE" = "nocontinuous" ]; then
-#                             ROPE_FLAG="--no_continuous_rope"
-#                         fi
-#                         for TRITON in triton notriton; do
-#                             TRITON_FLAG=""
-#                             if [ "$TRITON" = "notriton" ]; then
-#                                 TRITON_FLAG="--no_triton"
-#                             fi
-#                             echo ""
-#                             echo "============================================================"
-#                             echo "DCT: compress=${COMPRESS_RATIO} top_k=${TOP_K} scoring=${SCORING} gam=${GAM} unselected=${UMODE} rope=${CROPE} ${TRITON}"
-#                             echo "============================================================"
-#                             python speed_test_dummy.py \
-#                                 --mode dct \
-#                                 $COMMON_ARGS \
-#                                 --page_size        $PAGE_SIZE \
-#                                 --sink_size        $SINK_SIZE \
-#                                 --recent_size      $RECENT_SIZE \
-#                                 --compress_ratio   $COMPRESS_RATIO \
-#                                 --top_k            $TOP_K \
-#                                 --scoring_method   $SCORING \
-#                                 --group_agg_method $GAM \
-#                                 --unselected_mode  $UMODE \
-#                                 $ROPE_FLAG \
-#                                 $TRITON_FLAG
-#                         done
-#                     done
-#                 done
-#             done
-#         done
-#     done
-# done
+for COMPRESS_RATIO in 0.032; do
+    for TOP_K in 8; do
+        for SCORING in mean; do
+            for GAM in max; do
+                for UMODE in compressed; do
+                    for CROPE in continuous; do
+                        for TRITON in triton; do
+                            echo ""
+                            echo "============================================================"
+                            echo "DCT: compress=${COMPRESS_RATIO} top_k=${TOP_K} scoring=${SCORING} gam=${GAM} unselected=${UMODE} rope=${CROPE} ${TRITON}"
+                            echo "============================================================"
+                            python speed_test_dummy.py \
+                                --mode dct \
+                                $COMMON_ARGS \
+                                --page_size        $PAGE_SIZE \
+                                --sink_size        $SINK_SIZE \
+                                --recent_size      $RECENT_SIZE \
+                                --compress_ratio   $COMPRESS_RATIO \
+                                --top_k            $TOP_K \
+                                --scoring_method   $SCORING \
+                                --group_agg_method $GAM \
+                                --unselected_mode  $UMODE
+                        done
+                    done
+                done
+            done
+        done
+    done
+done
 
 # ---- Step 3: Comparison table ----
 echo ""

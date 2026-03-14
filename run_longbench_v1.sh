@@ -30,17 +30,17 @@ if [ -n "$TASKS" ]; then
 fi
 
 # ---- Step 1: Baseline (full attention, no monkey-patch) ----
-# echo "============================================================"
-# echo "BASELINE: Full attention (no monkey-patch)"
-# echo "============================================================"
-# python eval_longbench_v1.py \
-#     --mode baseline \
-#     --base_model "$BASE_MODEL" \
-#     --max_input_len "$MAX_INPUT_LEN" \
-#     --num_samples "$NUM_SAMPLES" \
-#     --output_dir "$OUTPUT_DIR" \
-#     --run_name llama_baseline \
-#     $TASK_ARGS
+echo "============================================================"
+echo "BASELINE: Full attention (no monkey-patch)"
+echo "============================================================"
+python eval_longbench_v1.py \
+    --mode baseline \
+    --base_model "$BASE_MODEL" \
+    --max_input_len "$MAX_INPUT_LEN" \
+    --num_samples "$NUM_SAMPLES" \
+    --output_dir "$OUTPUT_DIR" \
+    --run_name llama_baseline \
+    $TASK_ARGS
 
 # ---- Step 2: Sweep top_k x scoring_method x group_agg_method x mode ----
 for TOP_K in 4; do #4 8 16 32; do

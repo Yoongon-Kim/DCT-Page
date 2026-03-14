@@ -24,6 +24,7 @@ from speed_test_dummy import (
     load_model_and_tokenizer,
     get_original_forward,
     restore_forward,
+    chunked_prefill,
 )
 
 
@@ -602,6 +603,9 @@ def parse_args():
                    help="Disable Triton kernels (use pure PyTorch for comparison)")
     p.add_argument("--sync", action="store_true",
                    help="Add torch.cuda.synchronize() between steps to get CPU timing breakdown")
+    p.add_argument("--chunk_size", type=int, default=0,
+                   help="Chunked prefill size (0 = single-pass prefill). "
+                        "Use e.g. 8192 to reduce peak memory for long contexts.")
     args = p.parse_args()
     args.continuous_rope = not args.no_continuous_rope
     return args
@@ -621,12 +625,16 @@ def run_profiled_decode(model, tokenizer, args, mode):
                               dtype=torch.long, device=device)
 
     # Prefill (not profiled)
-    print(f"  Prefilling ({args.context_length} tokens)...")
+    chunk_size = getattr(args, 'chunk_size', 0)
+    if chunk_size > 0:
+        print(f"  Prefilling ({args.context_length} tokens, chunk_size={chunk_size})...")
+    else:
+        print(f"  Prefilling ({args.context_length} tokens)...")
     _enabled = False
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     with torch.no_grad():
-        out = model(input_ids, use_cache=True)
+        out = chunked_prefill(model, input_ids, chunk_size)
     torch.cuda.synchronize()
     prefill_ms = (time.perf_counter() - t0) * 1000
     print(f"  Prefill done: {prefill_ms:.0f}ms")
@@ -756,6 +764,7 @@ def main():
 
     original_forward = get_original_forward(args.model)
     model, tokenizer = load_model_and_tokenizer(args.model)
+    model._original_attn_forward = original_forward
 
     num_layers = model.config.num_hidden_layers
     print(f"Model layers: {num_layers}")

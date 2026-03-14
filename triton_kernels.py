@@ -189,45 +189,41 @@ def _topk_sort_kernel(
 ):
     """One program per (batch, kv_head). Finds top-k page indices sorted ascending.
 
-    Algorithm: k rounds of argmax (mask-and-repeat), then vectorized bubble sort.
+    Algorithm: two vectorized sorts via tl.sort —
+      1) Sort (score descending, index) packed into int64 to find top-k,
+      2) Sort the top-k indices ascending.
+    O(n log²n + n log²n) vectorized ops vs. O(k·n + k²) serial ops.
     """
     pid = tl.program_id(0)
     base_s = scores_ptr + pid * s_stride_bh
     base_o = out_ptr + pid * o_stride_bh
 
-    # Load all page scores
     p_idx = tl.arange(0, BLOCK_P)
     mask = p_idx < num_pages
     scores = tl.load(base_s + p_idx, mask=mask, other=float('-inf'))
 
-    # Phase 1: iterative argmax to find top-k indices
-    k_idx = tl.arange(0, TOP_K)
-    top_indices = tl.zeros([TOP_K], dtype=tl.int32)
+    # --- Phase 1: Sort by score descending to find top-k ---
+    # Convert float32 to signed int32 that preserves total float ordering:
+    #   positive floats: bits already sort correctly as signed int32
+    #   negative floats: XOR with 0x7FFFFFFF reverses their internal order
+    bits = scores.to(tl.int32, bitcast=True)
+    sortable = tl.where(bits >= 0, bits, bits ^ 0x7FFFFFFF)
+    # Negate so ascending int64 sort = descending float order
+    desc_key = -sortable
 
-    for _k in range(TOP_K):
-        best_val = tl.max(scores, axis=0)
-        is_best = (scores == best_val) & mask
-        best_idx = tl.min(tl.where(is_best, p_idx, BLOCK_P), axis=0)
-        top_indices = tl.where(k_idx == _k, best_idx.to(tl.int32), top_indices)
-        scores = tl.where(p_idx == best_idx, float('-inf'), scores)
+    # Pack (desc_key, page_index) into int64; ascending sort yields
+    # highest scores first, ties broken by lowest page index.
+    packed = (desc_key.to(tl.int64) << 32) | p_idx.to(tl.int64)
+    sorted_packed = tl.sort(packed)
 
-    # Phase 2: bubble sort ascending (TOP_K is small, fully unrolled)
-    for i in range(TOP_K - 1):
-        for j in range(TOP_K - 1):
-            # Load pair
-            left_mask = k_idx == j
-            right_mask = k_idx == (j + 1)
-            left_val = tl.sum(tl.where(left_mask, top_indices, 0))
-            right_val = tl.sum(tl.where(right_mask, top_indices, 0))
-            # Swap if out of order
-            do_swap = left_val > right_val
-            new_left = tl.where(do_swap, right_val, left_val)
-            new_right = tl.where(do_swap, left_val, right_val)
-            top_indices = tl.where(left_mask, new_left.to(tl.int32), top_indices)
-            top_indices = tl.where(right_mask, new_right.to(tl.int32), top_indices)
+    # --- Phase 2: Sort top-k indices ascending ---
+    # Extract page indices (lower 32 bits), sentinel the tail with INT_MAX
+    sorted_indices = (sorted_packed & 0xFFFFFFFF).to(tl.int32)
+    top_indices = tl.where(p_idx < TOP_K, sorted_indices, 2147483647)
+    sorted_top = tl.sort(top_indices)
 
-    # Store sorted int32 indices
-    tl.store(base_o + k_idx, top_indices)
+    # Store first TOP_K results (mask keeps writes in-bounds)
+    tl.store(base_o + p_idx, sorted_top, mask=p_idx < TOP_K)
 
 
 def topk_sort_triton(
@@ -269,6 +265,20 @@ def topk_sort_triton(
             TOP_K=top_k,
             BLOCK_P=BLOCK_P,
         )
+
+    # --- DEBUG: validate against torch.topk reference ---
+    # _, ref_indices = torch.topk(page_scores, top_k, dim=-1)
+    # ref_sorted = ref_indices.sort(dim=-1).values.to(torch.int32)
+    # if not torch.equal(selected, ref_sorted):
+    #     # Find first mismatch for diagnostics
+    #     diff_mask = selected != ref_sorted
+    #     b, h, k = diff_mask.nonzero(as_tuple=False)[0].tolist()
+    #     raise AssertionError(
+    #         f"topk_sort_triton mismatch at (b={b}, h={h}, k={k}): "
+    #         f"triton={selected[b, h].tolist()}, "
+    #         f"ref={ref_sorted[b, h].tolist()}"
+    #     )
+    # --- END DEBUG ---
 
     return selected
 
@@ -312,6 +322,7 @@ def _assemble_kv_full_kernel(
     PAGE_SIZE: tl.constexpr,
     COMP_SIZE: tl.constexpr,
     TOP_K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_T: tl.constexpr,
     APPLY_ROPE: tl.constexpr,   # 1 = apply K-RoPE, 0 = straight copy
@@ -336,8 +347,9 @@ def _assemble_kv_full_kernel(
 
     # ---- Load pre-sorted selected indices (tiny: TOP_K int32s) ----
     si_base = sel_indices_ptr + b * si_stride_b + h * si_stride_h
-    k_idx = tl.arange(0, TOP_K)
-    sel_indices = tl.load(si_base + k_idx).to(tl.int32)
+    k_idx = tl.arange(0, BLOCK_K)
+    k_mask = k_idx < TOP_K
+    sel_indices = tl.load(si_base + k_idx, mask=k_mask, other=2147483647).to(tl.int32)
 
     # ---- Determine segment type and source ----
     is_sink = (seg == 0)
@@ -560,6 +572,7 @@ def assemble_kv_full_triton(
             sink_len, recent_len, total_len,
             # constexprs
             PAGE_SIZE=page_size, COMP_SIZE=comp_size, TOP_K=top_k,
+            BLOCK_K=triton.next_power_of_2(top_k),
             BLOCK_D=BLOCK_D, BLOCK_T=BLOCK_T,
             APPLY_ROPE=1 if apply_rope else 0,
         )
@@ -776,6 +789,7 @@ def _copy_unselected_pages_kernel(
     COMP_SIZE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     TOP_K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     PAGES_PER_PROG: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_T: tl.constexpr,
@@ -794,8 +808,9 @@ def _copy_unselected_pages_kernel(
 
     # Load selected indices once per program (reused across all pages in batch)
     sel_base = sel_indices_ptr + b * sel_stride_b + h * sel_stride_h
-    k_idx = tl.arange(0, TOP_K)
-    sel_all = tl.load(sel_base + k_idx).to(tl.int32)
+    k_idx = tl.arange(0, BLOCK_K)
+    k_mask = k_idx < TOP_K
+    sel_all = tl.load(sel_base + k_idx, mask=k_mask, other=2147483647).to(tl.int32)
 
     # Precompute d_idx and RoPE constants (shared across pages)
     d_idx = tl.arange(0, BLOCK_D)
@@ -1023,6 +1038,7 @@ def assemble_kv_split_triton(
                 sel_idx.stride(0), sel_idx.stride(1),
                 num_kv_heads, num_pages, head_dim, sink_len, num_groups,
                 COMP_SIZE=comp_size, PAGE_SIZE=page_size, TOP_K=top_k,
+                BLOCK_K=triton.next_power_of_2(top_k),
                 PAGES_PER_PROG=PAGES_PER_PROG,
                 BLOCK_D=BLOCK_D, BLOCK_T=BLOCK_T_COMP,
                 APPLY_ROPE=1 if apply_rope else 0,
@@ -1175,6 +1191,7 @@ def _assemble_kv_split_stride_cached(
                 si[0], si[1],
                 c['num_kv_heads'], num_pages, head_dim, c['sink_len'], num_groups,
                 COMP_SIZE=c['comp_size'], PAGE_SIZE=c['page_size'], TOP_K=top_k,
+                BLOCK_K=triton.next_power_of_2(top_k),
                 PAGES_PER_PROG=c['PAGES_PER_PROG'],
                 BLOCK_D=c['BLOCK_D'], BLOCK_T=c['BLOCK_T_COMP'],
                 APPLY_ROPE=c['APPLY_ROPE'],
@@ -1324,6 +1341,7 @@ def _assemble_kv_split_cached(
                 si[0], si[1],
                 c['num_kv_heads'], c['num_pages'], head_dim, c['sink_len'], c['num_groups'],
                 COMP_SIZE=c['comp_size'], PAGE_SIZE=c['page_size'], TOP_K=c['top_k'],
+                BLOCK_K=triton.next_power_of_2(c['top_k']),
                 PAGES_PER_PROG=c['PAGES_PER_PROG'],
                 BLOCK_D=c['BLOCK_D'], BLOCK_T=c['BLOCK_T_COMP'],
                 APPLY_ROPE=c['APPLY_ROPE'],

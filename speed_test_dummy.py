@@ -161,15 +161,98 @@ def pre_allocate_cache(cache, extra_tokens=256):
 # ---------------------------------------------------------------------------
 # Per-sample timing (no EOS stopping — always generates max_new_tokens)
 # ---------------------------------------------------------------------------
+def chunked_prefill(model, input_ids, chunk_size):
+    """Prefill by processing input_ids in chunks to reduce peak activation memory.
+
+    Returns the same (output, past_key_values) as a single forward pass would,
+    but with much lower peak GPU memory usage.
+
+    When a DCT-patched attention forward is active, temporarily restores the
+    original forward for prefill (DCT prefill paths store unrotated keys but
+    use only the current chunk's rotated keys for attention, causing a shape
+    mismatch with the causal mask on chunk 2+).  After prefill, cached keys
+    are un-rotated so that DCT decode (which expects unrotated keys) works
+    correctly.
+    """
+    seq_len = input_ids.shape[1]
+    if chunk_size <= 0 or seq_len <= chunk_size:
+        out = model(input_ids, use_cache=True)
+        return out
+
+    # Detect if a DCT-patched forward is active and swap to original.
+    original_forward = getattr(model, '_original_attn_forward', None)
+    attn_cls = None
+    patched_forward = None
+
+    if original_forward is not None:
+        for module in model.modules():
+            if type(module).__name__ in ('LlamaAttention', 'Qwen2Attention'):
+                attn_cls = type(module)
+                break
+        if attn_cls is not None:
+            current_forward = attn_cls.__dict__.get('forward')
+            if current_forward is not None and current_forward is not original_forward:
+                patched_forward = current_forward
+                attn_cls.forward = original_forward
+
+    try:
+        past_key_values = None
+        for start in range(0, seq_len, chunk_size):
+            end = min(start + chunk_size, seq_len)
+            chunk = input_ids[:, start:end]
+            cache_position = torch.arange(start, end, device=input_ids.device)
+            out = model(
+                chunk,
+                past_key_values=past_key_values,
+                use_cache=True,
+                cache_position=cache_position,
+            )
+            past_key_values = out.past_key_values
+    finally:
+        # Always restore the patched forward
+        if attn_cls is not None and patched_forward is not None:
+            attn_cls.forward = patched_forward
+
+    # Original forward stores rotated keys; DCT decode expects unrotated.
+    if patched_forward is not None:
+        _unrotate_cache_keys(model, past_key_values, seq_len, input_ids.device)
+
+    return out
+
+
+def _unrotate_cache_keys(model, cache, seq_len, device):
+    """Apply inverse RoPE to convert rotated cached keys to unrotated.
+
+    The original attention forward stores RoPE-rotated keys in the cache.
+    DCT decode expects unrotated keys (it applies continuous RoPE later).
+    Inverse RoPE: apply_rotary_pos_emb with negated sin.
+    """
+    from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+
+    base_model = model.model if hasattr(model, 'model') else model
+    rotary_emb = base_model.rotary_emb
+
+    with torch.no_grad():
+        for layer_cache in cache.layers:
+            keys = layer_cache.keys  # [bsz, num_kv_heads, seq_len, head_dim]
+            layer_device = keys.device
+            positions = torch.arange(seq_len, device=layer_device).unsqueeze(0)
+            dummy = torch.empty(1, 1, device=layer_device, dtype=keys.dtype)
+            cos, sin = rotary_emb(dummy, position_ids=positions)
+            # Inverse RoPE: cos stays, sin is negated
+            _, unrotated = apply_rotary_pos_emb(keys, keys, cos, -sin)
+            layer_cache.keys = unrotated
+
+
 def time_sample(model, tokenizer, input_ids, max_new_tokens, warmup_steps,
-                use_pre_alloc=False):
+                use_pre_alloc=False, chunk_size=0):
     device = input_ids.device
     prefill_len = input_ids.shape[1]
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     with torch.no_grad():
-        out = model(input_ids, use_cache=True)
+        out = chunked_prefill(model, input_ids, chunk_size)
     torch.cuda.synchronize()
     prefill_time = time.perf_counter() - t0
 
@@ -219,8 +302,11 @@ def parse_args():
                    help="Comma-separated context lengths to benchmark")
     p.add_argument("--num_repeats", type=int, default=3,
                    help="Repeats per context length for averaging")
-    p.add_argument("--max_new_tokens", type=int, default=32)
+    p.add_argument("--max_new_tokens", type=int, default=128)
     p.add_argument("--warmup_steps", type=int, default=8)
+    p.add_argument("--chunk_size", type=int, default=0,
+                   help="Chunked prefill size (0 = single-pass prefill). "
+                        "Use e.g. 8192 to reduce peak memory for long contexts.")
     p.add_argument("--output_dir", default="results_speed_test_dummy")
     p.add_argument("--run_name", default=None)
 
@@ -280,7 +366,7 @@ def benchmark_dummy(model, tokenizer, args, label, context_lengths):
     warmup_ids = torch.randint(0, vocab_size, (1, warmup_len), dtype=torch.long, device=device)
     print(f"  [{label}] Warmup run (ctx={warmup_len})...")
     time_sample(model, tokenizer, warmup_ids, min(16, args.max_new_tokens), 0,
-                use_pre_alloc=use_pre_alloc)
+                use_pre_alloc=use_pre_alloc, chunk_size=args.chunk_size)
     del warmup_ids
     torch.cuda.empty_cache()
 
@@ -304,7 +390,7 @@ def benchmark_dummy(model, tokenizer, args, label, context_lengths):
 
             prefill_time, step_times, n_generated = time_sample(
                 model, tokenizer, input_ids, args.max_new_tokens, args.warmup_steps,
-                use_pre_alloc=use_pre_alloc,
+                use_pre_alloc=use_pre_alloc, chunk_size=args.chunk_size,
             )
 
             per_length_stats[ctx_len]["prefill_times"].append(prefill_time)
@@ -487,6 +573,7 @@ def main():
 
     original_forward = get_original_forward(args.model)
     model, tokenizer = load_model_and_tokenizer(args.model)
+    model._original_attn_forward = original_forward
 
     results = {}
 
