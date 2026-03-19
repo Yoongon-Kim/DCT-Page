@@ -614,7 +614,7 @@ def main():
     for task in args.tasks:
         print(f"\n--- Loading task: {task} ---")
         # ds = load_dataset("THUDM/LongBench", task, split="test")
-        ds = load_dataset("json", data_files=f"data/{task}.jsonl", split="train")
+        ds = load_dataset("json", data_files=f"longbench_v1_data/{task}.jsonl", split="train")
         print(f"  {len(ds)} samples")
         all_task_results[task] = evaluate_task(model, tokenizer, task, ds, args)
 

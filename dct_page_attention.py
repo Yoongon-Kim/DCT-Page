@@ -267,24 +267,32 @@ def _apply_rope(x, cos, sin):
     return (x * cos) + (_rotate_half(x) * sin)
 
 
-def _compute_rope_cos_sin(positions, head_dim, rope_theta, device, dtype):
-    """Compute cos/sin for arbitrary positions (matches Qwen2RotaryEmbedding).
+def _compute_rope_cos_sin(positions, config, device, dtype):
+    """Compute cos/sin for arbitrary positions, using the model's rope_scaling.
+
+    Uses transformers' ROPE_INIT_FUNCTIONS (the same function that
+    LlamaRotaryEmbedding.__init__ calls) so the inv_freq and
+    attention_scaling are identical to the model's own RoPE.
 
     Args:
         positions: [seq_len] integer tensor
-        head_dim:  int
-        rope_theta: float (from model config)
+        config:    model config object
 
     Returns:
         cos, sin: each [1, 1, seq_len, head_dim]
     """
-    inv_freq = 1.0 / (
-        rope_theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim)
-    )
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    rope_type = "default"
+    if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
+        rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type", "default"))
+
+    inv_freq, attention_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, device)
+
     freqs = torch.outer(positions.float(), inv_freq)   # [seq_len, head_dim/2]
     emb = torch.cat((freqs, freqs), dim=-1)             # [seq_len, head_dim]
-    cos = emb.cos().unsqueeze(0).unsqueeze(0).to(dtype)  # [1, 1, seq_len, head_dim]
-    sin = emb.sin().unsqueeze(0).unsqueeze(0).to(dtype)
+    cos = (emb.cos() * attention_scaling).unsqueeze(0).unsqueeze(0).to(dtype)
+    sin = (emb.sin() * attention_scaling).unsqueeze(0).unsqueeze(0).to(dtype)
     return cos, sin
 
 
@@ -432,13 +440,24 @@ def dct_page_attention_forward(
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
 
+        # Cache the model's RoPE table (correctly handles rope_scaling).
+        # Pre-allocate with extra slots so decode extends are O(1) writes.
+        # cos/sin shape from position_embeddings: [bsz, seq_len, head_dim]
+        # _rope_cos_2d / _rope_sin_2d shape: [alloc_len, head_dim]
+        extra_tokens = cfg.page_size * 2
+        alloc_len = q_len + extra_tokens
+        self._rope_cos_2d = torch.empty(alloc_len, self.head_dim, dtype=cos.dtype, device=cos.device)
+        self._rope_sin_2d = torch.empty(alloc_len, self.head_dim, dtype=sin.dtype, device=sin.device)
+        self._rope_cos_2d[:q_len] = cos[0]  # [seq_len, head_dim]
+        self._rope_sin_2d[:q_len] = sin[0]
+        self._rope_cache_len = q_len
+
         # Convert DynamicCache → PreAllocatedLayer at end of prefill (last layer only).
         # All layers are converted at once, so by the first decode step every
         # layer's cache.update() already uses PreAllocatedLayer (fixed strides).
         if (past_key_values is not None
                 and self.layer_idx == self.config.num_hidden_layers - 1
                 and not getattr(past_key_values, '_preallocated', False)):
-            extra_tokens = cfg.page_size*2
             pre_allocate_cache(past_key_values, extra_tokens=extra_tokens)
             past_key_values._preallocated = True
 
@@ -463,11 +482,12 @@ def dct_page_attention_forward(
     
     # Check if DCT path is active
     min_len_for_paging = cfg.sink_size + cfg.page_size * (cfg.top_k + 1) + cfg.recent_size
+    
+    # No need to do dct paging since there isn't enough tokens.
     if kv_len < min_len_for_paging:
         all_pos = torch.arange(kv_len, device=key_cached.device)
         cos_all, sin_all = _compute_rope_cos_sin(
-            all_pos, self.head_dim, getattr(self.config, 'rope_theta', self.config.rope_parameters['rope_theta'] if hasattr(self.config, 'rope_parameters') else 500000.0),
-            key_cached.device, key_cached.dtype
+            all_pos, self.config, key_cached.device, key_cached.dtype
         )
         attn_q, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
         attn_k = _apply_rope(key_cached, cos_all, sin_all)
@@ -536,9 +556,7 @@ def dct_page_attention_forward(
         max_len = assembled_len + cfg.page_size
         positions = torch.arange(max_len, device=comp_k.device)
         cos_cached, sin_cached = _compute_rope_cos_sin(
-            positions, self.head_dim,
-            getattr(self.config, 'rope_theta', self.config.rope_parameters['rope_theta'] if hasattr(self.config, 'rope_parameters') else 500000.0),
-            comp_k.device, comp_k.dtype,
+            positions, self.config, comp_k.device, comp_k.dtype,
         )
         # Store pre-squeezed 2D [max_len, head_dim] — eliminates [0,0,:N] indexing
         self._rope_cos_2d = cos_cached[0, 0] # [max_len, head_dim]
