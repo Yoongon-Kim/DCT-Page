@@ -590,21 +590,21 @@ def dct_page_attention_forward(
                 query_states=query_states if cfg.continuous_rope else None,
             )
 
-    # Fused assemble + Q-RoPE with stride cache
-    final_k, final_v, q_rope_out = assemble_kv_split_triton(
-        paged_k, paged_v, comp_k, comp_v,
-        sink_k, sink_v, recent_k, recent_v,
-        selected_indices,
-        cos_table, sin_table,
-        out_k=self._final_k_buf,
-        out_v=self._final_v_buf,
-        query_states=query_states,
-        q_rope_cos=q_rope_cos,
-        q_rope_sin=q_rope_sin,
-        q_rope_buf=self._q_rope_buf,
-        stride_cache=self._assemble_stride_cache,
-    )
-    query_states = q_rope_out
+        # Fused assemble + Q-RoPE with stride cache
+        final_k, final_v, q_rope_out = assemble_kv_split_triton(
+            paged_k, paged_v, comp_k, comp_v,
+            sink_k, sink_v, recent_k, recent_v,
+            selected_indices,
+            cos_table, sin_table,
+            out_k=self._final_k_buf,
+            out_v=self._final_v_buf,
+            query_states=query_states,
+            q_rope_cos=q_rope_cos,
+            q_rope_sin=q_rope_sin,
+            q_rope_buf=self._q_rope_buf,
+            stride_cache=self._assemble_stride_cache,
+        )
+        query_states = q_rope_out
 
     # Step 7a: Compute attention (no causal mask needed for q_len=1)
     attn_output = F.scaled_dot_product_attention(

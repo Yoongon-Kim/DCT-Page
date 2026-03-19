@@ -6,7 +6,7 @@ set -e
 
 # ---- Configuration ----
 BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
-MAX_INPUT_LEN="${MAX_INPUT_LEN:-120000}"
+MAX_INPUT_LEN="${MAX_INPUT_LEN:-127500}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
 OUTPUT_DIR="${OUTPUT_DIR:-results_longbench_v1}"
 
@@ -19,7 +19,6 @@ TASKS="${TASKS:-narrativeqa qasper gov_report 2wikimqa multifieldqa_en triviaqa}
 PAGE_SIZE=128
 SINK_SIZE=4
 RECENT_SIZE=128
-COMPRESS_RATIO=0.032
 SCORING_METHOD="mean"
 GROUP_AGG_METHOD="max"
 
@@ -42,51 +41,41 @@ python eval_longbench_v1.py \
     --run_name llama_baseline \
     $TASK_ARGS
 
-# ---- Step 2: Sweep top_k x scoring_method x group_agg_method x mode ----
-for TOP_K in 4; do #4 8 16 32; do
-    for SCORING_METHOD in mean; do
-        for GAM in max; do
-            for MODE in compressed; do
-                echo ""
-                echo "===================================================================="
-                echo "PAGE ATTENTION: top_k=${TOP_K}, scoring_method=${SCORING_METHOD}, group_agg=${GAM}, mode=${MODE}"
-                echo "===================================================================="
-                python eval_longbench_v1.py \
-                    --mode page_attention \
-                    --base_model "$BASE_MODEL" \
-                    --max_input_len "$MAX_INPUT_LEN" \
-                    --num_samples "$NUM_SAMPLES" \
-                    --output_dir "$OUTPUT_DIR" \
-                    --run_name "llama_page_attn_${COMPRESS_RATIO}_topk${TOP_K}_${SCORING_METHOD}_${GAM}_${MODE}_continuous_rope" \
-                    --page_size "$PAGE_SIZE" \
-                    --top_k "$TOP_K" \
-                    --sink_size "$SINK_SIZE" \
-                    --recent_size "$RECENT_SIZE" \
-                    --compress_ratio "$COMPRESS_RATIO" \
-                    --scoring_method "$SCORING_METHOD" \
-                    --group_agg_method "$GAM" \
-                    --unselected_mode "$MODE" \
-                    $TASK_ARGS
+# ---- Step 2: Sweep compress_ratio x top_k x scoring_method x group_agg_method x mode ----
+for COMPRESS_RATIO in 0.03125 0.0625 0.125 0.25; do  # 4/128, 8/128, 16/128, 32/128
+    for TOP_K in 4 8 16 32; do
+        for SCORING_METHOD in mean max; do
+            for GAM in max mean; do
+                for MODE in drop compressed; do
+                    echo ""
+                    echo "===================================================================="
+                    echo "PAGE ATTENTION: cr=${COMPRESS_RATIO}, top_k=${TOP_K}, scoring_method=${SCORING_METHOD}, group_agg=${GAM}, mode=${MODE}"
+                    echo "===================================================================="
+                    python eval_longbench_v1.py \
+                        --mode page_attention \
+                        --base_model "$BASE_MODEL" \
+                        --max_input_len "$MAX_INPUT_LEN" \
+                        --num_samples "$NUM_SAMPLES" \
+                        --output_dir "$OUTPUT_DIR" \
+                        --run_name "llama_page_attn_${COMPRESS_RATIO}_topk${TOP_K}_${SCORING_METHOD}_${GAM}_${MODE}" \
+                        --page_size "$PAGE_SIZE" \
+                        --top_k "$TOP_K" \
+                        --sink_size "$SINK_SIZE" \
+                        --recent_size "$RECENT_SIZE" \
+                        --compress_ratio "$COMPRESS_RATIO" \
+                        --scoring_method "$SCORING_METHOD" \
+                        --group_agg_method "$GAM" \
+                        --unselected_mode "$MODE" \
+                        $TASK_ARGS
+                done
             done
         done
     done
 done
 
-# ---- Step 3: Comparison table ----
+# ---- Step 3: Summarize all results ----
 echo ""
 echo "============================================================"
-echo "COMPARISON SUMMARY"
+echo "SUMMARIZING ALL RESULTS"
 echo "============================================================"
-echo ""
-printf "%-26s | %s\n" "Run Name" "Overall Score"
-printf "%-26s-|-%s\n" "--------------------------" "-------------"
-for d in "$OUTPUT_DIR"/*/; do
-    summary="${d}summary.json"
-    if [ -f "$summary" ]; then
-        name=$(python3 -c "import json; d=json.load(open('$summary')); print(d['run_name'])")
-        score=$(python3 -c "import json; d=json.load(open('$summary')); print(f\"{d['overall']:.1f}%\")")
-        printf "%-26s | %s\n" "$name" "$score"
-    fi
-done
-echo ""
-echo "Detailed results in: $OUTPUT_DIR/"
+python3 summarize_longbench_v1.py "$OUTPUT_DIR"

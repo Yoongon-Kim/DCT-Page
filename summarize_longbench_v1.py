@@ -3,6 +3,7 @@
 Prints per-task and overall scores, with optional breakdown by input length.
 
 Usage:
+    python summarize_longbench_v1.py results_longbench_v1/
     python summarize_longbench_v1.py results_longbench_v1/llama_page_attn_0.032_topk8_mean_max_compressed_continuous_rope/
     python summarize_longbench_v1.py results_longbench_v1/llama_page_attn_*/  # multiple runs
 """
@@ -56,11 +57,21 @@ def summarize_task(records):
 
 def main():
     parser = argparse.ArgumentParser(description="Summarize LongBench v1 results")
-    parser.add_argument("dirs", nargs="+", help="Result directories to summarize")
+    parser.add_argument("dirs", nargs="+", help="Result directories (or a parent folder containing run subdirectories)")
     args = parser.parse_args()
 
-    for dir_path in args.dirs:
-        dir_path = Path(dir_path)
+    # Resolve dirs: if a single directory is given that contains subdirectories
+    # with JSONL files (rather than JSONL files directly), treat it as a parent
+    # folder and summarize all subdirectories.
+    dirs = []
+    for d in args.dirs:
+        p = Path(d)
+        if p.is_dir() and not list(p.glob("*.jsonl")) and list(p.iterdir()):
+            dirs.extend(sorted(sub for sub in p.iterdir() if sub.is_dir()))
+        else:
+            dirs.append(p)
+
+    for dir_path in dirs:
         if not dir_path.is_dir():
             print(f"Skipping {dir_path} (not a directory)")
             continue

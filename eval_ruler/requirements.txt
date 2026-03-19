@@ -1,0 +1,12 @@
+torch
+transformers
+wonderwords
+tenacity
+huggingface-hub
+nltk
+PyYAML
+pandas
+scipy
+numpy
+tqdm
+datasets
