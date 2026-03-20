@@ -619,6 +619,7 @@ def _copy_full_segments_kernel(
     si_stride_b, si_stride_h,
     # --- runtime dims ---
     num_kv_heads,
+    num_pages,
     top_k,
     head_dim,
     sink_len,
@@ -630,6 +631,7 @@ def _copy_full_segments_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_T: tl.constexpr,
     APPLY_ROPE: tl.constexpr,
+    ORIGINAL_POS_ROPE: tl.constexpr,
     FUSE_Q_ROPE: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
 ):
@@ -692,9 +694,17 @@ def _copy_full_segments_kernel(
 
     # ---- RoPE setup (precompute outside branches) ----
     if APPLY_ROPE == 1:
-        out_pos = (write_start + t_start + t_idx)
+        if ORIGINAL_POS_ROPE == 1:
+            if is_sink:
+                rope_pos = t_start + t_idx
+            elif is_recent:
+                rope_pos = sink_len + num_pages * PAGE_SIZE + t_start + t_idx
+            else:
+                rope_pos = sink_len + page_idx * PAGE_SIZE + t_idx
+        else:
+            rope_pos = write_start + t_start + t_idx
         half_d = head_dim // 2
-        cos_offsets = out_pos[:, None] * rope_stride_t + d_idx[None, :]
+        cos_offsets = rope_pos[:, None] * rope_stride_t + d_idx[None, :]
         cos_vals = tl.load(cos_ptr + cos_offsets, mask=mask, other=0.0).to(tl.float32)
         sin_vals = tl.load(sin_ptr + cos_offsets, mask=mask, other=0.0).to(tl.float32)
         d_rot = tl.where(d_idx < half_d, d_idx + half_d, d_idx - half_d)
@@ -1013,11 +1023,12 @@ def assemble_kv_split_triton(
             # sel_indices strides
             sel_idx.stride(0), sel_idx.stride(1),
             # runtime dims
-            num_kv_heads, top_k, head_dim, sink_len, recent_len, total_len,
+            num_kv_heads, num_pages, top_k, head_dim, sink_len, recent_len, total_len,
             # constexprs
             COMP_SIZE=comp_size, PAGE_SIZE=page_size,
             BLOCK_D=BLOCK_D, BLOCK_T=BLOCK_T_FULL,
             APPLY_ROPE=1 if apply_rope else 0,
+            ORIGINAL_POS_ROPE=0,
             FUSE_Q_ROPE=1 if fuse_q_rope else 0,
             NUM_Q_HEADS=num_q_heads if fuse_q_rope else 0,
         )
@@ -1171,10 +1182,11 @@ def _assemble_kv_split_stride_cached(
             os[0], os[1], os[2],
             c['rope_stride_t'],
             si[0], si[1],
-            c['num_kv_heads'], top_k, head_dim, c['sink_len'], recent_len, total_len,
+            c['num_kv_heads'], num_pages, top_k, head_dim, c['sink_len'], recent_len, total_len,
             COMP_SIZE=c['comp_size'], PAGE_SIZE=c['page_size'],
             BLOCK_D=c['BLOCK_D'], BLOCK_T=c['BLOCK_T_FULL'],
             APPLY_ROPE=c['APPLY_ROPE'],
+            ORIGINAL_POS_ROPE=0,
             FUSE_Q_ROPE=c['FUSE_Q_ROPE'],
             NUM_Q_HEADS=c['NUM_Q_HEADS'],
         )
@@ -1321,10 +1333,11 @@ def _assemble_kv_split_cached(
             os[0], os[1], os[2],
             c['rope_stride_t'],
             si[0], si[1],
-            c['num_kv_heads'], c['top_k'], head_dim, c['sink_len'], c['recent_len'], total_len,
+            c['num_kv_heads'], c['num_pages'], c['top_k'], head_dim, c['sink_len'], c['recent_len'], total_len,
             COMP_SIZE=c['comp_size'], PAGE_SIZE=c['page_size'],
             BLOCK_D=c['BLOCK_D'], BLOCK_T=c['BLOCK_T_FULL'],
             APPLY_ROPE=c['APPLY_ROPE'],
+            ORIGINAL_POS_ROPE=0,
             FUSE_Q_ROPE=c['FUSE_Q_ROPE'],
             NUM_Q_HEADS=c['NUM_Q_HEADS'],
         )
@@ -1355,6 +1368,127 @@ def _assemble_kv_split_cached(
 # ---------------------------------------------------------------------------
 # Wrapper: Drop-mode assemble (Kernel A only, COMP_SIZE=0)
 # ---------------------------------------------------------------------------
+def build_assemble_drop_stride_cache(
+    paged_k,
+    sink_k,
+    recent_k,
+    selected_indices,
+    out_k,
+    cos_table=None,
+    original_position_rope=False,
+):
+    """Precompute tensor strides and fixed constants for drop-mode assembly."""
+    bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
+    sink_len = sink_k.shape[2]
+
+    BLOCK_D = triton.next_power_of_2(head_dim)
+    BLOCK_T_FULL = 64
+    sink_tiles = (sink_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
+    page_tiles = (page_size + BLOCK_T_FULL - 1) // BLOCK_T_FULL
+
+    apply_rope = cos_table is not None
+    rope_stride_t = cos_table.stride(0) if apply_rope else 0
+
+    return {
+        "device": paged_k.device,
+        "bsz": bsz,
+        "num_kv_heads": num_kv_heads,
+        "page_size": page_size,
+        "head_dim": head_dim,
+        "sink_len": sink_len,
+        "paged_strides": (
+            paged_k.stride(0),
+            paged_k.stride(1),
+            paged_k.stride(2),
+            paged_k.stride(3),
+        ),
+        "sink_strides": (sink_k.stride(0), sink_k.stride(1), sink_k.stride(2)),
+        "recent_strides": (recent_k.stride(0), recent_k.stride(1), recent_k.stride(2)),
+        "out_strides": (out_k.stride(0), out_k.stride(1), out_k.stride(2)),
+        "sel_strides": (selected_indices.stride(0), selected_indices.stride(1)),
+        "rope_stride_t": rope_stride_t,
+        "BLOCK_D": BLOCK_D,
+        "BLOCK_T_FULL": BLOCK_T_FULL,
+        "sink_tiles": sink_tiles,
+        "page_tiles": page_tiles,
+        "APPLY_ROPE": 1 if apply_rope else 0,
+        "ORIGINAL_POS_ROPE": 1 if original_position_rope else 0,
+    }
+
+
+def _assemble_kv_drop_stride_cached(
+    paged_k,
+    paged_v,
+    sink_k,
+    sink_v,
+    recent_k,
+    recent_v,
+    selected_indices,
+    cos_table,
+    sin_table,
+    out_k,
+    out_v,
+    out_sel_idx,
+    num_pages,
+    c,
+):
+    """Fast path using cached strides for drop-mode assembly."""
+    recent_len = recent_k.shape[2]
+    top_k = selected_indices.shape[2]
+    total_len = c["sink_len"] + top_k * c["page_size"] + recent_len
+
+    final_k = out_k[:, :, :total_len, :]
+    final_v = out_v[:, :, :total_len, :]
+
+    if selected_indices.dtype == torch.int32:
+        sel_idx = selected_indices
+    elif out_sel_idx is not None and out_sel_idx.shape[2] >= top_k:
+        sel_idx = out_sel_idx[:, :, :top_k]
+        sel_idx.copy_(selected_indices)
+    else:
+        sel_idx = selected_indices.to(torch.int32)
+
+    ps = c["paged_strides"]
+    ss = c["sink_strides"]
+    rs = c["recent_strides"]
+    os = c["out_strides"]
+    si = c["sel_strides"]
+
+    cos_ptr = cos_table if cos_table is not None else final_k
+    sin_ptr = sin_table if sin_table is not None else final_k
+
+    recent_tiles = (recent_len + c["BLOCK_T_FULL"] - 1) // c["BLOCK_T_FULL"]
+    tiles_per_head = c["sink_tiles"] + top_k * c["page_tiles"] + recent_tiles
+    grid_full = (c["bsz"] * c["num_kv_heads"], tiles_per_head)
+
+    with torch.cuda.device(c["device"]):
+        _copy_full_segments_kernel[grid_full](
+            paged_k, paged_v,
+            sink_k, sink_v,
+            recent_k, recent_v,
+            final_k, final_v,
+            cos_ptr, sin_ptr,
+            sel_idx,
+            final_k, final_k, final_k, final_k,
+            0,
+            ps[0], ps[1], ps[2], ps[3],
+            ss[0], ss[1], ss[2],
+            rs[0], rs[1], rs[2],
+            os[0], os[1], os[2],
+            c["rope_stride_t"],
+            si[0], si[1],
+            c["num_kv_heads"], num_pages, top_k, c["head_dim"], c["sink_len"], recent_len, total_len,
+            COMP_SIZE=0, PAGE_SIZE=c["page_size"],
+            BLOCK_D=c["BLOCK_D"], BLOCK_T=c["BLOCK_T_FULL"],
+            APPLY_ROPE=c["APPLY_ROPE"],
+            ORIGINAL_POS_ROPE=c["ORIGINAL_POS_ROPE"],
+            FUSE_Q_ROPE=0,
+            NUM_Q_HEADS=0,
+        )
+
+    return final_k, final_v
+
+
 def assemble_kv_drop_triton(
     paged_k: torch.Tensor,
     paged_v: torch.Tensor,
@@ -1368,6 +1502,9 @@ def assemble_kv_drop_triton(
     out_k: torch.Tensor = None,
     out_v: torch.Tensor = None,
     out_sel_idx: torch.Tensor = None,
+    stride_cache: dict = None,
+    num_pages: int = None,
+    original_position_rope: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Assemble KV for drop mode: sink + selected full pages + recent.
 
@@ -1375,7 +1512,9 @@ def assemble_kv_drop_triton(
     are packed contiguously (write_start = sink_len + rank * PAGE_SIZE).
     No Kernel B launch needed — unselected pages are simply dropped.
     """
-    bsz, num_kv_heads, num_pages, page_size, head_dim = paged_k.shape
+    bsz, num_kv_heads, inferred_num_pages, page_size, head_dim = paged_k.shape
+    if num_pages is None:
+        num_pages = inferred_num_pages
     sink_len = sink_k.shape[2]
     recent_len = recent_k.shape[2]
     top_k = selected_indices.shape[2]
@@ -1384,6 +1523,24 @@ def assemble_kv_drop_triton(
     apply_rope = cos_table is not None and sin_table is not None
     device = paged_k.device
     dtype = paged_k.dtype
+
+    if stride_cache is not None:
+        return _assemble_kv_drop_stride_cached(
+            paged_k,
+            paged_v,
+            sink_k,
+            sink_v,
+            recent_k,
+            recent_v,
+            selected_indices,
+            cos_table,
+            sin_table,
+            out_k,
+            out_v,
+            out_sel_idx,
+            num_pages,
+            stride_cache,
+        )
 
     if out_k is not None and out_k.shape[2] >= total_len:
         final_k = out_k[:, :, :total_len, :]
@@ -1434,10 +1591,11 @@ def assemble_kv_drop_triton(
             final_k.stride(0), final_k.stride(1), final_k.stride(2),
             rope_stride_t,
             sel_idx.stride(0), sel_idx.stride(1),
-            num_kv_heads, top_k, head_dim, sink_len, recent_len, total_len,
+            num_kv_heads, num_pages, top_k, head_dim, sink_len, recent_len, total_len,
             COMP_SIZE=0, PAGE_SIZE=page_size,
             BLOCK_D=BLOCK_D, BLOCK_T=BLOCK_T_FULL,
             APPLY_ROPE=1 if apply_rope else 0,
+            ORIGINAL_POS_ROPE=1 if original_position_rope else 0,
             FUSE_Q_ROPE=0,
             NUM_Q_HEADS=0,
         )

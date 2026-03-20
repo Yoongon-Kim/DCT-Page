@@ -29,6 +29,7 @@ from config import DCTPageConfig
 from triton_kernels import (
     assemble_kv_split_triton, 
     build_assemble_stride_cache, 
+    build_assemble_drop_stride_cache,
     topk_sort_triton, 
     assemble_kv_drop_triton, 
     score_pages_triton,
@@ -523,6 +524,16 @@ def _get_or_build_hadamard_projection_matrix(attn_module, page_size, comp_size, 
     return M
 
 
+def _next_page_capacity(required_pages, current_capacity):
+    """Grow page caches geometrically to avoid repeated realloc/copy."""
+    if current_capacity >= required_pages:
+        return current_capacity
+    new_capacity = max(8, current_capacity or 0)
+    while new_capacity < required_pages:
+        new_capacity *= 2
+    return new_capacity
+
+
 # ---------------------------------------------------------------------------
 # RoPE helpers (for continuous RoPE in continuous_rope mode)
 # ---------------------------------------------------------------------------
@@ -570,6 +581,33 @@ def _compute_rope_cos_sin(positions, config, device, dtype):
     cos = (emb.cos() * attention_scaling).unsqueeze(0).unsqueeze(0).to(dtype)
     sin = (emb.sin() * attention_scaling).unsqueeze(0).unsqueeze(0).to(dtype)
     return cos, sin
+
+
+def _get_or_build_original_position_rope_tables(attn_module, required_len, config, device, dtype):
+    """Cache 2D RoPE tables for contiguous original token positions [0, required_len)."""
+    cached_len = getattr(attn_module, "_orig_pos_rope_cache_len", 0)
+    cached_cos = getattr(attn_module, "_orig_pos_rope_cos_2d", None)
+    cached_sin = getattr(attn_module, "_orig_pos_rope_sin_2d", None)
+
+    need_rebuild = (
+        cached_cos is None
+        or cached_sin is None
+        or cached_len < required_len
+        or cached_cos.device != device
+        or cached_cos.dtype != dtype
+    )
+    if need_rebuild:
+        cache_len = _next_page_capacity(required_len, cached_len)
+        positions = torch.arange(cache_len, device=device)
+        cos, sin = _compute_rope_cos_sin(positions, config, device, dtype)
+        attn_module._orig_pos_rope_cos_2d = cos[0, 0]
+        attn_module._orig_pos_rope_sin_2d = sin[0, 0]
+        attn_module._orig_pos_rope_cache_len = cache_len
+
+    return (
+        attn_module._orig_pos_rope_cos_2d[:required_len],
+        attn_module._orig_pos_rope_sin_2d[:required_len],
+    )
 
 
 def _compute_rope_cos_sin_for_position_ids(position_ids, config, device, dtype):
@@ -637,7 +675,7 @@ def segment_kv(key_states, value_states, cfg):
 # ---------------------------------------------------------------------------
 # Incremental compressed page cache
 # ---------------------------------------------------------------------------
-def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size):
+def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, need_values=True):
     """
     Incrementally maintain DCT-compressed page representations.
 
@@ -648,17 +686,22 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size):
     bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
 
     cached_k = getattr(attn_module, '_dct_comp_k_cache', None)
-    n_cached  = getattr(attn_module, '_dct_n_pages_cached', 0)
+    cached_v = getattr(attn_module, '_dct_comp_v_cache', None)
+    n_cached = getattr(attn_module, '_dct_n_pages_cached', 0)
+    capacity = getattr(attn_module, '_dct_comp_cache_capacity', 0)
 
     # Invalidate cache when the sequence restarts or config changed
     if (cached_k is None
             or num_pages < n_cached
             or cached_k.shape[0] != bsz
-            or cached_k.shape[3] != comp_size):
+            or cached_k.shape[3] != comp_size
+            or (need_values and cached_v is None and n_cached > 0)):
         attn_module._dct_comp_k_cache  = None
         attn_module._dct_comp_v_cache  = None
         attn_module._dct_n_pages_cached = 0
+        attn_module._dct_comp_cache_capacity = 0
         n_cached = 0
+        capacity = 0
 
     n_new = num_pages - n_cached
     if n_new > 0:
@@ -669,22 +712,43 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size):
             attn_module, page_size, comp_size, new_k.device, new_k.dtype
         )
         new_comp_k = torch.einsum('cs,bhnsd->bhncd', M, new_k)
-        new_comp_v = torch.einsum('cs,bhnsd->bhncd', M, new_v)
+        new_comp_v = (
+            torch.einsum('cs,bhnsd->bhncd', M, new_v)
+            if need_values
+            else None
+        )
 
-        if attn_module._dct_comp_k_cache is None:
-            attn_module._dct_comp_k_cache = new_comp_k
-            attn_module._dct_comp_v_cache = new_comp_v
-        else:
-            attn_module._dct_comp_k_cache = torch.cat(
-                [attn_module._dct_comp_k_cache, new_comp_k], dim=2
+        if num_pages > capacity:
+            new_capacity = _next_page_capacity(num_pages, capacity)
+            new_k_cache = torch.empty(
+                bsz, num_kv_heads, new_capacity, comp_size, head_dim,
+                dtype=new_comp_k.dtype, device=new_comp_k.device,
             )
-            attn_module._dct_comp_v_cache = torch.cat(
-                [attn_module._dct_comp_v_cache, new_comp_v], dim=2
-            )
+            if n_cached > 0 and attn_module._dct_comp_k_cache is not None:
+                new_k_cache[:, :, :n_cached].copy_(attn_module._dct_comp_k_cache[:, :, :n_cached])
+            attn_module._dct_comp_k_cache = new_k_cache
+
+            if need_values:
+                new_v_cache = torch.empty_like(new_k_cache)
+                if n_cached > 0 and cached_v is not None:
+                    new_v_cache[:, :, :n_cached].copy_(cached_v[:, :, :n_cached])
+                attn_module._dct_comp_v_cache = new_v_cache
+            else:
+                attn_module._dct_comp_v_cache = None
+
+            attn_module._dct_comp_cache_capacity = new_capacity
+
+        attn_module._dct_comp_k_cache[:, :, n_cached:num_pages].copy_(new_comp_k)
+        if need_values and new_comp_v is not None:
+            attn_module._dct_comp_v_cache[:, :, n_cached:num_pages].copy_(new_comp_v)
 
         attn_module._dct_n_pages_cached = num_pages
 
-    return attn_module._dct_comp_k_cache, attn_module._dct_comp_v_cache
+    comp_k = attn_module._dct_comp_k_cache
+    comp_v = attn_module._dct_comp_v_cache if need_values else None
+    if comp_k is None:
+        return None, None
+    return comp_k[:, :, :num_pages], None if comp_v is None else comp_v[:, :, :num_pages]
 
 
 def _compress_pages(attn_module, paged_x, comp_size):
@@ -738,6 +802,7 @@ def _update_score_key_cache(attn_module, paged_k, num_pages, comp_size, cfg):
 
     cached_k = getattr(attn_module, '_dct_score_comp_k_cache', None)
     n_cached = getattr(attn_module, '_dct_score_n_pages_cached', 0)
+    capacity = getattr(attn_module, '_dct_score_cache_capacity', 0)
 
     if (
         cached_k is None
@@ -747,35 +812,41 @@ def _update_score_key_cache(attn_module, paged_k, num_pages, comp_size, cfg):
     ):
         attn_module._dct_score_comp_k_cache = None
         attn_module._dct_score_n_pages_cached = 0
+        attn_module._dct_score_cache_capacity = 0
         n_cached = 0
+        capacity = 0
 
     n_new = num_pages - n_cached
     if n_new > 0:
         new_k = paged_k[:, :, n_cached:num_pages]
         flat_k = new_k.reshape(bsz, num_kv_heads, n_new * page_size, head_dim)
         start_pos = cfg.sink_size + n_cached * page_size
-        positions = torch.arange(
-            start_pos,
-            start_pos + n_new * page_size,
-            device=new_k.device,
+        end_pos = start_pos + n_new * page_size
+        cos_table, sin_table = _get_or_build_original_position_rope_tables(
+            attn_module, end_pos, attn_module.config, new_k.device, new_k.dtype
         )
-        cos_pages, sin_pages = _compute_rope_cos_sin(
-            positions, attn_module.config, new_k.device, new_k.dtype
-        )
+        cos_pages = cos_table[start_pos:end_pos].unsqueeze(0).unsqueeze(0)
+        sin_pages = sin_table[start_pos:end_pos].unsqueeze(0).unsqueeze(0)
         flat_k_rope = _apply_rope(flat_k, cos_pages, sin_pages)
         new_k_rope = flat_k_rope.reshape(bsz, num_kv_heads, n_new, page_size, head_dim)
         new_comp_k = _compress_pages(attn_module, new_k_rope, comp_size)
 
-        if attn_module._dct_score_comp_k_cache is None:
-            attn_module._dct_score_comp_k_cache = new_comp_k
-        else:
-            attn_module._dct_score_comp_k_cache = torch.cat(
-                [attn_module._dct_score_comp_k_cache, new_comp_k], dim=2
+        if num_pages > capacity:
+            new_capacity = _next_page_capacity(num_pages, capacity)
+            new_cache = torch.empty(
+                bsz, num_kv_heads, new_capacity, comp_size, head_dim,
+                dtype=new_comp_k.dtype, device=new_comp_k.device,
             )
+            if n_cached > 0 and attn_module._dct_score_comp_k_cache is not None:
+                new_cache[:, :, :n_cached].copy_(attn_module._dct_score_comp_k_cache[:, :, :n_cached])
+            attn_module._dct_score_comp_k_cache = new_cache
+            attn_module._dct_score_cache_capacity = new_capacity
+
+        attn_module._dct_score_comp_k_cache[:, :, n_cached:num_pages].copy_(new_comp_k)
 
         attn_module._dct_score_n_pages_cached = num_pages
 
-    return attn_module._dct_score_comp_k_cache
+    return attn_module._dct_score_comp_k_cache[:, :, :num_pages]
 
 
 def _update_score_spectral_key_cache(attn_module, paged_k, num_pages, comp_size, cfg):
@@ -1001,14 +1072,12 @@ def _apply_original_position_rope_to_paged_k(paged_k, sink_size, model_config):
     """Apply original-position RoPE to full paged keys for debug/oracle scoring."""
     bsz, num_kv_heads, num_pages, page_size, head_dim = paged_k.shape
     flat_k = paged_k.reshape(bsz, num_kv_heads, num_pages * page_size, head_dim)
-    positions = torch.arange(
-        sink_size,
-        sink_size + num_pages * page_size,
-        device=paged_k.device,
-    )
+    positions = torch.arange(sink_size + num_pages * page_size, device=paged_k.device)
     cos_pages, sin_pages = _compute_rope_cos_sin(
         positions, model_config, paged_k.device, paged_k.dtype
     )
+    cos_pages = cos_pages[:, :, sink_size:]
+    sin_pages = sin_pages[:, :, sink_size:]
     flat_k_rope = _apply_rope(flat_k, cos_pages, sin_pages)
     return flat_k_rope.reshape(bsz, num_kv_heads, num_pages, page_size, head_dim)
 
@@ -1033,30 +1102,64 @@ def _compute_debug_oracle_page_scores(attn_module, query_states, paged_k, cfg, c
     )
 
 
-def _build_drop_mode_position_ids(selected_indices, cfg, num_pages, actual_recent):
+def _build_drop_mode_position_ids(selected_indices, cfg, num_pages, actual_recent, out=None):
     """Build original token positions for assembled drop-mode KV."""
     bsz, num_kv_heads, actual_top_k = selected_indices.shape
     device = selected_indices.device
+    total_len = cfg.sink_size + actual_top_k * cfg.page_size + actual_recent
+
+    if out is None or out.shape[2] < total_len:
+        position_ids = torch.empty(
+            bsz, num_kv_heads, total_len,
+            dtype=torch.long, device=device,
+        )
+    else:
+        position_ids = out[:, :, :total_len]
 
     sink_positions = torch.arange(cfg.sink_size, device=device, dtype=torch.long)
-    sink_positions = sink_positions.view(1, 1, -1).expand(bsz, num_kv_heads, -1)
+    position_ids[:, :, :cfg.sink_size] = sink_positions.view(1, 1, -1)
 
     page_offsets = torch.arange(cfg.page_size, device=device, dtype=torch.long)
     selected_positions = cfg.sink_size + selected_indices.to(torch.long).unsqueeze(-1) * cfg.page_size
     selected_positions = selected_positions + page_offsets.view(1, 1, 1, -1)
-    selected_positions = selected_positions.reshape(bsz, num_kv_heads, actual_top_k * cfg.page_size)
+    middle_start = cfg.sink_size
+    middle_end = middle_start + actual_top_k * cfg.page_size
+    position_ids[:, :, middle_start:middle_end] = selected_positions.reshape(
+        bsz, num_kv_heads, actual_top_k * cfg.page_size
+    )
 
     recent_start = cfg.sink_size + num_pages * cfg.page_size
     recent_positions = recent_start + torch.arange(actual_recent, device=device, dtype=torch.long)
-    recent_positions = recent_positions.view(1, 1, -1).expand(bsz, num_kv_heads, -1)
+    position_ids[:, :, middle_end:total_len] = recent_positions.view(1, 1, -1)
+    return position_ids
 
-    return torch.cat((sink_positions, selected_positions, recent_positions), dim=-1)
 
-
-def _apply_original_position_rope_to_final_k(final_k, selected_indices, num_pages, actual_recent, cfg, model_config):
+def _apply_original_position_rope_to_final_k(
+    attn_module,
+    final_k,
+    selected_indices,
+    num_pages,
+    actual_recent,
+    cfg,
+    model_config,
+):
     """Apply RoPE to assembled drop-mode KV using the tokens' original positions."""
-    position_ids = _build_drop_mode_position_ids(selected_indices, cfg, num_pages, actual_recent)
-    cos, sin = _compute_rope_cos_sin_for_position_ids(position_ids, model_config, final_k.device, final_k.dtype)
+    total_len = final_k.shape[2]
+    position_buf = getattr(attn_module, "_drop_position_ids_buf", None)
+    position_ids = _build_drop_mode_position_ids(
+        selected_indices, cfg, num_pages, actual_recent, out=position_buf
+    )
+    attn_module._drop_position_ids_buf = position_ids
+    attn_module._drop_position_ids_buf_len = total_len
+    cos_table, sin_table = _get_or_build_original_position_rope_tables(
+        attn_module,
+        num_pages * cfg.page_size + cfg.sink_size + actual_recent,
+        model_config,
+        final_k.device,
+        final_k.dtype,
+    )
+    cos = cos_table[position_ids]
+    sin = sin_table[position_ids]
     return _apply_rope(final_k, cos, sin)
 
 
@@ -1064,8 +1167,10 @@ _DCT_RUNTIME_STATE_ATTRS = (
     "_dct_comp_k_cache",
     "_dct_comp_v_cache",
     "_dct_n_pages_cached",
+    "_dct_comp_cache_capacity",
     "_dct_score_comp_k_cache",
     "_dct_score_n_pages_cached",
+    "_dct_score_cache_capacity",
     "_dct_score_spectral_k_cache",
     "_dct_score_spectral_n_pages_cached",
     "_dct_score_haar_k_cache",
@@ -1076,12 +1181,19 @@ _DCT_RUNTIME_STATE_ATTRS = (
     "_dct_score_hadamard_n_pages_cached",
     "_page_scores_buf",
     "_page_scores_np",
+    "_page_scores_capacity",
     "_topk_out_buf",
     "_assemble_stride_cache",
+    "_assemble_drop_stride_cache",
     "_final_k_buf",
     "_final_v_buf",
     "_sel_idx_buf",
     "_assemble_buf_len",
+    "_orig_pos_rope_cos_2d",
+    "_orig_pos_rope_sin_2d",
+    "_orig_pos_rope_cache_len",
+    "_drop_position_ids_buf",
+    "_drop_position_ids_buf_len",
 )
 
 
@@ -1196,6 +1308,7 @@ def dct_page_attention_forward(
     query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    query_states_rope = None
     
     # Step 2: RoPE + KV cache update
     cos, sin = position_embeddings
@@ -1223,12 +1336,13 @@ def dct_page_attention_forward(
     # No need to do dct paging since there isn't enough tokens.
     if kv_len < min_len_for_paging:
         if cfg.continuous_rope:
-            all_pos = torch.arange(kv_len, device=key_cached.device)
-            cos_all, sin_all = _compute_rope_cos_sin(
-                all_pos, self.config, key_cached.device, key_cached.dtype
+            if query_states_rope is None:
+                query_states_rope, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
+            cos_all, sin_all = _get_or_build_original_position_rope_tables(
+                self, kv_len, self.config, key_cached.device, key_cached.dtype
             )
-            attn_q, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
-            attn_k = _apply_rope(key_cached, cos_all, sin_all)
+            attn_q = query_states_rope
+            attn_k = _apply_rope(key_cached, cos_all.unsqueeze(0).unsqueeze(0), sin_all.unsqueeze(0).unsqueeze(0))
             attn_v = value_cached
         else:
             attn_q, attn_k, attn_v = query_states, key_states, value_states
@@ -1263,23 +1377,41 @@ def dct_page_attention_forward(
         key_states, value_states, cfg
     )
     
-    # Step 4: DCT compression (torch.cat - always contiguous, L2-warm)
-    comp_k, comp_v = _update_comp_cache(self, paged_k, paged_v, num_pages, comp_size)
+    # Step 4: Compressed cache maintenance. The current default path uses a
+    # separate score-time cache and drop-mode assembly, so comp_k/comp_v are
+    # only required for non-default compatibility paths.
+    need_comp_cache = not (cfg.continuous_rope and cfg.unselected_mode == "drop")
+    comp_k = comp_v = None
+    if need_comp_cache:
+        comp_k, comp_v = _update_comp_cache(
+            self,
+            paged_k,
+            paged_v,
+            num_pages,
+            comp_size,
+            need_values=(cfg.unselected_mode != "drop"),
+        )
 
     # Step 5: Score pages (Triton kernel 1 — returns page_scores only)
-    # Pre-allocate page_scores buffer (reallocate only when num_pages changes)
     _num_kv_heads = self.config.num_key_value_heads # 8 for Llama-3.1-8B
-    if getattr(self, '_page_scores_np', 0) != num_pages:
+    page_scores_buf = getattr(self, '_page_scores_buf', None)
+    if (
+        page_scores_buf is None
+        or page_scores_buf.shape[0] != bsz
+        or page_scores_buf.shape[1] != _num_kv_heads
+        or page_scores_buf.shape[2] != num_pages
+    ):
         self._page_scores_buf = torch.empty(
             bsz, _num_kv_heads, num_pages,
-            dtype=torch.float32, device=comp_k.device,
+            dtype=torch.float32, device=paged_k.device,
         )
-        self._page_scores_np = num_pages
 
     score_query_states = query_states
     score_comp_k = comp_k
     if cfg.continuous_rope:
-        score_query_states, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
+        if query_states_rope is None:
+            query_states_rope, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
+        score_query_states = query_states_rope
         if cfg.score_use_direct_spectral_proxy:
             score_comp_k = _update_score_spectral_key_cache(
                 self, paged_k, num_pages, comp_size, cfg
@@ -1314,8 +1446,16 @@ def dct_page_attention_forward(
     actual_top_k = min(cfg.top_k, num_pages)
     
     # Pre-allocate selected_indices buffer (constant shape across all decode steps)
-    if not hasattr(self, '_topk_out_buf'):
-        self._topk_out_buf = torch.empty(bsz, _num_kv_heads, actual_top_k, dtype=torch.int32, device=comp_k.device)
+    topk_buf = getattr(self, '_topk_out_buf', None)
+    if (
+        topk_buf is None
+        or topk_buf.shape[0] != bsz
+        or topk_buf.shape[1] != _num_kv_heads
+        or topk_buf.shape[2] != actual_top_k
+    ):
+        self._topk_out_buf = torch.empty(
+            bsz, _num_kv_heads, actual_top_k, dtype=torch.int32, device=paged_k.device
+        )
 
     selected_indices = topk_sort_triton(selection_page_scores, actual_top_k, out=self._topk_out_buf)
 
@@ -1359,9 +1499,13 @@ def dct_page_attention_forward(
     if assembled_len > _buf_len:
         _max_len = assembled_len + cfg.page_size
         _nkv = _num_kv_heads
-        self._final_k_buf = torch.empty(bsz, _nkv, _max_len, self.head_dim, dtype=comp_k.dtype, device=comp_k.device)
+        self._final_k_buf = torch.empty(
+            bsz, _nkv, _max_len, self.head_dim, dtype=paged_k.dtype, device=paged_k.device
+        )
         self._final_v_buf = torch.empty_like(self._final_k_buf)
-        self._sel_idx_buf = torch.empty(bsz, _nkv, actual_top_k, dtype=torch.int32, device=comp_k.device)
+        self._sel_idx_buf = torch.empty(
+            bsz, _nkv, actual_top_k, dtype=torch.int32, device=paged_k.device
+        )
         self._assemble_buf_len = _max_len
 
     # Step 6b: Assemble KV for attention.
@@ -1370,7 +1514,7 @@ def dct_page_attention_forward(
             paged_k, paged_v,
             sink_k, sink_v, recent_k, recent_v,
             selected_indices,
-            cos_table, sin_table,
+            None, None,
             out_k=self._final_k_buf,
             out_v=self._final_v_buf,
             out_sel_idx=self._sel_idx_buf,
@@ -1399,8 +1543,11 @@ def dct_page_attention_forward(
         )
 
     if cfg.continuous_rope:
-        query_states, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
+        if query_states_rope is None:
+            query_states_rope, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
+        query_states = query_states_rope
         final_k = _apply_original_position_rope_to_final_k(
+            self,
             final_k,
             selected_indices,
             num_pages,

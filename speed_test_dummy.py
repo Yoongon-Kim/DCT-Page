@@ -578,7 +578,12 @@ def main():
     results = {}
 
     def run_mode(label, patch=False):
-        run_name = args.run_name or make_run_name(label, args)
+        if args.run_name is not None:
+            run_name = args.run_name
+            if args.mode == "both":
+                run_name = f"{run_name}_{label}"
+        else:
+            run_name = make_run_name(label, args)
         run_dir = Path(args.output_dir) / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
 
