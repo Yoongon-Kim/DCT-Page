@@ -128,8 +128,14 @@ class PreAllocatedLayer(DynamicLayer):
         # Return view of valid portion (zero-copy)
         return self.keys[:, :, :end, :], self.values[:, :, :end, :]
 
-    def get_seq_length(self):
+    def get_seq_length(self, cache_position=None):
         return self._seen
+
+
+def _get_attention_interface(attn_module):
+    if attn_module.config._attn_implementation == "eager":
+        return eager_attention_forward
+    return ALL_ATTENTION_FUNCTIONS[attn_module.config._attn_implementation]
 
 
 def pre_allocate_cache(cache, extra_tokens=256):
@@ -167,7 +173,7 @@ def profiled_dct_page_attention_forward(
     hidden_states,
     position_embeddings,
     attention_mask=None,
-    past_key_values=None,
+    past_key_value=None,
     cache_position=None,
     **kwargs,
 ):
@@ -178,12 +184,13 @@ def profiled_dct_page_attention_forward(
     """
     global _current_layer
 
-    from dct_page_attention import _dct_page_cfg as cfg
+    from dct_page_attention import _dct_page_cfg as cfg, _maybe_reset_dct_runtime_state
     from typing import Callable
 
     input_shape = hidden_states.shape[:-1]  # (bsz, q_len)
     hidden_shape = (*input_shape, -1, self.head_dim)  # (bsz, q_len, num_heads, head_dim)
     bsz, q_len = input_shape
+    _maybe_reset_dct_runtime_state(self, past_key_value)
 
     if q_len > 1:
         # Prefill path — always use standard attention (no profiling)
@@ -194,27 +201,37 @@ def profiled_dct_page_attention_forward(
         cos, sin = position_embeddings
         if cfg.continuous_rope:
             query_rope, key_rope = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-            if past_key_values is not None:
+            if past_key_value is not None:
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                key_cached, value_cached = past_key_values.update(
+                key_cached, value_cached = past_key_value.update(
                     key_states, value_states, self.layer_idx, cache_kwargs
                 )
             else:
                 key_cached, value_cached = key_states, value_states
-            attn_q, attn_k, attn_v = query_rope, key_rope, value_states
+            attn_q = query_rope
+            if past_key_value is not None:
+                all_pos = torch.arange(key_cached.shape[2], device=key_cached.device)
+                cos_all, sin_all = _compute_rope_cos_sin(
+                    all_pos, self.config, key_cached.device, key_cached.dtype
+                )
+                attn_k = _apply_rope(key_cached, cos_all, sin_all)
+                attn_v = value_cached
+            else:
+                attn_k, attn_v = key_rope, value_states
         else:
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-            if past_key_values is not None:
+            if past_key_value is not None:
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                key_states, value_states = past_key_values.update(
+                key_states, value_states = past_key_value.update(
                     key_states, value_states, self.layer_idx, cache_kwargs
                 )
             attn_q, attn_k, attn_v = query_states, key_states, value_states
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get("sdpa", eager_attention_forward)
+        attention_interface = _get_attention_interface(self)
         attn_output, attn_weights = attention_interface(
             self, attn_q, attn_k, attn_v, attention_mask,
-            dropout=0.0, scaling=self.scaling,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
             sliding_window=getattr(self, "sliding_window", None), **kwargs,
         )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -251,9 +268,9 @@ def profiled_dct_page_attention_forward(
     # Step 2: RoPE + KV cache update
     cos, sin = position_embeddings
     if cfg.continuous_rope:
-        if past_key_values is not None:
+        if past_key_value is not None:
             # cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_cached, value_cached = past_key_values.update(
+            key_cached, value_cached = past_key_value.update(
                 key_states, value_states, self.layer_idx, # cache_kwargs # commented out because we will compute rope table later.
             )
         else:
@@ -261,9 +278,9 @@ def profiled_dct_page_attention_forward(
         kv_len = key_cached.shape[2]
     else:
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        if past_key_values is not None:
+        if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(
+            key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
         kv_len = key_states.shape[2]
@@ -286,10 +303,11 @@ def profiled_dct_page_attention_forward(
         else:
             attn_q, attn_k, attn_v = query_states, key_states, value_states
 
-        attention_interface = ALL_ATTENTION_FUNCTIONS.get("sdpa", eager_attention_forward)
+        attention_interface = _get_attention_interface(self)
         attn_output, attn_weights = attention_interface(
             self, attn_q, attn_k, attn_v, attention_mask,
-            dropout=0.0, scaling=self.scaling,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
             sliding_window=getattr(self, "sliding_window", None), **kwargs,
         )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -489,7 +507,7 @@ def profiled_baseline_forward(
     hidden_states,
     position_embeddings,
     attention_mask=None,
-    past_key_values=None,
+    past_key_value=None,
     cache_position=None,
     **kwargs,
 ):
@@ -513,16 +531,17 @@ def profiled_baseline_forward(
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_values is not None:
+        if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(
+            key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get("sdpa", eager_attention_forward)
+        attention_interface = _get_attention_interface(self)
         attn_output, attn_weights = attention_interface(
             self, query_states, key_states, value_states, attention_mask,
-            dropout=0.0, scaling=self.scaling,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
             sliding_window=getattr(self, "sliding_window", None), **kwargs,
         )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -545,9 +564,9 @@ def profiled_baseline_forward(
     # Step 2: RoPE + KV cache update
     cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-    if past_key_values is not None:
+    if past_key_value is not None:
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        key_states, value_states = past_key_values.update(
+        key_states, value_states = past_key_value.update(
             key_states, value_states, self.layer_idx, cache_kwargs
         )
 

@@ -235,10 +235,96 @@ def dct_compress_page(x, compressed_len):
     return compressed.reshape(bsz, compressed_len, num_heads, head_dim).transpose(1, 2)
 
 
+def dct_project_page(x, compressed_len):
+    """
+    Project a KV tensor to leading DCT coefficients along the sequence dimension.
+
+    Args:
+        x: [bsz, num_heads, seq_len, head_dim], seq_len: sequence length per page
+        compressed_len: number of low-frequency coefficients to keep
+
+    Returns:
+        [bsz, num_heads, min(compressed_len, seq_len), head_dim]
+    """
+    bsz, num_heads, seq_len, head_dim = x.shape
+    keep_len = min(compressed_len, seq_len)
+
+    x_merged = x.transpose(1, 2).reshape(bsz, seq_len, num_heads * head_dim)
+    x_dct = dct(x_merged.transpose(1, 2), norm='ortho')
+    x_dct = x_dct[:, :, :keep_len].transpose(1, 2)
+    spectral = x_dct.to(x.dtype)
+    return spectral.reshape(bsz, keep_len, num_heads, head_dim).transpose(1, 2)
+
+
+def _normalize_frequency_indices(indices, seq_len, comp_size):
+    """Deduplicate/clamp indices while preserving order and filling missing slots."""
+    seen = set()
+    normalized = []
+    for idx in indices:
+        idx = max(0, min(int(idx), seq_len - 1))
+        if idx in seen:
+            continue
+        normalized.append(idx)
+        seen.add(idx)
+        if len(normalized) == comp_size:
+            return normalized
+
+    for idx in range(seq_len):
+        if idx in seen:
+            continue
+        normalized.append(idx)
+        if len(normalized) == comp_size:
+            break
+    return normalized
+
+
+def _resolve_frequency_keep_indices(seq_len, comp_size, layout):
+    """Choose which DCT frequencies to retain for proxy construction."""
+    if comp_size >= seq_len or layout == "low":
+        return list(range(min(comp_size, seq_len)))
+
+    if layout == "low_high":
+        low_count = (comp_size + 1) // 2
+        high_count = comp_size - low_count
+        indices = list(range(low_count)) + list(range(seq_len - high_count, seq_len))
+        return _normalize_frequency_indices(indices, seq_len, comp_size)
+
+    if layout == "low_mid_high":
+        low_count = min(2, comp_size)
+        remaining = comp_size - low_count
+        indices = list(range(low_count))
+        if remaining > 0:
+            tail = np.linspace(seq_len // 2, seq_len - 1, num=remaining, dtype=int).tolist()
+            indices.extend(tail)
+        return _normalize_frequency_indices(indices, seq_len, comp_size)
+
+    if layout == "spread":
+        indices = np.linspace(0, seq_len - 1, num=comp_size, dtype=int).tolist()
+        return _normalize_frequency_indices(indices, seq_len, comp_size)
+
+    raise ValueError(f"Unsupported proxy_frequency_layout: {layout}")
+
+
+def dct_compress_page_with_indices(x, freq_indices):
+    """Compress a page by selecting specific DCT frequencies before IDCT."""
+    comp_size = len(freq_indices)
+    if comp_size >= x.shape[2] and list(freq_indices) == list(range(x.shape[2])):
+        return x
+
+    bsz, num_heads, seq_len, head_dim = x.shape
+    x_merged = x.transpose(1, 2).reshape(bsz, seq_len, num_heads * head_dim)
+    x_dct = dct(x_merged.transpose(1, 2), norm='ortho')
+    index_tensor = torch.tensor(freq_indices, device=x.device, dtype=torch.long)
+    x_dct = x_dct.index_select(2, index_tensor)
+    x_idct = idct(x_dct, norm='ortho').transpose(1, 2) * math.sqrt(comp_size / seq_len)
+    compressed = x_idct.to(x.dtype)
+    return compressed.reshape(bsz, comp_size, num_heads, head_dim).transpose(1, 2)
+
+
 # ---------------------------------------------------------------------------
 # DCT Projection Matrix (replaces FFT with a single matmul)
 # ---------------------------------------------------------------------------
-def _build_dct_projection_matrix(page_size, comp_size, device, dtype):
+def _build_dct_projection_matrix(page_size, comp_size, device, dtype, layout):
     """Precompute the [comp_size, page_size] projection matrix.
 
     The full DCT compression pipeline (DCT → truncate → IDCT → energy
@@ -247,16 +333,193 @@ def _build_dct_projection_matrix(page_size, comp_size, device, dtype):
     """
     I = torch.eye(page_size, device=device, dtype=torch.float32)
     I = I.unsqueeze(0).unsqueeze(0)  # [1, 1, page_size, page_size]
-    M = dct_compress_page(I, comp_size)  # [1, 1, comp_size, page_size]
+    freq_indices = _resolve_frequency_keep_indices(page_size, comp_size, layout)
+    M = dct_compress_page_with_indices(I, freq_indices)  # [1, 1, comp_size, page_size]
     return M.squeeze(0).squeeze(0).to(dtype)  # [comp_size, page_size]
+
+
+def _build_dct_spectral_projection_matrix(page_size, comp_size, device, dtype, layout):
+    """Precompute the [comp_size, page_size] DCT basis for direct spectral proxies."""
+    I = torch.eye(page_size, device=device, dtype=torch.float32)
+    I = I.unsqueeze(0).unsqueeze(0)  # [1, 1, page_size, page_size]
+    freq_indices = _resolve_frequency_keep_indices(page_size, comp_size, layout)
+    M = dct_project_page(I, page_size)
+    index_tensor = torch.tensor(freq_indices, device=device, dtype=torch.long)
+    M = M.index_select(2, index_tensor)  # [1, 1, comp_size, page_size]
+    return M.squeeze(0).squeeze(0).to(dtype)  # [comp_size, page_size]
+
+
+def _build_haar_lowpass_projection_matrix(page_size, comp_size, device, dtype):
+    """Precompute a coarse Haar-style lowpass projection matrix.
+
+    Each proxy is the mean over an evenly partitioned contiguous block. For
+    `page_size=128, comp_size=4`, this yields four 32-token lowpass proxies.
+    """
+    M = torch.zeros(comp_size, page_size, device=device, dtype=torch.float32)
+    for idx in range(comp_size):
+        start = (idx * page_size) // comp_size
+        end = ((idx + 1) * page_size) // comp_size
+        if end <= start:
+            end = min(page_size, start + 1)
+        M[idx, start:end] = 1.0 / float(end - start)
+    return M.to(dtype)
+
+
+def _build_haar_mixed_supports(page_size, comp_size):
+    """Return support intervals for global-plus-detail Haar proxies."""
+    supports = [(0, page_size)]
+    if comp_size <= 1:
+        return supports
+
+    intervals = [(0, page_size)]
+    queue_idx = 0
+    while len(supports) < comp_size and queue_idx < len(intervals):
+        start, end = intervals[queue_idx]
+        queue_idx += 1
+        if end - start < 2:
+            continue
+
+        mid = (start + end) // 2
+        if mid <= start or mid >= end:
+            continue
+
+        supports.append((start, end))
+        intervals.append((start, mid))
+        intervals.append((mid, end))
+
+    fill_idx = 0
+    while len(supports) < comp_size:
+        start = (fill_idx * page_size) // comp_size
+        end = max(((fill_idx + 1) * page_size) // comp_size, start + 1)
+        supports.append((start, min(page_size, end)))
+        fill_idx += 1
+
+    return supports
+
+
+def _build_haar_mixed_projection_matrix(page_size, comp_size, device, dtype):
+    """Precompute global-mean plus coarse-detail Haar proxies.
+
+    Row 0 is a full-page mean. Remaining rows follow a breadth-first Haar
+    detail decomposition, using half-differences over each interval.
+    """
+    supports = _build_haar_mixed_supports(page_size, comp_size)
+    M = torch.zeros(comp_size, page_size, device=device, dtype=torch.float32)
+
+    for idx, (start, end) in enumerate(supports):
+        if idx == 0:
+            M[idx, start:end] = 1.0 / float(max(end - start, 1))
+            continue
+
+        mid = (start + end) // 2
+        if mid <= start or mid >= end:
+            M[idx, start:end] = 1.0 / float(max(end - start, 1))
+            continue
+
+        left_len = mid - start
+        right_len = end - mid
+        # Keep the proxy scale comparable to block means.
+        M[idx, start:mid] = 0.5 / float(left_len)
+        M[idx, mid:end] = -0.5 / float(right_len)
+
+    return M.to(dtype)
+
+
+def _is_power_of_two(value):
+    return value > 0 and (value & (value - 1)) == 0
+
+
+def _build_walsh_hadamard_matrix(size, device, dtype):
+    """Build an orthonormal Walsh-Hadamard matrix in sequency order."""
+    if not _is_power_of_two(size):
+        raise ValueError(f"Hadamard proxy requires power-of-two size, got {size}")
+
+    H = torch.tensor([[1.0]], device=device, dtype=torch.float32)
+    while H.shape[0] < size:
+        H = torch.cat(
+            [
+                torch.cat([H, H], dim=1),
+                torch.cat([H, -H], dim=1),
+            ],
+            dim=0,
+        )
+    H = H / math.sqrt(size)
+    sign_changes = (H[:, 1:] * H[:, :-1] < 0).sum(dim=1)
+    perm = torch.argsort(sign_changes, stable=True)
+    return H.index_select(0, perm).to(dtype)
+
+
+def _build_hadamard_projection_matrix(page_size, comp_size, device, dtype):
+    """Precompute the [comp_size, page_size] Walsh-Hadamard projection matrix."""
+    if not _is_power_of_two(page_size) or not _is_power_of_two(comp_size):
+        raise ValueError(
+            f"Hadamard proxy requires power-of-two page_size/comp_size, got "
+            f"{page_size}/{comp_size}"
+        )
+    H_page = _build_walsh_hadamard_matrix(page_size, device, torch.float32)
+    H_comp = _build_walsh_hadamard_matrix(comp_size, device, torch.float32)
+    M = math.sqrt(comp_size / page_size) * torch.matmul(H_comp.transpose(0, 1), H_page[:comp_size, :])
+    return M.to(dtype)
 
 
 def _get_or_build_projection_matrix(attn_module, page_size, comp_size, device, dtype):
     """Return cached projection matrix, building it on first call."""
     M = getattr(attn_module, '_dct_proj_matrix', None)
-    if M is None or M.shape != (comp_size, page_size) or M.device != device:
-        M = _build_dct_projection_matrix(page_size, comp_size, device, dtype)
+    layout = _dct_page_cfg.proxy_frequency_layout
+    cached_layout = getattr(attn_module, '_dct_proj_matrix_layout', None)
+    if (
+        M is None
+        or M.shape != (comp_size, page_size)
+        or M.device != device
+        or cached_layout != layout
+    ):
+        M = _build_dct_projection_matrix(page_size, comp_size, device, dtype, layout)
         attn_module._dct_proj_matrix = M
+        attn_module._dct_proj_matrix_layout = layout
+    return M
+
+
+def _get_or_build_spectral_projection_matrix(attn_module, page_size, comp_size, device, dtype):
+    """Return cached DCT basis matrix for direct spectral score proxies."""
+    M = getattr(attn_module, '_dct_spectral_proj_matrix', None)
+    layout = _dct_page_cfg.proxy_frequency_layout
+    cached_layout = getattr(attn_module, '_dct_spectral_proj_matrix_layout', None)
+    if (
+        M is None
+        or M.shape != (comp_size, page_size)
+        or M.device != device
+        or cached_layout != layout
+    ):
+        M = _build_dct_spectral_projection_matrix(page_size, comp_size, device, dtype, layout)
+        attn_module._dct_spectral_proj_matrix = M
+        attn_module._dct_spectral_proj_matrix_layout = layout
+    return M
+
+
+def _get_or_build_haar_projection_matrix(attn_module, page_size, comp_size, device, dtype):
+    """Return cached Haar lowpass projection matrix."""
+    M = getattr(attn_module, '_dct_haar_proj_matrix', None)
+    if M is None or M.shape != (comp_size, page_size) or M.device != device:
+        M = _build_haar_lowpass_projection_matrix(page_size, comp_size, device, dtype)
+        attn_module._dct_haar_proj_matrix = M
+    return M
+
+
+def _get_or_build_haar_mixed_projection_matrix(attn_module, page_size, comp_size, device, dtype):
+    """Return cached mixed Haar projection matrix."""
+    M = getattr(attn_module, '_dct_haar_mixed_proj_matrix', None)
+    if M is None or M.shape != (comp_size, page_size) or M.device != device:
+        M = _build_haar_mixed_projection_matrix(page_size, comp_size, device, dtype)
+        attn_module._dct_haar_mixed_proj_matrix = M
+    return M
+
+
+def _get_or_build_hadamard_projection_matrix(attn_module, page_size, comp_size, device, dtype):
+    """Return cached Hadamard projection matrix."""
+    M = getattr(attn_module, '_dct_hadamard_proj_matrix', None)
+    if M is None or M.shape != (comp_size, page_size) or M.device != device:
+        M = _build_hadamard_projection_matrix(page_size, comp_size, device, dtype)
+        attn_module._dct_hadamard_proj_matrix = M
     return M
 
 
@@ -433,6 +696,42 @@ def _compress_pages(attn_module, paged_x, comp_size):
     return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
 
 
+def _project_pages_to_spectral(attn_module, paged_x, comp_size):
+    """Project pages to their leading DCT coefficients without IDCT reconstruction."""
+    page_size = paged_x.shape[3]
+    M = _get_or_build_spectral_projection_matrix(
+        attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
+    )
+    return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
+
+
+def _project_pages_to_haar_lowpass(attn_module, paged_x, comp_size):
+    """Project pages to coarse Haar lowpass block means."""
+    page_size = paged_x.shape[3]
+    M = _get_or_build_haar_projection_matrix(
+        attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
+    )
+    return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
+
+
+def _project_pages_to_haar_mixed(attn_module, paged_x, comp_size):
+    """Project pages to mixed global/detail Haar proxies."""
+    page_size = paged_x.shape[3]
+    M = _get_or_build_haar_mixed_projection_matrix(
+        attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
+    )
+    return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
+
+
+def _project_pages_to_hadamard(attn_module, paged_x, comp_size):
+    """Project pages to Walsh-Hadamard compressed proxies."""
+    page_size = paged_x.shape[3]
+    M = _get_or_build_hadamard_projection_matrix(
+        attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
+    )
+    return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
+
+
 def _update_score_key_cache(attn_module, paged_k, num_pages, comp_size, cfg):
     """Maintain a separate score-time key cache in original-position RoPE space."""
     bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
@@ -479,6 +778,385 @@ def _update_score_key_cache(attn_module, paged_k, num_pages, comp_size, cfg):
     return attn_module._dct_score_comp_k_cache
 
 
+def _update_score_spectral_key_cache(attn_module, paged_k, num_pages, comp_size, cfg):
+    """Maintain a score-time cache of direct spectral proxies in original-position RoPE space."""
+    bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
+
+    cached_k = getattr(attn_module, '_dct_score_spectral_k_cache', None)
+    n_cached = getattr(attn_module, '_dct_score_spectral_n_pages_cached', 0)
+
+    if (
+        cached_k is None
+        or num_pages < n_cached
+        or cached_k.shape[0] != bsz
+        or cached_k.shape[3] != comp_size
+    ):
+        attn_module._dct_score_spectral_k_cache = None
+        attn_module._dct_score_spectral_n_pages_cached = 0
+        n_cached = 0
+
+    n_new = num_pages - n_cached
+    if n_new > 0:
+        new_k = paged_k[:, :, n_cached:num_pages]
+        flat_k = new_k.reshape(bsz, num_kv_heads, n_new * page_size, head_dim)
+        start_pos = cfg.sink_size + n_cached * page_size
+        positions = torch.arange(
+            start_pos,
+            start_pos + n_new * page_size,
+            device=new_k.device,
+        )
+        cos_pages, sin_pages = _compute_rope_cos_sin(
+            positions, attn_module.config, new_k.device, new_k.dtype
+        )
+        flat_k_rope = _apply_rope(flat_k, cos_pages, sin_pages)
+        new_k_rope = flat_k_rope.reshape(bsz, num_kv_heads, n_new, page_size, head_dim)
+        new_spec_k = _project_pages_to_spectral(attn_module, new_k_rope, comp_size)
+
+        if attn_module._dct_score_spectral_k_cache is None:
+            attn_module._dct_score_spectral_k_cache = new_spec_k
+        else:
+            attn_module._dct_score_spectral_k_cache = torch.cat(
+                [attn_module._dct_score_spectral_k_cache, new_spec_k], dim=2
+            )
+
+        attn_module._dct_score_spectral_n_pages_cached = num_pages
+
+    return attn_module._dct_score_spectral_k_cache
+
+
+def _haar_proxy_block_center_positions(start_page_idx, n_pages, page_size, comp_size, sink_size, device):
+    """Anchor each Haar lowpass proxy to the center of its source block."""
+    page_ids = torch.arange(start_page_idx, start_page_idx + n_pages, device=device, dtype=torch.long)
+    page_bases = sink_size + page_ids[:, None] * page_size
+    starts = torch.tensor(
+        [(idx * page_size) // comp_size for idx in range(comp_size)],
+        device=device,
+        dtype=torch.long,
+    )
+    ends = torch.tensor(
+        [max(((idx + 1) * page_size) // comp_size, (idx * page_size) // comp_size + 1) for idx in range(comp_size)],
+        device=device,
+        dtype=torch.long,
+    )
+    proxy_offsets = ((starts + ends - 1) // 2).clamp_max(page_size - 1)
+    return page_bases + proxy_offsets[None, :]
+
+
+def _haar_mixed_proxy_anchor_positions(start_page_idx, n_pages, page_size, comp_size, sink_size, device):
+    """Anchor each mixed Haar proxy to the center of its support interval."""
+    page_ids = torch.arange(start_page_idx, start_page_idx + n_pages, device=device, dtype=torch.long)
+    page_bases = sink_size + page_ids[:, None] * page_size
+    supports = _build_haar_mixed_supports(page_size, comp_size)
+    proxy_offsets = torch.tensor(
+        [min(page_size - 1, (start + end - 1) // 2) for start, end in supports],
+        device=device,
+        dtype=torch.long,
+    )
+    return page_bases + proxy_offsets[None, :]
+
+
+def _update_score_haar_key_cache(attn_module, paged_k, num_pages, comp_size, cfg):
+    """Maintain a separate score-time cache of Haar lowpass proxies."""
+    bsz, num_kv_heads, _, _, head_dim = paged_k.shape
+
+    cached_k = getattr(attn_module, '_dct_score_haar_k_cache', None)
+    n_cached = getattr(attn_module, '_dct_score_haar_n_pages_cached', 0)
+
+    if (
+        cached_k is None
+        or num_pages < n_cached
+        or cached_k.shape[0] != bsz
+        or cached_k.shape[3] != comp_size
+    ):
+        attn_module._dct_score_haar_k_cache = None
+        attn_module._dct_score_haar_n_pages_cached = 0
+        n_cached = 0
+
+    n_new = num_pages - n_cached
+    if n_new > 0:
+        new_k = paged_k[:, :, n_cached:num_pages]
+        new_proxy_k = _project_pages_to_haar_lowpass(attn_module, new_k, comp_size)
+        positions = _haar_proxy_block_center_positions(
+            n_cached,
+            n_new,
+            cfg.page_size,
+            comp_size,
+            cfg.sink_size,
+            new_proxy_k.device,
+        ).reshape(-1)
+        cos_proxy, sin_proxy = _compute_rope_cos_sin(
+            positions, attn_module.config, new_proxy_k.device, new_proxy_k.dtype
+        )
+        flat_proxy_k = new_proxy_k.reshape(bsz, num_kv_heads, n_new * comp_size, head_dim)
+        flat_proxy_k = _apply_rope(flat_proxy_k, cos_proxy, sin_proxy)
+        new_score_proxy_k = flat_proxy_k.reshape(bsz, num_kv_heads, n_new, comp_size, head_dim)
+
+        if attn_module._dct_score_haar_k_cache is None:
+            attn_module._dct_score_haar_k_cache = new_score_proxy_k
+        else:
+            attn_module._dct_score_haar_k_cache = torch.cat(
+                [attn_module._dct_score_haar_k_cache, new_score_proxy_k], dim=2
+            )
+
+        attn_module._dct_score_haar_n_pages_cached = num_pages
+
+    return attn_module._dct_score_haar_k_cache
+
+
+def _update_score_haar_mixed_key_cache(attn_module, paged_k, num_pages, comp_size, cfg):
+    """Maintain a separate score-time cache of mixed Haar proxies."""
+    bsz, num_kv_heads, _, _, head_dim = paged_k.shape
+
+    cached_k = getattr(attn_module, '_dct_score_haar_mixed_k_cache', None)
+    n_cached = getattr(attn_module, '_dct_score_haar_mixed_n_pages_cached', 0)
+
+    if (
+        cached_k is None
+        or num_pages < n_cached
+        or cached_k.shape[0] != bsz
+        or cached_k.shape[3] != comp_size
+    ):
+        attn_module._dct_score_haar_mixed_k_cache = None
+        attn_module._dct_score_haar_mixed_n_pages_cached = 0
+        n_cached = 0
+
+    n_new = num_pages - n_cached
+    if n_new > 0:
+        new_k = paged_k[:, :, n_cached:num_pages]
+        new_proxy_k = _project_pages_to_haar_mixed(attn_module, new_k, comp_size)
+        positions = _haar_mixed_proxy_anchor_positions(
+            n_cached,
+            n_new,
+            cfg.page_size,
+            comp_size,
+            cfg.sink_size,
+            new_proxy_k.device,
+        ).reshape(-1)
+        cos_proxy, sin_proxy = _compute_rope_cos_sin(
+            positions, attn_module.config, new_proxy_k.device, new_proxy_k.dtype
+        )
+        flat_proxy_k = new_proxy_k.reshape(bsz, num_kv_heads, n_new * comp_size, head_dim)
+        flat_proxy_k = _apply_rope(flat_proxy_k, cos_proxy, sin_proxy)
+        new_score_proxy_k = flat_proxy_k.reshape(bsz, num_kv_heads, n_new, comp_size, head_dim)
+
+        if attn_module._dct_score_haar_mixed_k_cache is None:
+            attn_module._dct_score_haar_mixed_k_cache = new_score_proxy_k
+        else:
+            attn_module._dct_score_haar_mixed_k_cache = torch.cat(
+                [attn_module._dct_score_haar_mixed_k_cache, new_score_proxy_k], dim=2
+            )
+
+        attn_module._dct_score_haar_mixed_n_pages_cached = num_pages
+
+    return attn_module._dct_score_haar_mixed_k_cache
+
+
+def _update_score_hadamard_key_cache(attn_module, paged_k, num_pages, comp_size, cfg):
+    """Maintain a score-time cache of Hadamard proxies in original-position RoPE space."""
+    bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
+
+    cached_k = getattr(attn_module, '_dct_score_hadamard_k_cache', None)
+    n_cached = getattr(attn_module, '_dct_score_hadamard_n_pages_cached', 0)
+
+    if (
+        cached_k is None
+        or num_pages < n_cached
+        or cached_k.shape[0] != bsz
+        or cached_k.shape[3] != comp_size
+    ):
+        attn_module._dct_score_hadamard_k_cache = None
+        attn_module._dct_score_hadamard_n_pages_cached = 0
+        n_cached = 0
+
+    n_new = num_pages - n_cached
+    if n_new > 0:
+        new_k = paged_k[:, :, n_cached:num_pages]
+        flat_k = new_k.reshape(bsz, num_kv_heads, n_new * page_size, head_dim)
+        start_pos = cfg.sink_size + n_cached * page_size
+        positions = torch.arange(
+            start_pos,
+            start_pos + n_new * page_size,
+            device=new_k.device,
+        )
+        cos_pages, sin_pages = _compute_rope_cos_sin(
+            positions, attn_module.config, new_k.device, new_k.dtype
+        )
+        flat_k_rope = _apply_rope(flat_k, cos_pages, sin_pages)
+        new_k_rope = flat_k_rope.reshape(bsz, num_kv_heads, n_new, page_size, head_dim)
+        new_proxy_k = _project_pages_to_hadamard(attn_module, new_k_rope, comp_size)
+
+        if attn_module._dct_score_hadamard_k_cache is None:
+            attn_module._dct_score_hadamard_k_cache = new_proxy_k
+        else:
+            attn_module._dct_score_hadamard_k_cache = torch.cat(
+                [attn_module._dct_score_hadamard_k_cache, new_proxy_k], dim=2
+            )
+
+        attn_module._dct_score_hadamard_n_pages_cached = num_pages
+
+    return attn_module._dct_score_hadamard_k_cache
+
+
+def _apply_original_position_rope_to_paged_k(paged_k, sink_size, model_config):
+    """Apply original-position RoPE to full paged keys for debug/oracle scoring."""
+    bsz, num_kv_heads, num_pages, page_size, head_dim = paged_k.shape
+    flat_k = paged_k.reshape(bsz, num_kv_heads, num_pages * page_size, head_dim)
+    positions = torch.arange(
+        sink_size,
+        sink_size + num_pages * page_size,
+        device=paged_k.device,
+    )
+    cos_pages, sin_pages = _compute_rope_cos_sin(
+        positions, model_config, paged_k.device, paged_k.dtype
+    )
+    flat_k_rope = _apply_rope(flat_k, cos_pages, sin_pages)
+    return flat_k_rope.reshape(bsz, num_kv_heads, num_pages, page_size, head_dim)
+
+
+def _compute_debug_oracle_page_scores(attn_module, query_states, paged_k, cfg, cos, sin):
+    """Compute full-page oracle scores for debug comparisons against proxies."""
+    oracle_query_states = query_states
+    oracle_paged_k = paged_k
+    if cfg.continuous_rope:
+        oracle_query_states, _ = apply_rotary_pos_emb(
+            query_states, query_states, cos, sin
+        )
+        oracle_paged_k = _apply_original_position_rope_to_paged_k(
+            paged_k, cfg.sink_size, attn_module.config
+        )
+    return score_pages_triton(
+        oracle_query_states,
+        oracle_paged_k,
+        cfg.scoring_method,
+        cfg.group_agg_method,
+        attn_module.num_key_value_groups,
+    )
+
+
+def _proxy_block_center_positions(start_page_idx, n_pages, page_size, comp_size, sink_size, device):
+    """Anchor each compressed proxy to the center of its source block range."""
+    page_ids = torch.arange(start_page_idx, start_page_idx + n_pages, device=device, dtype=torch.long)
+    page_bases = sink_size + page_ids[:, None] * page_size
+    proxy_ids = torch.arange(comp_size, device=device, dtype=torch.long)
+    proxy_offsets = ((2 * proxy_ids + 1) * page_size) // (2 * comp_size)
+    proxy_offsets = proxy_offsets.clamp_max(page_size - 1)
+    return page_bases + proxy_offsets[None, :]
+
+
+def _shared_block_anchor_positions(start_page_idx, n_pages, page_size, comp_size, sink_size, device, anchor_mode):
+    """Assign every proxy in a page the same shared anchor position."""
+    page_ids = torch.arange(start_page_idx, start_page_idx + n_pages, device=device, dtype=torch.long)
+    page_bases = sink_size + page_ids * page_size
+    if anchor_mode == "center":
+        anchor_offset = page_size // 2
+    elif anchor_mode == "start":
+        anchor_offset = 0
+    else:
+        raise ValueError(f"Unsupported proxy block anchor mode: {anchor_mode}")
+    anchors = page_bases + anchor_offset
+    return anchors[:, None].expand(n_pages, comp_size)
+
+
+def _update_score_proxy_key_cache(attn_module, comp_k, num_pages, comp_size, cfg):
+    """Apply block-aware proxy-position RoPE to already-compressed page proxies."""
+    bsz, num_kv_heads, _, _, head_dim = comp_k.shape
+
+    cached_k = getattr(attn_module, '_dct_score_proxy_comp_k_cache', None)
+    n_cached = getattr(attn_module, '_dct_score_proxy_n_pages_cached', 0)
+
+    if (
+        cached_k is None
+        or num_pages < n_cached
+        or cached_k.shape[0] != bsz
+        or cached_k.shape[3] != comp_size
+    ):
+        attn_module._dct_score_proxy_comp_k_cache = None
+        attn_module._dct_score_proxy_n_pages_cached = 0
+        n_cached = 0
+
+    n_new = num_pages - n_cached
+    if n_new > 0:
+        new_comp_k = comp_k[:, :, n_cached:num_pages]
+        positions = _proxy_block_center_positions(
+            n_cached,
+            n_new,
+            cfg.page_size,
+            comp_size,
+            cfg.sink_size,
+            new_comp_k.device,
+        ).reshape(-1)
+        cos_proxy, sin_proxy = _compute_rope_cos_sin(
+            positions, attn_module.config, new_comp_k.device, new_comp_k.dtype
+        )
+        flat_comp_k = new_comp_k.reshape(bsz, num_kv_heads, n_new * comp_size, head_dim)
+        flat_comp_k = _apply_rope(flat_comp_k, cos_proxy, sin_proxy)
+        new_score_comp_k = flat_comp_k.reshape(bsz, num_kv_heads, n_new, comp_size, head_dim)
+
+        if attn_module._dct_score_proxy_comp_k_cache is None:
+            attn_module._dct_score_proxy_comp_k_cache = new_score_comp_k
+        else:
+            attn_module._dct_score_proxy_comp_k_cache = torch.cat(
+                [attn_module._dct_score_proxy_comp_k_cache, new_score_comp_k], dim=2
+            )
+
+        attn_module._dct_score_proxy_n_pages_cached = num_pages
+
+    return attn_module._dct_score_proxy_comp_k_cache
+
+
+def _update_score_proxy_shared_anchor_key_cache(attn_module, comp_k, num_pages, comp_size, cfg, anchor_mode):
+    """Apply a shared block anchor position to all proxies inside each page."""
+    bsz, num_kv_heads, _, _, head_dim = comp_k.shape
+
+    cache_attr = f"_dct_score_proxy_shared_{anchor_mode}_comp_k_cache"
+    n_cache_attr = f"_dct_score_proxy_shared_{anchor_mode}_n_pages_cached"
+    cached_k = getattr(attn_module, cache_attr, None)
+    n_cached = getattr(attn_module, n_cache_attr, 0)
+
+    if (
+        cached_k is None
+        or num_pages < n_cached
+        or cached_k.shape[0] != bsz
+        or cached_k.shape[3] != comp_size
+    ):
+        setattr(attn_module, cache_attr, None)
+        setattr(attn_module, n_cache_attr, 0)
+        n_cached = 0
+
+    n_new = num_pages - n_cached
+    if n_new > 0:
+        new_comp_k = comp_k[:, :, n_cached:num_pages]
+        positions = _shared_block_anchor_positions(
+            n_cached,
+            n_new,
+            cfg.page_size,
+            comp_size,
+            cfg.sink_size,
+            new_comp_k.device,
+            anchor_mode,
+        ).reshape(-1)
+        cos_proxy, sin_proxy = _compute_rope_cos_sin(
+            positions, attn_module.config, new_comp_k.device, new_comp_k.dtype
+        )
+        flat_comp_k = new_comp_k.reshape(bsz, num_kv_heads, n_new * comp_size, head_dim)
+        flat_comp_k = _apply_rope(flat_comp_k, cos_proxy, sin_proxy)
+        new_score_comp_k = flat_comp_k.reshape(bsz, num_kv_heads, n_new, comp_size, head_dim)
+
+        cached_k = getattr(attn_module, cache_attr, None)
+        if cached_k is None:
+            setattr(attn_module, cache_attr, new_score_comp_k)
+        else:
+            setattr(
+                attn_module,
+                cache_attr,
+                torch.cat([cached_k, new_score_comp_k], dim=2),
+            )
+
+        setattr(attn_module, n_cache_attr, num_pages)
+
+    return getattr(attn_module, cache_attr)
+
+
 def _build_drop_mode_position_ids(selected_indices, cfg, num_pages, actual_recent):
     """Build original token positions for assembled drop-mode KV."""
     bsz, num_kv_heads, actual_top_k = selected_indices.shape
@@ -506,6 +1184,49 @@ def _apply_original_position_rope_to_final_k(final_k, selected_indices, num_page
     return _apply_rope(final_k, cos, sin)
 
 
+_DCT_RUNTIME_STATE_ATTRS = (
+    "_dct_comp_k_cache",
+    "_dct_comp_v_cache",
+    "_dct_n_pages_cached",
+    "_dct_score_comp_k_cache",
+    "_dct_score_n_pages_cached",
+    "_dct_score_spectral_k_cache",
+    "_dct_score_spectral_n_pages_cached",
+    "_dct_score_haar_k_cache",
+    "_dct_score_haar_n_pages_cached",
+    "_dct_score_haar_mixed_k_cache",
+    "_dct_score_haar_mixed_n_pages_cached",
+    "_dct_score_hadamard_k_cache",
+    "_dct_score_hadamard_n_pages_cached",
+    "_dct_score_proxy_comp_k_cache",
+    "_dct_score_proxy_n_pages_cached",
+    "_dct_score_proxy_shared_center_comp_k_cache",
+    "_dct_score_proxy_shared_center_n_pages_cached",
+    "_dct_score_proxy_shared_start_comp_k_cache",
+    "_dct_score_proxy_shared_start_n_pages_cached",
+    "_page_scores_buf",
+    "_page_scores_np",
+    "_topk_out_buf",
+    "_assemble_stride_cache",
+    "_final_k_buf",
+    "_final_v_buf",
+    "_sel_idx_buf",
+    "_assemble_buf_len",
+)
+
+
+def _maybe_reset_dct_runtime_state(attn_module, past_key_value):
+    """Clear per-generation runtime caches when the HF cache object changes."""
+    cached_ref = getattr(attn_module, "_dct_runtime_cache_ref", None)
+    if cached_ref is past_key_value:
+        return
+
+    for attr in _DCT_RUNTIME_STATE_ATTRS:
+        if hasattr(attn_module, attr):
+            delattr(attn_module, attr)
+    attn_module._dct_runtime_cache_ref = past_key_value
+
+
 # ---------------------------------------------------------------------------
 # Main attention forward
 # ---------------------------------------------------------------------------
@@ -525,9 +1246,27 @@ def dct_page_attention_forward(
     - Decode (q_len == 1, long KV cache): DCT page attention.
     """
     cfg = _dct_page_cfg
+    num_score_proxy_modes = sum(
+        int(flag)
+        for flag in (
+            cfg.score_with_original_rope,
+            cfg.score_use_direct_spectral_proxy,
+            cfg.score_use_haar_proxy,
+            cfg.score_use_haar_mixed_proxy,
+            cfg.score_use_hadamard_proxy,
+            cfg.score_proxy_with_block_position_rope,
+            cfg.score_proxy_with_shared_block_center_rope,
+            cfg.score_proxy_with_shared_block_start_rope,
+        )
+    )
+    if num_score_proxy_modes > 1:
+        raise ValueError(
+            "Only one score-time proxy rope mode may be enabled at once."
+        )
     input_shape = hidden_states.shape[:-1] # (bsz, q_len)
     hidden_shape = (*input_shape, -1, self.head_dim) # (bsz, q_len, num_heads, head_dim)
     bsz, q_len = input_shape     
+    _maybe_reset_dct_runtime_state(self, past_key_value)
 
     if q_len>1:
         # Step 1: Q/K/V projection
@@ -673,14 +1412,48 @@ def dct_page_attention_forward(
 
     score_query_states = query_states
     score_comp_k = comp_k
-    if cfg.continuous_rope and cfg.score_with_original_rope:
+    if cfg.continuous_rope and num_score_proxy_modes:
         score_query_states, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
-        score_comp_k = _update_score_key_cache(self, paged_k, num_pages, comp_size, cfg)
+        if cfg.score_use_direct_spectral_proxy:
+            score_comp_k = _update_score_spectral_key_cache(
+                self, paged_k, num_pages, comp_size, cfg
+            )
+        elif cfg.score_use_haar_proxy:
+            score_comp_k = _update_score_haar_key_cache(
+                self, paged_k, num_pages, comp_size, cfg
+            )
+        elif cfg.score_use_haar_mixed_proxy:
+            score_comp_k = _update_score_haar_mixed_key_cache(
+                self, paged_k, num_pages, comp_size, cfg
+            )
+        elif cfg.score_use_hadamard_proxy:
+            score_comp_k = _update_score_hadamard_key_cache(
+                self, paged_k, num_pages, comp_size, cfg
+            )
+        elif cfg.score_with_original_rope:
+            score_comp_k = _update_score_key_cache(self, paged_k, num_pages, comp_size, cfg)
+        elif cfg.score_proxy_with_shared_block_center_rope:
+            score_comp_k = _update_score_proxy_shared_anchor_key_cache(
+                self, comp_k, num_pages, comp_size, cfg, anchor_mode="center"
+            )
+        elif cfg.score_proxy_with_shared_block_start_rope:
+            score_comp_k = _update_score_proxy_shared_anchor_key_cache(
+                self, comp_k, num_pages, comp_size, cfg, anchor_mode="start"
+            )
+        else:
+            score_comp_k = _update_score_proxy_key_cache(self, comp_k, num_pages, comp_size, cfg)
 
     page_scores = score_pages_triton(
         score_query_states, score_comp_k, cfg.scoring_method, cfg.group_agg_method, self.num_key_value_groups,
         out=self._page_scores_buf,
     )
+    debug_hook = _dct_page_debug_hook
+    oracle_page_scores = None
+    if debug_hook is not None or cfg.select_with_oracle_page_scores:
+        oracle_page_scores = _compute_debug_oracle_page_scores(
+            self, query_states, paged_k, cfg, cos, sin
+        )
+    selection_page_scores = oracle_page_scores if cfg.select_with_oracle_page_scores else page_scores
     
     actual_top_k = min(cfg.top_k, num_pages)
     
@@ -688,9 +1461,8 @@ def dct_page_attention_forward(
     if not hasattr(self, '_topk_out_buf'):
         self._topk_out_buf = torch.empty(bsz, _num_kv_heads, actual_top_k, dtype=torch.int32, device=comp_k.device)
 
-    selected_indices = topk_sort_triton(page_scores, actual_top_k, out=self._topk_out_buf)
+    selected_indices = topk_sort_triton(selection_page_scores, actual_top_k, out=self._topk_out_buf)
 
-    debug_hook = _dct_page_debug_hook
     if debug_hook is not None:
         debug_hook(
             {
@@ -701,11 +1473,21 @@ def dct_page_attention_forward(
                 "page_size": int(cfg.page_size),
                 "sink_size": int(cfg.sink_size),
                 "recent_size": int(cfg.recent_size),
+                "proxy_frequency_layout": str(cfg.proxy_frequency_layout),
                 "score_with_original_rope": bool(cfg.score_with_original_rope),
+                "score_use_direct_spectral_proxy": bool(cfg.score_use_direct_spectral_proxy),
+                "score_use_haar_proxy": bool(cfg.score_use_haar_proxy),
+                "score_use_haar_mixed_proxy": bool(cfg.score_use_haar_mixed_proxy),
+                "score_use_hadamard_proxy": bool(cfg.score_use_hadamard_proxy),
+                "score_proxy_with_block_position_rope": bool(cfg.score_proxy_with_block_position_rope),
+                "score_proxy_with_shared_block_center_rope": bool(cfg.score_proxy_with_shared_block_center_rope),
+                "score_proxy_with_shared_block_start_rope": bool(cfg.score_proxy_with_shared_block_start_rope),
                 "cache_position": None
                 if cache_position is None
                 else cache_position.detach().cpu(),
                 "page_scores": page_scores.detach().float().cpu(),
+                "oracle_page_scores": oracle_page_scores.detach().float().cpu(),
+                "selection_used_oracle_page_scores": bool(cfg.select_with_oracle_page_scores),
                 "selected_indices": selected_indices.detach().cpu(),
             }
         )
@@ -798,11 +1580,20 @@ def replace_qwen2_attn(
     sink_size=4,
     recent_size=128,
     compress_ratio=0.25,
+    proxy_frequency_layout="low",
     scoring_method="max",
     group_agg_method="mean",
     unselected_mode="drop",
     continuous_rope=True,
     score_with_original_rope=False,
+    score_use_direct_spectral_proxy=False,
+    score_use_haar_proxy=False,
+    score_use_haar_mixed_proxy=False,
+    score_use_hadamard_proxy=False,
+    score_proxy_with_block_position_rope=False,
+    score_proxy_with_shared_block_center_rope=False,
+    score_proxy_with_shared_block_start_rope=False,
+    select_with_oracle_page_scores=False,
     use_triton=True,
 ):
     """
@@ -817,11 +1608,20 @@ def replace_qwen2_attn(
         sink_size=sink_size,
         recent_size=recent_size,
         compress_ratio=compress_ratio,
+        proxy_frequency_layout=proxy_frequency_layout,
         scoring_method=scoring_method,
         group_agg_method=group_agg_method,
         unselected_mode=unselected_mode,
         continuous_rope=continuous_rope,
         score_with_original_rope=score_with_original_rope,
+        score_use_direct_spectral_proxy=score_use_direct_spectral_proxy,
+        score_use_haar_proxy=score_use_haar_proxy,
+        score_use_haar_mixed_proxy=score_use_haar_mixed_proxy,
+        score_use_hadamard_proxy=score_use_hadamard_proxy,
+        score_proxy_with_block_position_rope=score_proxy_with_block_position_rope,
+        score_proxy_with_shared_block_center_rope=score_proxy_with_shared_block_center_rope,
+        score_proxy_with_shared_block_start_rope=score_proxy_with_shared_block_start_rope,
+        select_with_oracle_page_scores=select_with_oracle_page_scores,
         use_triton=use_triton,
     )
 
@@ -830,11 +1630,20 @@ def replace_qwen2_attn(
     print(f"  page_size={page_size}, top_k={top_k}")
     print(f"  sink_size={sink_size}, recent_size={recent_size}")
     print(f"  compress_ratio={compress_ratio} ({page_size} -> {comp_size} tokens)")
+    print(f"  proxy_frequency_layout={proxy_frequency_layout}")
     print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}")
     print(f"  unselected_mode={unselected_mode}")
     print(
         f"  continuous_rope={continuous_rope}, "
         f"score_with_original_rope={score_with_original_rope}, "
+        f"score_use_direct_spectral_proxy={score_use_direct_spectral_proxy}, "
+        f"score_use_haar_proxy={score_use_haar_proxy}, "
+        f"score_use_haar_mixed_proxy={score_use_haar_mixed_proxy}, "
+        f"score_use_hadamard_proxy={score_use_hadamard_proxy}, "
+        f"score_proxy_with_block_position_rope={score_proxy_with_block_position_rope}, "
+        f"score_proxy_with_shared_block_center_rope={score_proxy_with_shared_block_center_rope}, "
+        f"score_proxy_with_shared_block_start_rope={score_proxy_with_shared_block_start_rope}, "
+        f"select_with_oracle_page_scores={select_with_oracle_page_scores}, "
         f"use_triton={use_triton}"
     )
     print(f"  Page attention active during decode only (prefill uses full attention)")
@@ -848,11 +1657,20 @@ def replace_llama_attn(
     sink_size=4,
     recent_size=128,
     compress_ratio=0.25,
+    proxy_frequency_layout="low",
     scoring_method="max",
     group_agg_method="mean",
     unselected_mode="drop",
     continuous_rope=True,
     score_with_original_rope=False,
+    score_use_direct_spectral_proxy=False,
+    score_use_haar_proxy=False,
+    score_use_haar_mixed_proxy=False,
+    score_use_hadamard_proxy=False,
+    score_proxy_with_block_position_rope=False,
+    score_proxy_with_shared_block_center_rope=False,
+    score_proxy_with_shared_block_start_rope=False,
+    select_with_oracle_page_scores=False,
     use_triton=True,
 ):
     """
@@ -869,11 +1687,20 @@ def replace_llama_attn(
         sink_size=sink_size,
         recent_size=recent_size,
         compress_ratio=compress_ratio,
+        proxy_frequency_layout=proxy_frequency_layout,
         scoring_method=scoring_method,
         group_agg_method=group_agg_method,
         unselected_mode=unselected_mode,
         continuous_rope=continuous_rope,
         score_with_original_rope=score_with_original_rope,
+        score_use_direct_spectral_proxy=score_use_direct_spectral_proxy,
+        score_use_haar_proxy=score_use_haar_proxy,
+        score_use_haar_mixed_proxy=score_use_haar_mixed_proxy,
+        score_use_hadamard_proxy=score_use_hadamard_proxy,
+        score_proxy_with_block_position_rope=score_proxy_with_block_position_rope,
+        score_proxy_with_shared_block_center_rope=score_proxy_with_shared_block_center_rope,
+        score_proxy_with_shared_block_start_rope=score_proxy_with_shared_block_start_rope,
+        select_with_oracle_page_scores=select_with_oracle_page_scores,
         use_triton=use_triton,
     )
 
@@ -882,11 +1709,20 @@ def replace_llama_attn(
     print(f"  page_size={page_size}, top_k={top_k}")
     print(f"  sink_size={sink_size}, recent_size={recent_size}")
     print(f"  compress_ratio={compress_ratio} ({page_size} -> {comp_size} tokens)")
+    print(f"  proxy_frequency_layout={proxy_frequency_layout}")
     print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}")
     print(f"  unselected_mode={unselected_mode}")
     print(
         f"  continuous_rope={continuous_rope}, "
         f"score_with_original_rope={score_with_original_rope}, "
+        f"score_use_direct_spectral_proxy={score_use_direct_spectral_proxy}, "
+        f"score_use_haar_proxy={score_use_haar_proxy}, "
+        f"score_use_haar_mixed_proxy={score_use_haar_mixed_proxy}, "
+        f"score_use_hadamard_proxy={score_use_hadamard_proxy}, "
+        f"score_proxy_with_block_position_rope={score_proxy_with_block_position_rope}, "
+        f"score_proxy_with_shared_block_center_rope={score_proxy_with_shared_block_center_rope}, "
+        f"score_proxy_with_shared_block_start_rope={score_proxy_with_shared_block_start_rope}, "
+        f"select_with_oracle_page_scores={select_with_oracle_page_scores}, "
         f"use_triton={use_triton}"
     )
     print(f"  Page attention active during decode only (prefill uses full attention)")

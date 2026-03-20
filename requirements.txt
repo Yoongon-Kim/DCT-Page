@@ -1,5 +1,5 @@
 torch>=2.0.0
-transformers>=4.45.0
+transformers>=4.54.0,<4.55
 datasets>=2.14.0
 numpy
 tqdm
