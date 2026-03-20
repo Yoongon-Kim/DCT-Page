@@ -90,14 +90,10 @@ def parse_args() -> argparse.Namespace:
         default="drop",
         choices=["drop", "compressed"],
     )
-    parser.add_argument("--dct_score_with_original_rope", action="store_true")
     parser.add_argument("--dct_score_use_direct_spectral_proxy", action="store_true")
     parser.add_argument("--dct_score_use_haar_proxy", action="store_true")
     parser.add_argument("--dct_score_use_haar_mixed_proxy", action="store_true")
     parser.add_argument("--dct_score_use_hadamard_proxy", action="store_true")
-    parser.add_argument("--dct_score_proxy_with_block_position_rope", action="store_true")
-    parser.add_argument("--dct_score_proxy_with_shared_block_center_rope", action="store_true")
-    parser.add_argument("--dct_score_proxy_with_shared_block_start_rope", action="store_true")
     parser.add_argument("--dct_select_with_oracle_page_scores", action="store_true")
     parser.add_argument("--dct_no_continuous_rope", action="store_true")
     parser.add_argument("--dct_no_triton", action="store_true")
@@ -228,14 +224,10 @@ def apply_dct_patch(args: argparse.Namespace) -> None:
         group_agg_method=args.dct_group_agg_method,
         unselected_mode=args.dct_unselected_mode,
         continuous_rope=not args.dct_no_continuous_rope,
-        score_with_original_rope=args.dct_score_with_original_rope,
         score_use_direct_spectral_proxy=args.dct_score_use_direct_spectral_proxy,
         score_use_haar_proxy=args.dct_score_use_haar_proxy,
         score_use_haar_mixed_proxy=args.dct_score_use_haar_mixed_proxy,
         score_use_hadamard_proxy=args.dct_score_use_hadamard_proxy,
-        score_proxy_with_block_position_rope=args.dct_score_proxy_with_block_position_rope,
-        score_proxy_with_shared_block_center_rope=args.dct_score_proxy_with_shared_block_center_rope,
-        score_proxy_with_shared_block_start_rope=args.dct_score_proxy_with_shared_block_start_rope,
         select_with_oracle_page_scores=args.dct_select_with_oracle_page_scores,
         use_triton=not args.dct_no_triton,
     )
@@ -412,14 +404,10 @@ def main() -> None:
                 "group_agg_method": args.dct_group_agg_method,
                 "unselected_mode": args.dct_unselected_mode,
                 "continuous_rope": not args.dct_no_continuous_rope,
-                "score_with_original_rope": args.dct_score_with_original_rope,
                 "score_use_direct_spectral_proxy": args.dct_score_use_direct_spectral_proxy,
                 "score_use_haar_proxy": args.dct_score_use_haar_proxy,
                 "score_use_haar_mixed_proxy": args.dct_score_use_haar_mixed_proxy,
                 "score_use_hadamard_proxy": args.dct_score_use_hadamard_proxy,
-                "score_proxy_with_block_position_rope": args.dct_score_proxy_with_block_position_rope,
-                "score_proxy_with_shared_block_center_rope": args.dct_score_proxy_with_shared_block_center_rope,
-                "score_proxy_with_shared_block_start_rope": args.dct_score_proxy_with_shared_block_start_rope,
                 "select_with_oracle_page_scores": args.dct_select_with_oracle_page_scores,
                 "use_triton": not args.dct_no_triton,
             },

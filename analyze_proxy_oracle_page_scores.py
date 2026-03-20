@@ -124,20 +124,10 @@ def parse_args() -> argparse.Namespace:
         default="drop",
         choices=["drop", "compressed"],
     )
-    parser.add_argument("--dct_score_with_original_rope", action="store_true")
     parser.add_argument("--dct_score_use_direct_spectral_proxy", action="store_true")
     parser.add_argument("--dct_score_use_haar_proxy", action="store_true")
     parser.add_argument("--dct_score_use_haar_mixed_proxy", action="store_true")
     parser.add_argument("--dct_score_use_hadamard_proxy", action="store_true")
-    parser.add_argument(
-        "--dct_score_proxy_with_block_position_rope", action="store_true"
-    )
-    parser.add_argument(
-        "--dct_score_proxy_with_shared_block_center_rope", action="store_true"
-    )
-    parser.add_argument(
-        "--dct_score_proxy_with_shared_block_start_rope", action="store_true"
-    )
     parser.add_argument("--dct_no_continuous_rope", action="store_true")
     parser.add_argument("--dct_no_triton", action="store_true")
     return parser.parse_args()
@@ -458,14 +448,10 @@ def main() -> None:
             "dct_top_k": args.dct_top_k,
             "dct_compress_ratio": args.dct_compress_ratio,
             "dct_proxy_frequency_layout": args.dct_proxy_frequency_layout,
-            "dct_score_with_original_rope": args.dct_score_with_original_rope,
             "dct_score_use_direct_spectral_proxy": args.dct_score_use_direct_spectral_proxy,
             "dct_score_use_haar_proxy": args.dct_score_use_haar_proxy,
             "dct_score_use_haar_mixed_proxy": args.dct_score_use_haar_mixed_proxy,
             "dct_score_use_hadamard_proxy": args.dct_score_use_hadamard_proxy,
-            "dct_score_proxy_with_block_position_rope": args.dct_score_proxy_with_block_position_rope,
-            "dct_score_proxy_with_shared_block_center_rope": args.dct_score_proxy_with_shared_block_center_rope,
-            "dct_score_proxy_with_shared_block_start_rope": args.dct_score_proxy_with_shared_block_start_rope,
             "first_step_last_layer": {
                 "proxy": build_summary_block(proxy_last_layer, num_heads),
                 "oracle": build_summary_block(oracle_last_layer, num_heads),

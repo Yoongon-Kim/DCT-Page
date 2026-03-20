@@ -1033,130 +1033,6 @@ def _compute_debug_oracle_page_scores(attn_module, query_states, paged_k, cfg, c
     )
 
 
-def _proxy_block_center_positions(start_page_idx, n_pages, page_size, comp_size, sink_size, device):
-    """Anchor each compressed proxy to the center of its source block range."""
-    page_ids = torch.arange(start_page_idx, start_page_idx + n_pages, device=device, dtype=torch.long)
-    page_bases = sink_size + page_ids[:, None] * page_size
-    proxy_ids = torch.arange(comp_size, device=device, dtype=torch.long)
-    proxy_offsets = ((2 * proxy_ids + 1) * page_size) // (2 * comp_size)
-    proxy_offsets = proxy_offsets.clamp_max(page_size - 1)
-    return page_bases + proxy_offsets[None, :]
-
-
-def _shared_block_anchor_positions(start_page_idx, n_pages, page_size, comp_size, sink_size, device, anchor_mode):
-    """Assign every proxy in a page the same shared anchor position."""
-    page_ids = torch.arange(start_page_idx, start_page_idx + n_pages, device=device, dtype=torch.long)
-    page_bases = sink_size + page_ids * page_size
-    if anchor_mode == "center":
-        anchor_offset = page_size // 2
-    elif anchor_mode == "start":
-        anchor_offset = 0
-    else:
-        raise ValueError(f"Unsupported proxy block anchor mode: {anchor_mode}")
-    anchors = page_bases + anchor_offset
-    return anchors[:, None].expand(n_pages, comp_size)
-
-
-def _update_score_proxy_key_cache(attn_module, comp_k, num_pages, comp_size, cfg):
-    """Apply block-aware proxy-position RoPE to already-compressed page proxies."""
-    bsz, num_kv_heads, _, _, head_dim = comp_k.shape
-
-    cached_k = getattr(attn_module, '_dct_score_proxy_comp_k_cache', None)
-    n_cached = getattr(attn_module, '_dct_score_proxy_n_pages_cached', 0)
-
-    if (
-        cached_k is None
-        or num_pages < n_cached
-        or cached_k.shape[0] != bsz
-        or cached_k.shape[3] != comp_size
-    ):
-        attn_module._dct_score_proxy_comp_k_cache = None
-        attn_module._dct_score_proxy_n_pages_cached = 0
-        n_cached = 0
-
-    n_new = num_pages - n_cached
-    if n_new > 0:
-        new_comp_k = comp_k[:, :, n_cached:num_pages]
-        positions = _proxy_block_center_positions(
-            n_cached,
-            n_new,
-            cfg.page_size,
-            comp_size,
-            cfg.sink_size,
-            new_comp_k.device,
-        ).reshape(-1)
-        cos_proxy, sin_proxy = _compute_rope_cos_sin(
-            positions, attn_module.config, new_comp_k.device, new_comp_k.dtype
-        )
-        flat_comp_k = new_comp_k.reshape(bsz, num_kv_heads, n_new * comp_size, head_dim)
-        flat_comp_k = _apply_rope(flat_comp_k, cos_proxy, sin_proxy)
-        new_score_comp_k = flat_comp_k.reshape(bsz, num_kv_heads, n_new, comp_size, head_dim)
-
-        if attn_module._dct_score_proxy_comp_k_cache is None:
-            attn_module._dct_score_proxy_comp_k_cache = new_score_comp_k
-        else:
-            attn_module._dct_score_proxy_comp_k_cache = torch.cat(
-                [attn_module._dct_score_proxy_comp_k_cache, new_score_comp_k], dim=2
-            )
-
-        attn_module._dct_score_proxy_n_pages_cached = num_pages
-
-    return attn_module._dct_score_proxy_comp_k_cache
-
-
-def _update_score_proxy_shared_anchor_key_cache(attn_module, comp_k, num_pages, comp_size, cfg, anchor_mode):
-    """Apply a shared block anchor position to all proxies inside each page."""
-    bsz, num_kv_heads, _, _, head_dim = comp_k.shape
-
-    cache_attr = f"_dct_score_proxy_shared_{anchor_mode}_comp_k_cache"
-    n_cache_attr = f"_dct_score_proxy_shared_{anchor_mode}_n_pages_cached"
-    cached_k = getattr(attn_module, cache_attr, None)
-    n_cached = getattr(attn_module, n_cache_attr, 0)
-
-    if (
-        cached_k is None
-        or num_pages < n_cached
-        or cached_k.shape[0] != bsz
-        or cached_k.shape[3] != comp_size
-    ):
-        setattr(attn_module, cache_attr, None)
-        setattr(attn_module, n_cache_attr, 0)
-        n_cached = 0
-
-    n_new = num_pages - n_cached
-    if n_new > 0:
-        new_comp_k = comp_k[:, :, n_cached:num_pages]
-        positions = _shared_block_anchor_positions(
-            n_cached,
-            n_new,
-            cfg.page_size,
-            comp_size,
-            cfg.sink_size,
-            new_comp_k.device,
-            anchor_mode,
-        ).reshape(-1)
-        cos_proxy, sin_proxy = _compute_rope_cos_sin(
-            positions, attn_module.config, new_comp_k.device, new_comp_k.dtype
-        )
-        flat_comp_k = new_comp_k.reshape(bsz, num_kv_heads, n_new * comp_size, head_dim)
-        flat_comp_k = _apply_rope(flat_comp_k, cos_proxy, sin_proxy)
-        new_score_comp_k = flat_comp_k.reshape(bsz, num_kv_heads, n_new, comp_size, head_dim)
-
-        cached_k = getattr(attn_module, cache_attr, None)
-        if cached_k is None:
-            setattr(attn_module, cache_attr, new_score_comp_k)
-        else:
-            setattr(
-                attn_module,
-                cache_attr,
-                torch.cat([cached_k, new_score_comp_k], dim=2),
-            )
-
-        setattr(attn_module, n_cache_attr, num_pages)
-
-    return getattr(attn_module, cache_attr)
-
-
 def _build_drop_mode_position_ids(selected_indices, cfg, num_pages, actual_recent):
     """Build original token positions for assembled drop-mode KV."""
     bsz, num_kv_heads, actual_top_k = selected_indices.shape
@@ -1198,12 +1074,6 @@ _DCT_RUNTIME_STATE_ATTRS = (
     "_dct_score_haar_mixed_n_pages_cached",
     "_dct_score_hadamard_k_cache",
     "_dct_score_hadamard_n_pages_cached",
-    "_dct_score_proxy_comp_k_cache",
-    "_dct_score_proxy_n_pages_cached",
-    "_dct_score_proxy_shared_center_comp_k_cache",
-    "_dct_score_proxy_shared_center_n_pages_cached",
-    "_dct_score_proxy_shared_start_comp_k_cache",
-    "_dct_score_proxy_shared_start_n_pages_cached",
     "_page_scores_buf",
     "_page_scores_np",
     "_topk_out_buf",
@@ -1249,14 +1119,10 @@ def dct_page_attention_forward(
     num_score_proxy_modes = sum(
         int(flag)
         for flag in (
-            cfg.score_with_original_rope,
             cfg.score_use_direct_spectral_proxy,
             cfg.score_use_haar_proxy,
             cfg.score_use_haar_mixed_proxy,
             cfg.score_use_hadamard_proxy,
-            cfg.score_proxy_with_block_position_rope,
-            cfg.score_proxy_with_shared_block_center_rope,
-            cfg.score_proxy_with_shared_block_start_rope,
         )
     )
     if num_score_proxy_modes > 1:
@@ -1412,7 +1278,7 @@ def dct_page_attention_forward(
 
     score_query_states = query_states
     score_comp_k = comp_k
-    if cfg.continuous_rope and num_score_proxy_modes:
+    if cfg.continuous_rope:
         score_query_states, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
         if cfg.score_use_direct_spectral_proxy:
             score_comp_k = _update_score_spectral_key_cache(
@@ -1430,18 +1296,8 @@ def dct_page_attention_forward(
             score_comp_k = _update_score_hadamard_key_cache(
                 self, paged_k, num_pages, comp_size, cfg
             )
-        elif cfg.score_with_original_rope:
-            score_comp_k = _update_score_key_cache(self, paged_k, num_pages, comp_size, cfg)
-        elif cfg.score_proxy_with_shared_block_center_rope:
-            score_comp_k = _update_score_proxy_shared_anchor_key_cache(
-                self, comp_k, num_pages, comp_size, cfg, anchor_mode="center"
-            )
-        elif cfg.score_proxy_with_shared_block_start_rope:
-            score_comp_k = _update_score_proxy_shared_anchor_key_cache(
-                self, comp_k, num_pages, comp_size, cfg, anchor_mode="start"
-            )
         else:
-            score_comp_k = _update_score_proxy_key_cache(self, comp_k, num_pages, comp_size, cfg)
+            score_comp_k = _update_score_key_cache(self, paged_k, num_pages, comp_size, cfg)
 
     page_scores = score_pages_triton(
         score_query_states, score_comp_k, cfg.scoring_method, cfg.group_agg_method, self.num_key_value_groups,
@@ -1474,14 +1330,10 @@ def dct_page_attention_forward(
                 "sink_size": int(cfg.sink_size),
                 "recent_size": int(cfg.recent_size),
                 "proxy_frequency_layout": str(cfg.proxy_frequency_layout),
-                "score_with_original_rope": bool(cfg.score_with_original_rope),
                 "score_use_direct_spectral_proxy": bool(cfg.score_use_direct_spectral_proxy),
                 "score_use_haar_proxy": bool(cfg.score_use_haar_proxy),
                 "score_use_haar_mixed_proxy": bool(cfg.score_use_haar_mixed_proxy),
                 "score_use_hadamard_proxy": bool(cfg.score_use_hadamard_proxy),
-                "score_proxy_with_block_position_rope": bool(cfg.score_proxy_with_block_position_rope),
-                "score_proxy_with_shared_block_center_rope": bool(cfg.score_proxy_with_shared_block_center_rope),
-                "score_proxy_with_shared_block_start_rope": bool(cfg.score_proxy_with_shared_block_start_rope),
                 "cache_position": None
                 if cache_position is None
                 else cache_position.detach().cpu(),
@@ -1585,14 +1437,10 @@ def replace_qwen2_attn(
     group_agg_method="mean",
     unselected_mode="drop",
     continuous_rope=True,
-    score_with_original_rope=False,
     score_use_direct_spectral_proxy=False,
     score_use_haar_proxy=False,
     score_use_haar_mixed_proxy=False,
     score_use_hadamard_proxy=False,
-    score_proxy_with_block_position_rope=False,
-    score_proxy_with_shared_block_center_rope=False,
-    score_proxy_with_shared_block_start_rope=False,
     select_with_oracle_page_scores=False,
     use_triton=True,
 ):
@@ -1613,14 +1461,10 @@ def replace_qwen2_attn(
         group_agg_method=group_agg_method,
         unselected_mode=unselected_mode,
         continuous_rope=continuous_rope,
-        score_with_original_rope=score_with_original_rope,
         score_use_direct_spectral_proxy=score_use_direct_spectral_proxy,
         score_use_haar_proxy=score_use_haar_proxy,
         score_use_haar_mixed_proxy=score_use_haar_mixed_proxy,
         score_use_hadamard_proxy=score_use_hadamard_proxy,
-        score_proxy_with_block_position_rope=score_proxy_with_block_position_rope,
-        score_proxy_with_shared_block_center_rope=score_proxy_with_shared_block_center_rope,
-        score_proxy_with_shared_block_start_rope=score_proxy_with_shared_block_start_rope,
         select_with_oracle_page_scores=select_with_oracle_page_scores,
         use_triton=use_triton,
     )
@@ -1635,14 +1479,10 @@ def replace_qwen2_attn(
     print(f"  unselected_mode={unselected_mode}")
     print(
         f"  continuous_rope={continuous_rope}, "
-        f"score_with_original_rope={score_with_original_rope}, "
         f"score_use_direct_spectral_proxy={score_use_direct_spectral_proxy}, "
         f"score_use_haar_proxy={score_use_haar_proxy}, "
         f"score_use_haar_mixed_proxy={score_use_haar_mixed_proxy}, "
         f"score_use_hadamard_proxy={score_use_hadamard_proxy}, "
-        f"score_proxy_with_block_position_rope={score_proxy_with_block_position_rope}, "
-        f"score_proxy_with_shared_block_center_rope={score_proxy_with_shared_block_center_rope}, "
-        f"score_proxy_with_shared_block_start_rope={score_proxy_with_shared_block_start_rope}, "
         f"select_with_oracle_page_scores={select_with_oracle_page_scores}, "
         f"use_triton={use_triton}"
     )
@@ -1662,14 +1502,10 @@ def replace_llama_attn(
     group_agg_method="mean",
     unselected_mode="drop",
     continuous_rope=True,
-    score_with_original_rope=False,
     score_use_direct_spectral_proxy=False,
     score_use_haar_proxy=False,
     score_use_haar_mixed_proxy=False,
     score_use_hadamard_proxy=False,
-    score_proxy_with_block_position_rope=False,
-    score_proxy_with_shared_block_center_rope=False,
-    score_proxy_with_shared_block_start_rope=False,
     select_with_oracle_page_scores=False,
     use_triton=True,
 ):
@@ -1692,14 +1528,10 @@ def replace_llama_attn(
         group_agg_method=group_agg_method,
         unselected_mode=unselected_mode,
         continuous_rope=continuous_rope,
-        score_with_original_rope=score_with_original_rope,
         score_use_direct_spectral_proxy=score_use_direct_spectral_proxy,
         score_use_haar_proxy=score_use_haar_proxy,
         score_use_haar_mixed_proxy=score_use_haar_mixed_proxy,
         score_use_hadamard_proxy=score_use_hadamard_proxy,
-        score_proxy_with_block_position_rope=score_proxy_with_block_position_rope,
-        score_proxy_with_shared_block_center_rope=score_proxy_with_shared_block_center_rope,
-        score_proxy_with_shared_block_start_rope=score_proxy_with_shared_block_start_rope,
         select_with_oracle_page_scores=select_with_oracle_page_scores,
         use_triton=use_triton,
     )
@@ -1714,14 +1546,10 @@ def replace_llama_attn(
     print(f"  unselected_mode={unselected_mode}")
     print(
         f"  continuous_rope={continuous_rope}, "
-        f"score_with_original_rope={score_with_original_rope}, "
         f"score_use_direct_spectral_proxy={score_use_direct_spectral_proxy}, "
         f"score_use_haar_proxy={score_use_haar_proxy}, "
         f"score_use_haar_mixed_proxy={score_use_haar_mixed_proxy}, "
         f"score_use_hadamard_proxy={score_use_hadamard_proxy}, "
-        f"score_proxy_with_block_position_rope={score_proxy_with_block_position_rope}, "
-        f"score_proxy_with_shared_block_center_rope={score_proxy_with_shared_block_center_rope}, "
-        f"score_proxy_with_shared_block_start_rope={score_proxy_with_shared_block_start_rope}, "
         f"select_with_oracle_page_scores={select_with_oracle_page_scores}, "
         f"use_triton={use_triton}"
     )
