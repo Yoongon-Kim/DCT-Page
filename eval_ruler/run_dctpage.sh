@@ -73,11 +73,11 @@ elif [ "$MODE" == "predict" ]; then
     # ---- PREDICTION + EVAL ----
     MODEL_NAME=${1:-"meta-llama/Llama-3.1-8B-Instruct"}
     ROOT_DIR=${2:-"results_ruler"}
-    DCT_TOP_K=${3:-128}
-    COMPRESS_RATIO=${4:-0.5}
+    DCT_TOP_K=${3:-8}
+    COMPRESS_RATIO=${4:-0.032}
     MODEL_TEMPLATE_TYPE=${5:-"llama-3"}
-    DCT_PAGE_SIZE=${6:-4}
-    DCT_UNSELECTED_MODE=${7:-"drop"}
+    DCT_PAGE_SIZE=${6:-128}
+    DCT_UNSELECTED_MODE=${7:-"compressed"}
 
     for MAX_SEQ_LENGTH in "${SEQ_LENGTHS[@]}"; do
         DATA_DIR="${ROOT_DIR}/data/${BENCHMARK}/${MAX_SEQ_LENGTH}"
