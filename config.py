@@ -12,4 +12,5 @@ class DCTPageConfig:
     group_agg_method: str = "mean" # "mean" | "max" | "topp" — aggregation of per-head scores within a GQA group
     unselected_mode: str = "drop"  # "drop" | "compressed"
     continuous_rope: bool = True       # Store KV before RoPE, apply continuous RoPE after assembly
+    score_with_original_rope: bool = False  # In continuous_rope mode, score pages in original-position RoPE space
     use_triton: bool = True            # Use fused Triton kernels (False = pure PyTorch, for comparison)
