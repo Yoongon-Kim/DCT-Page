@@ -485,6 +485,7 @@ def dct_page_attention_forward(
     
     # No need to do dct paging since there isn't enough tokens.
     if kv_len < min_len_for_paging:
+        print("FallBackk!!!!!!!!!!!")
         all_pos = torch.arange(kv_len, device=key_cached.device)
         cos_all, sin_all = _compute_rope_cos_sin(
             all_pos, self.config, key_cached.device, key_cached.dtype
