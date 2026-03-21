@@ -303,7 +303,7 @@ def parse_args():
     p.add_argument("--num_repeats", type=int, default=3,
                    help="Repeats per context length for averaging")
     p.add_argument("--max_new_tokens", type=int, default=128)
-    p.add_argument("--warmup_steps", type=int, default=8)
+    p.add_argument("--warmup_steps", type=int, default=1)
     p.add_argument("--chunk_size", type=int, default=0,
                    help="Chunked prefill size (0 = single-pass prefill). "
                         "Use e.g. 8192 to reduce peak memory for long contexts.")

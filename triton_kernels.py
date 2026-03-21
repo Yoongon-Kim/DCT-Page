@@ -150,6 +150,63 @@ def _score_pages_max_mean_c4_g4_kernel(
     tl.store(out_ptrs, agg_scores, mask=p_mask)
 
 
+@triton.jit
+def _score_pages_c1_g4_kernel(
+    query_ptr,         # [bsz, num_kv_heads, 4, head_dim]
+    comp_keys_ptr,     # [bsz, num_kv_heads, num_pages, 1, head_dim]
+    out_scores_ptr,    # [bsz, num_kv_heads, num_pages]
+    q_stride_b, q_stride_h, q_stride_g,
+    ck_stride_b, ck_stride_h, ck_stride_p, ck_stride_c,
+    os_stride_b, os_stride_h,
+    num_kv_heads,
+    num_pages,
+    head_dim,
+    scaling,
+    BLOCK_D: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+    GROUP_AGG_METHOD: tl.constexpr,  # 0=mean, 1=max
+):
+    """Specialized exact path for comp_size=1, groups=4."""
+    pid_bh = tl.program_id(0)
+    pid_pt = tl.program_id(1)
+
+    h = pid_bh % num_kv_heads
+    b = pid_bh // num_kv_heads
+
+    p_start = pid_pt * BLOCK_P
+    p_offsets = tl.arange(0, BLOCK_P)
+    p_indices = p_start + p_offsets
+    p_mask = p_indices < num_pages
+
+    d_idx = tl.arange(0, BLOCK_D)
+    d_mask = d_idx < head_dim
+
+    q_base = query_ptr + b * q_stride_b + h * q_stride_h
+    ck_base = comp_keys_ptr + b * ck_stride_b + h * ck_stride_h
+
+    q0 = tl.load(q_base + 0 * q_stride_g + d_idx, mask=d_mask, other=0.0).to(tl.float32) * scaling
+    q1 = tl.load(q_base + 1 * q_stride_g + d_idx, mask=d_mask, other=0.0).to(tl.float32) * scaling
+    q2 = tl.load(q_base + 2 * q_stride_g + d_idx, mask=d_mask, other=0.0).to(tl.float32) * scaling
+    q3 = tl.load(q_base + 3 * q_stride_g + d_idx, mask=d_mask, other=0.0).to(tl.float32) * scaling
+
+    k_ptrs = ck_base + p_indices[:, None] * ck_stride_p + 0 * ck_stride_c + d_idx[None, :]
+    mask_2d = p_mask[:, None] & d_mask[None, :]
+    k = tl.load(k_ptrs, mask=mask_2d, other=0.0).to(tl.float32)
+
+    s0 = tl.sum(k * q0[None, :], axis=1)
+    s1 = tl.sum(k * q1[None, :], axis=1)
+    s2 = tl.sum(k * q2[None, :], axis=1)
+    s3 = tl.sum(k * q3[None, :], axis=1)
+
+    if GROUP_AGG_METHOD == 0:
+        agg_scores = 0.25 * (s0 + s1 + s2 + s3)
+    else:
+        agg_scores = tl.maximum(tl.maximum(s0, s1), tl.maximum(s2, s3))
+
+    out_ptrs = out_scores_ptr + b * os_stride_b + h * os_stride_h + p_indices
+    tl.store(out_ptrs, agg_scores, mask=p_mask)
+
+
 _SCORING_MAP = {"max": 0, "mean": 1, "sum": 2}
 _GROUP_AGG_MAP = {"mean": 0, "max": 1}
 
@@ -222,6 +279,11 @@ def score_pages_triton(
         and num_kv_groups == 4
         and comp_size == 4
     )
+    use_specialized_c1_g4 = (
+        num_kv_groups == 4
+        and comp_size == 1
+        and group_agg_method in {"mean", "max"}
+    )
 
     with torch.cuda.device(query.device):
         if use_specialized_c4_g4:
@@ -234,6 +296,18 @@ def score_pages_triton(
                 scaling,
                 BLOCK_D=BLOCK_D,
                 BLOCK_P=BLOCK_P,
+            )
+        elif use_specialized_c1_g4:
+            _score_pages_c1_g4_kernel[grid](
+                query, compressed_keys, page_scores,
+                q_stride_0, q_stride_1, q_stride_2,
+                ck_stride_0, ck_stride_1, ck_stride_2, ck_stride_3,
+                ps_stride_0, ps_stride_bh,
+                num_kv_heads, num_pages, head_dim,
+                scaling,
+                BLOCK_D=BLOCK_D,
+                BLOCK_P=BLOCK_P,
+                GROUP_AGG_METHOD=GROUP_AGG,
             )
         else:
             _score_pages_fused_kernel[grid](

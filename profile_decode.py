@@ -628,14 +628,14 @@ def parse_args():
     p.add_argument("--mode", choices=["dct", "baseline", "both"], default="both")
 
     # DCT config
-    p.add_argument("--page_size", type=int, default=128)
-    p.add_argument("--top_k", type=int, default=8)
+    p.add_argument("--page_size", type=int, default=32)
+    p.add_argument("--top_k", type=int, default=64)
     p.add_argument("--sink_size", type=int, default=4)
     p.add_argument("--recent_size", type=int, default=128)
-    p.add_argument("--compress_ratio", type=float, default=4/128)
-    p.add_argument("--scoring_method", default="mean")
-    p.add_argument("--group_agg_method", default="max")
-    p.add_argument("--unselected_mode", default="compressed",
+    p.add_argument("--compress_ratio", type=float, default=0.03125)
+    p.add_argument("--scoring_method", default="max")
+    p.add_argument("--group_agg_method", default="mean")
+    p.add_argument("--unselected_mode", default="drop",
                    choices=["drop", "compressed"])
     p.add_argument("--no_continuous_rope", action="store_true",
                    help="Disable continuous RoPE (enabled by default)")
