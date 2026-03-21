@@ -135,10 +135,7 @@ def score_pages_triton(
         )
         ps_stride_bh = num_pages
 
-    SCORING = _SCORING_MAP[scoring_method]
-    GROUP_AGG = _GROUP_AGG_MAP[group_agg_method]
     BLOCK_D = triton.next_power_of_2(head_dim)
-    BLOCK_P = 32
 
     # query is contiguous [bsz, num_kv_heads, num_kv_groups, head_dim] — compute strides
     q_stride_0 = num_kv_heads * num_kv_groups * head_dim
@@ -152,6 +149,9 @@ def score_pages_triton(
     # page_scores stride(0) based on actual buffer stride(1)
     ps_stride_0 = num_kv_heads * ps_stride_bh
 
+    SCORING = _SCORING_MAP[scoring_method]
+    GROUP_AGG = _GROUP_AGG_MAP[group_agg_method]
+    BLOCK_P = 32
     num_page_tiles = (num_pages + BLOCK_P - 1) // BLOCK_P
     grid = (bsz * num_kv_heads, num_page_tiles)
 
@@ -238,7 +238,8 @@ def topk_sort_triton(
     Args:
         page_scores: [bsz, num_kv_heads, num_pages] float32
         top_k: number of pages to select
-        out: optional pre-allocated [bsz, num_kv_heads, top_k] int32 buffer
+        out: optional pre-allocated [bsz, num_kv_heads, top_k] int32 buffer.
+             Strides may be larger than the logical shape.
 
     Returns:
         selected_indices: [bsz, num_kv_heads, top_k] int32, sorted ascending
@@ -255,12 +256,14 @@ def topk_sort_triton(
         )
 
     grid = (bsz * num_kv_heads,)
+    s_stride_bh = page_scores.stride(1)
+    o_stride_bh = selected.stride(1)
 
     with torch.cuda.device(page_scores.device):
         _topk_sort_kernel[grid](
             page_scores, selected,
-            num_pages,       # scores contiguous: stride(1) = num_pages
-            top_k,           # output contiguous: stride(1) = top_k
+            s_stride_bh,
+            o_stride_bh,
             num_pages,
             TOP_K=top_k,
             BLOCK_P=BLOCK_P,

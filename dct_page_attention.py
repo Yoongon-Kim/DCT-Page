@@ -1102,38 +1102,6 @@ def _compute_debug_oracle_page_scores(attn_module, query_states, paged_k, cfg, c
     )
 
 
-def _build_drop_mode_position_ids(selected_indices, cfg, num_pages, actual_recent, out=None):
-    """Build original token positions for assembled drop-mode KV."""
-    bsz, num_kv_heads, actual_top_k = selected_indices.shape
-    device = selected_indices.device
-    total_len = cfg.sink_size + actual_top_k * cfg.page_size + actual_recent
-
-    if out is None or out.shape[2] < total_len:
-        position_ids = torch.empty(
-            bsz, num_kv_heads, total_len,
-            dtype=torch.long, device=device,
-        )
-    else:
-        position_ids = out[:, :, :total_len]
-
-    sink_positions = torch.arange(cfg.sink_size, device=device, dtype=torch.long)
-    position_ids[:, :, :cfg.sink_size] = sink_positions.view(1, 1, -1)
-
-    page_offsets = torch.arange(cfg.page_size, device=device, dtype=torch.long)
-    selected_positions = cfg.sink_size + selected_indices.to(torch.long).unsqueeze(-1) * cfg.page_size
-    selected_positions = selected_positions + page_offsets.view(1, 1, 1, -1)
-    middle_start = cfg.sink_size
-    middle_end = middle_start + actual_top_k * cfg.page_size
-    position_ids[:, :, middle_start:middle_end] = selected_positions.reshape(
-        bsz, num_kv_heads, actual_top_k * cfg.page_size
-    )
-
-    recent_start = cfg.sink_size + num_pages * cfg.page_size
-    recent_positions = recent_start + torch.arange(actual_recent, device=device, dtype=torch.long)
-    position_ids[:, :, middle_end:total_len] = recent_positions.view(1, 1, -1)
-    return position_ids
-
-
 def _apply_original_position_rope_to_final_k(
     attn_module,
     final_k,
@@ -1144,13 +1112,9 @@ def _apply_original_position_rope_to_final_k(
     model_config,
 ):
     """Apply RoPE to assembled drop-mode KV using the tokens' original positions."""
-    total_len = final_k.shape[2]
-    position_buf = getattr(attn_module, "_drop_position_ids_buf", None)
-    position_ids = _build_drop_mode_position_ids(
-        selected_indices, cfg, num_pages, actual_recent, out=position_buf
-    )
-    attn_module._drop_position_ids_buf = position_ids
-    attn_module._drop_position_ids_buf_len = total_len
+    bsz, num_kv_heads, _, head_dim = final_k.shape
+    actual_top_k = selected_indices.shape[2]
+    selected_indices_long = selected_indices.to(torch.long)
     cos_table, sin_table = _get_or_build_original_position_rope_tables(
         attn_module,
         num_pages * cfg.page_size + cfg.sink_size + actual_recent,
@@ -1158,8 +1122,47 @@ def _apply_original_position_rope_to_final_k(
         final_k.device,
         final_k.dtype,
     )
-    cos = cos_table[position_ids]
-    sin = sin_table[position_ids]
+
+    cos_parts = []
+    sin_parts = []
+
+    if cfg.sink_size > 0:
+        sink_cos = cos_table[:cfg.sink_size].view(1, 1, cfg.sink_size, head_dim)
+        sink_sin = sin_table[:cfg.sink_size].view(1, 1, cfg.sink_size, head_dim)
+        cos_parts.append(sink_cos.expand(bsz, num_kv_heads, -1, -1))
+        sin_parts.append(sink_sin.expand(bsz, num_kv_heads, -1, -1))
+
+    middle_start = cfg.sink_size
+    middle_end = middle_start + num_pages * cfg.page_size
+    if actual_top_k > 0:
+        page_cos_table = cos_table[middle_start:middle_end].view(num_pages, cfg.page_size, head_dim)
+        page_sin_table = sin_table[middle_start:middle_end].view(num_pages, cfg.page_size, head_dim)
+        selected_cos = page_cos_table[selected_indices_long].reshape(
+            bsz, num_kv_heads, actual_top_k * cfg.page_size, head_dim
+        )
+        selected_sin = page_sin_table[selected_indices_long].reshape(
+            bsz, num_kv_heads, actual_top_k * cfg.page_size, head_dim
+        )
+        cos_parts.append(selected_cos)
+        sin_parts.append(selected_sin)
+
+    if actual_recent > 0:
+        recent_start = middle_end
+        recent_cos = cos_table[recent_start:recent_start + actual_recent].view(
+            1, 1, actual_recent, head_dim
+        )
+        recent_sin = sin_table[recent_start:recent_start + actual_recent].view(
+            1, 1, actual_recent, head_dim
+        )
+        cos_parts.append(recent_cos.expand(bsz, num_kv_heads, -1, -1))
+        sin_parts.append(recent_sin.expand(bsz, num_kv_heads, -1, -1))
+
+    if len(cos_parts) == 1:
+        cos = cos_parts[0]
+        sin = sin_parts[0]
+    else:
+        cos = torch.cat(cos_parts, dim=2)
+        sin = torch.cat(sin_parts, dim=2)
     return _apply_rope(final_k, cos, sin)
 
 
@@ -1192,8 +1195,6 @@ _DCT_RUNTIME_STATE_ATTRS = (
     "_orig_pos_rope_cos_2d",
     "_orig_pos_rope_sin_2d",
     "_orig_pos_rope_cache_len",
-    "_drop_position_ids_buf",
-    "_drop_position_ids_buf_len",
 )
 
 

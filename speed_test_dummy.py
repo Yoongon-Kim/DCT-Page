@@ -361,15 +361,6 @@ def benchmark_dummy(model, tokenizer, args, label, context_lengths):
     vocab_size = tokenizer.vocab_size
     use_pre_alloc = (label == "dct") and not getattr(args, 'no_triton', False)
 
-    # Warmup run: triggers CUDA kernel compilation and memory allocation
-    warmup_len = min(context_lengths)
-    warmup_ids = torch.randint(0, vocab_size, (1, warmup_len), dtype=torch.long, device=device)
-    print(f"  [{label}] Warmup run (ctx={warmup_len})...")
-    time_sample(model, tokenizer, warmup_ids, min(16, args.max_new_tokens), 0,
-                use_pre_alloc=use_pre_alloc, chunk_size=args.chunk_size)
-    del warmup_ids
-    torch.cuda.empty_cache()
-
     all_records = []
     # stats grouped by context length: {ctx_len: {prefill_times, step_times}}
     per_length_stats = {}
@@ -379,6 +370,25 @@ def benchmark_dummy(model, tokenizer, args, label, context_lengths):
 
     for ctx_len in context_lengths:
         per_length_stats[ctx_len] = {"prefill_times": [], "step_times": []}
+
+        # Warm each context length separately so the first measured repeat for a
+        # given length does not absorb shape-specific kernel compilation or
+        # allocator/setup costs.
+        warmup_ids = torch.randint(
+            0, vocab_size, (1, ctx_len), dtype=torch.long, device=device
+        )
+        print(f"  [{label}] Warmup run (ctx={ctx_len})...")
+        time_sample(
+            model,
+            tokenizer,
+            warmup_ids,
+            min(16, args.max_new_tokens),
+            0,
+            use_pre_alloc=use_pre_alloc,
+            chunk_size=args.chunk_size,
+        )
+        del warmup_ids
+        torch.cuda.empty_cache()
 
         for repeat in range(args.num_repeats):
             run_idx += 1
