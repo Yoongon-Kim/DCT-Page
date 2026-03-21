@@ -73,11 +73,11 @@ def parse_args():
                         help="Size of each position gap (multiple of page_size)")
 
     # DCT Page Attention params (only used when mode=page_attention)
-    parser.add_argument("--page_size", type=int, default=128)
-    parser.add_argument("--top_k", type=int, default=8)
+    parser.add_argument("--page_size", type=int, default=32)
+    parser.add_argument("--top_k", type=int, default=64)
     parser.add_argument("--sink_size", type=int, default=4)
     parser.add_argument("--recent_size", type=int, default=128)
-    parser.add_argument("--compress_ratio", type=float, default=0.25)
+    parser.add_argument("--compress_ratio", type=float, default=0.03125)
     parser.add_argument("--scoring_method", type=str, default="max",
                         choices=["mean", "max", "sum"])
     parser.add_argument("--group_agg_method", type=str, default="mean",

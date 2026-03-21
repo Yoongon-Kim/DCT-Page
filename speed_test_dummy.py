@@ -311,11 +311,11 @@ def parse_args():
     p.add_argument("--run_name", default=None)
 
     dct = p.add_argument_group("DCT Page Attention config")
-    dct.add_argument("--page_size", type=int, default=128)
-    dct.add_argument("--top_k", type=int, default=8)
+    dct.add_argument("--page_size", type=int, default=32)
+    dct.add_argument("--top_k", type=int, default=64)
     dct.add_argument("--sink_size", type=int, default=4)
     dct.add_argument("--recent_size", type=int, default=128)
-    dct.add_argument("--compress_ratio", type=float, default=0.03)
+    dct.add_argument("--compress_ratio", type=float, default=0.03125)
     dct.add_argument("--scoring_method", default="max", choices=["mean", "max"])
     dct.add_argument("--group_agg_method", default="mean",
                      choices=["mean", "max", "topp"])

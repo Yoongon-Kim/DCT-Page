@@ -1831,11 +1831,11 @@ def dct_page_attention_forward(
 # Monkey-patch entry point
 # ---------------------------------------------------------------------------
 def replace_qwen2_attn(
-    page_size=128,
-    top_k=8,
+    page_size=32,
+    top_k=64,
     sink_size=4,
     recent_size=128,
-    compress_ratio=0.25,
+    compress_ratio=0.03125,
     proxy_frequency_layout="low",
     scoring_method="max",
     group_agg_method="mean",
@@ -1896,11 +1896,11 @@ def replace_qwen2_attn(
 
 
 def replace_llama_attn(
-    page_size=128,
-    top_k=8,
+    page_size=32,
+    top_k=64,
     sink_size=4,
     recent_size=128,
-    compress_ratio=0.25,
+    compress_ratio=0.03125,
     proxy_frequency_layout="low",
     scoring_method="max",
     group_agg_method="mean",

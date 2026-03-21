@@ -41,11 +41,11 @@ def parse_args():
                         default="meta-llama/Llama-3.1-8B-Instruct")
 
     # DCT-Page parameters
-    parser.add_argument("--dct_page_size", type=int, default=128)
-    parser.add_argument("--dct_top_k", type=int, default=8)
+    parser.add_argument("--dct_page_size", type=int, default=32)
+    parser.add_argument("--dct_top_k", type=int, default=64)
     parser.add_argument("--dct_sink_size", type=int, default=4)
     parser.add_argument("--dct_recent_size", type=int, default=128)
-    parser.add_argument("--dct_compress_ratio", type=float, default=0.25)
+    parser.add_argument("--dct_compress_ratio", type=float, default=0.03125)
     parser.add_argument("--dct_scoring_method", type=str, default="max",
                         choices=["mean", "max", "sum"])
     parser.add_argument("--dct_group_agg_method", type=str, default="mean",
