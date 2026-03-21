@@ -33,6 +33,7 @@ from triton_kernels import (
     topk_sort_triton, 
     assemble_kv_drop_triton, 
     score_pages_triton,
+    apply_rope_q_direct,
 )
 
 # ---------------------------------------------------------------------------
@@ -581,6 +582,28 @@ def _compute_rope_cos_sin(positions, config, device, dtype):
     cos = (emb.cos() * attention_scaling).unsqueeze(0).unsqueeze(0).to(dtype)
     sin = (emb.sin() * attention_scaling).unsqueeze(0).unsqueeze(0).to(dtype)
     return cos, sin
+
+
+def _apply_decode_query_rope(attn_module, query_states, cos, sin, cfg):
+    """Apply RoPE to a single-token decode query, using Triton when safe."""
+    if (
+        cfg.use_triton
+        and query_states.shape[0] == 1
+        and query_states.shape[2] == 1
+        and cos.ndim == 3
+        and sin.ndim == 3
+        and cos.shape[0] == 1
+        and sin.shape[0] == 1
+        and cos.shape[1] == 1
+        and sin.shape[1] == 1
+    ):
+        q_rope_buf = getattr(attn_module, "_q_rope_buf", None)
+        if q_rope_buf is None or q_rope_buf.shape != query_states.shape:
+            attn_module._q_rope_buf = torch.empty_like(query_states)
+            q_rope_buf = attn_module._q_rope_buf
+        return apply_rope_q_direct(query_states, cos[0, 0].contiguous(), sin[0, 0].contiguous(), q_rope_buf)
+    query_states_rope, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
+    return query_states_rope
 
 
 def _get_or_build_original_position_rope_tables(attn_module, required_len, config, device, dtype):
@@ -1195,6 +1218,7 @@ _DCT_RUNTIME_STATE_ATTRS = (
     "_orig_pos_rope_cos_2d",
     "_orig_pos_rope_sin_2d",
     "_orig_pos_rope_cache_len",
+    "_q_rope_buf",
 )
 
 
@@ -1338,7 +1362,7 @@ def dct_page_attention_forward(
     if kv_len < min_len_for_paging:
         if cfg.continuous_rope:
             if query_states_rope is None:
-                query_states_rope, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
+                query_states_rope = _apply_decode_query_rope(self, query_states, cos, sin, cfg)
             cos_all, sin_all = _get_or_build_original_position_rope_tables(
                 self, kv_len, self.config, key_cached.device, key_cached.dtype
             )
@@ -1411,7 +1435,7 @@ def dct_page_attention_forward(
     score_comp_k = comp_k
     if cfg.continuous_rope:
         if query_states_rope is None:
-            query_states_rope, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
+            query_states_rope = _apply_decode_query_rope(self, query_states, cos, sin, cfg)
         score_query_states = query_states_rope
         if cfg.score_use_direct_spectral_proxy:
             score_comp_k = _update_score_spectral_key_cache(
@@ -1555,7 +1579,7 @@ def dct_page_attention_forward(
 
     if cfg.continuous_rope:
         if query_states_rope is None:
-            query_states_rope, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
+            query_states_rope = _apply_decode_query_rope(self, query_states, cos, sin, cfg)
         query_states = query_states_rope
         if not fuse_final_k_original_rope:
             final_k = _apply_original_position_rope_to_final_k(

@@ -76,6 +76,7 @@ from dct_page_attention import (
     _compute_rope_cos_sin,
     _get_or_build_original_position_rope_tables,
     _apply_original_position_rope_to_final_k,
+    _apply_decode_query_rope,
 )
 
 
@@ -300,7 +301,7 @@ def profiled_dct_page_attention_forward(
     if kv_len < min_len_for_paging:
         if cfg.continuous_rope:
             if query_states_rope is None:
-                query_states_rope, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
+                query_states_rope = _apply_decode_query_rope(self, query_states, cos, sin, cfg)
             cos_all, sin_all = _get_or_build_original_position_rope_tables(
                 self, kv_len, self.config, key_cached.device, key_cached.dtype
             )
@@ -379,7 +380,7 @@ def profiled_dct_page_attention_forward(
     score_comp_k = comp_k
     if cfg.continuous_rope:
         if query_states_rope is None:
-            query_states_rope, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
+            query_states_rope = _apply_decode_query_rope(self, query_states, cos, sin, cfg)
         score_query_states = query_states_rope
         if cfg.score_use_direct_spectral_proxy:
             score_comp_k = _update_score_spectral_key_cache(self, paged_k, num_pages, comp_size, cfg)
@@ -474,7 +475,7 @@ def profiled_dct_page_attention_forward(
 
     if cfg.continuous_rope:
         if query_states_rope is None:
-            query_states_rope, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
+            query_states_rope = _apply_decode_query_rope(self, query_states, cos, sin, cfg)
         query_states = query_states_rope
         if not fuse_final_k_original_rope:
             final_k = _apply_original_position_rope_to_final_k(
