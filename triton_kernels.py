@@ -702,7 +702,7 @@ def _copy_full_segments_kernel(
             elif is_recent:
                 rope_pos = sink_len + num_pages * PAGE_SIZE + t_start + t_idx
             else:
-                rope_pos = sink_len + page_idx * PAGE_SIZE + t_idx
+                rope_pos = sink_len + page_idx * PAGE_SIZE + t_start + t_idx
         else:
             rope_pos = write_start + t_start + t_idx
         half_d = head_dim // 2

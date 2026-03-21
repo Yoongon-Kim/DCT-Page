@@ -251,7 +251,7 @@ def profiled_dct_page_attention_forward(
         # Record events on the correct device's stream (critical for multi-GPU)
         _dev = hidden_states.device
         _stream = torch.cuda.current_stream(_dev)
-        ev = [torch.cuda.Event(enable_timing=True) for _ in range(12)]
+        ev = [torch.cuda.Event(enable_timing=True) for _ in range(11)]
         _cpu_ts = []
 
         def _rec(i):
@@ -434,6 +434,15 @@ def profiled_dct_page_attention_forward(
 
     cos_table = None
     sin_table = None
+    fuse_final_k_original_rope = cfg.continuous_rope and cfg.unselected_mode == "drop"
+    if fuse_final_k_original_rope:
+        cos_table, sin_table = _get_or_build_original_position_rope_tables(
+            self,
+            num_pages * cfg.page_size + cfg.sink_size + actual_recent,
+            self.config,
+            paged_k.device,
+            paged_k.dtype,
+        )
 
     # Pre-allocate or expand output buffers (avoids torch.empty per step)
     _buf_len = getattr(self, '_assemble_buf_len', 0)
@@ -451,10 +460,11 @@ def profiled_dct_page_attention_forward(
             paged_k, paged_v,
             sink_k, sink_v, recent_k, recent_v,
             selected_indices,
-            None, None,
+            cos_table, sin_table,
             out_k=self._final_k_buf,
             out_v=self._final_v_buf,
             out_sel_idx=self._sel_idx_buf,
+            original_position_rope=fuse_final_k_original_rope,
         )
     else:
         raise NotImplementedError("profile_decode only supports the current drop-mode default path.")
@@ -466,18 +476,16 @@ def profiled_dct_page_attention_forward(
         if query_states_rope is None:
             query_states_rope, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
         query_states = query_states_rope
-        final_k = _apply_original_position_rope_to_final_k(
-            self,
-            final_k,
-            selected_indices,
-            num_pages,
-            actual_recent,
-            cfg,
-            self.config,
-        )
-
-    if _enabled:
-        _rec(9)
+        if not fuse_final_k_original_rope:
+            final_k = _apply_original_position_rope_to_final_k(
+                self,
+                final_k,
+                selected_indices,
+                num_pages,
+                actual_recent,
+                cfg,
+                self.config,
+            )
 
     attn_output = F.scaled_dot_product_attention(
         query_states, final_k, final_v,
@@ -488,17 +496,17 @@ def profiled_dct_page_attention_forward(
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
 
     if _enabled:
-        _rec(10)
+        _rec(9)
 
     attn_output = self.o_proj(attn_output)
 
     if _enabled:
-        _rec(11)
+        _rec(10)
         step_names = [
             "1_qkv", "2_kv_update", "3_segment",
             "4_compress", "5a_score_cache_update", "5b_score_pages_kernel",
-            "6_topk", "7_assemble_drop", "8_final_k_original_rope",
-            "9_sdpa", "10_o_proj",
+            "6_topk", "7_assemble_drop_and_final_k_original_rope",
+            "8_sdpa", "9_o_proj",
         ]
         for i, name in enumerate(step_names):
             _pending_events.append((name, ev[i], ev[i + 1]))

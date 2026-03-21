@@ -1494,6 +1494,15 @@ def dct_page_attention_forward(
 
     cos_table = None
     sin_table = None
+    fuse_final_k_original_rope = cfg.continuous_rope and cfg.unselected_mode == "drop"
+    if fuse_final_k_original_rope:
+        cos_table, sin_table = _get_or_build_original_position_rope_tables(
+            self,
+            num_pages * cfg.page_size + cfg.sink_size + actual_recent,
+            self.config,
+            paged_k.device,
+            paged_k.dtype,
+        )
 
     # Pre-allocate or expand output buffers (avoids torch.empty per step)
     _buf_len = getattr(self, '_assemble_buf_len', 0)
@@ -1515,10 +1524,11 @@ def dct_page_attention_forward(
             paged_k, paged_v,
             sink_k, sink_v, recent_k, recent_v,
             selected_indices,
-            None, None,
+            cos_table, sin_table,
             out_k=self._final_k_buf,
             out_v=self._final_v_buf,
             out_sel_idx=self._sel_idx_buf,
+            original_position_rope=fuse_final_k_original_rope,
         )
     
     else:
@@ -1547,15 +1557,16 @@ def dct_page_attention_forward(
         if query_states_rope is None:
             query_states_rope, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
         query_states = query_states_rope
-        final_k = _apply_original_position_rope_to_final_k(
-            self,
-            final_k,
-            selected_indices,
-            num_pages,
-            actual_recent,
-            cfg,
-            self.config,
-        )
+        if not fuse_final_k_original_rope:
+            final_k = _apply_original_position_rope_to_final_k(
+                self,
+                final_k,
+                selected_indices,
+                num_pages,
+                actual_recent,
+                cfg,
+                self.config,
+            )
 
     # Step 7a: Compute attention (no causal mask needed for q_len=1)
     attn_output = F.scaled_dot_product_attention(
