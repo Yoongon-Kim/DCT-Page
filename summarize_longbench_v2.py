@@ -3,8 +3,8 @@
 Prints per-run accuracy with breakdowns by domain, difficulty, and length.
 
 Usage:
-    python summarize_longbench_v2.py results_longbench_v2/
-    python summarize_longbench_v2.py results_longbench_v2/llama_baseline.jsonl
+    python summarize_longbench_v2.py results/longbench_v2/
+    python summarize_longbench_v2.py results/longbench_v2/llama_baseline.jsonl
 """
 
 import argparse

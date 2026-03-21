@@ -5,7 +5,7 @@ Generates random token sequences of configurable lengths, avoiding any dataset
 dependency.  Measures prefill and decode speed separately.
 
 Results are saved under:
-    results_speed_test_dummy/<run_name>/
+    results/speed_test_dummy/<run_name>/
         samples.jsonl   — per-(length, repeat) timing records
         summary.json    — aggregated stats grouped by context length
 
@@ -307,7 +307,7 @@ def parse_args():
     p.add_argument("--chunk_size", type=int, default=0,
                    help="Chunked prefill size (0 = single-pass prefill). "
                         "Use e.g. 8192 to reduce peak memory for long contexts.")
-    p.add_argument("--output_dir", default="results_speed_test_dummy")
+    p.add_argument("--output_dir", default="results/speed_test_dummy")
     p.add_argument("--run_name", default=None)
 
     dct = p.add_argument_group("DCT Page Attention config")

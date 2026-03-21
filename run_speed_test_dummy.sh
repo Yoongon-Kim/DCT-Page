@@ -6,7 +6,7 @@ set -e
 MODEL="${MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 CONTEXT_LENGTHS="${CONTEXT_LENGTHS:-65536}" #4096,8192,16384,32768,65536,120000}"
 NUM_REPEATS="${NUM_REPEATS:-3}"
-OUTPUT_DIR="${OUTPUT_DIR:-results_speed_test_dummy}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/speed_test_dummy}"
 
 # Fixed DCT parameters
 PAGE_SIZE=128

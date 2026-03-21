@@ -13,13 +13,15 @@ import re
 import string
 import argparse
 import random
-import difflib
+from pathlib import Path
 from collections import Counter
 
 import torch
 import numpy as np
 from tqdm import tqdm
 from datasets import load_dataset
+from fuzzywuzzy import fuzz
+from rouge import Rouge
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -34,6 +36,8 @@ ENGLISH_TASKS = [
     "passage_count", "passage_retrieval_en",
     "lcc", "repobench-p",
 ]
+
+REPO_DIR = Path(__file__).resolve().parent
 
 TASK_CATEGORIES = {
     "Single-Doc QA": ["narrativeqa", "qasper", "multifieldqa_en"],
@@ -56,6 +60,7 @@ TASK_MAX_NEW_TOKENS = {
 
 # Tasks where only the first line of generation is used for scoring
 FIRST_LINE_TASKS = {"trec", "triviaqa", "samsum"}
+NO_CHAT_TASKS = {"trec", "triviaqa", "samsum", "lcc", "repobench-p"}
 
 # Task -> metric type
 TASK_METRIC = {
@@ -146,21 +151,27 @@ TASK_PROMPTS = {
     ),
     "multi_news": (
         "You are given several news passages. Write a one-page summary of all "
-        "news.\n\n"
-        "{context}\n\n"
-        "Now, write a one-page summary of all the news passages above.\n\n"
+        "news. \n\n"
+        "News:\n{context}\n\n"
+        "Now, write a one-page summary of all the news.\n\n"
         "Summary:"
     ),
-    "trec": "{context}\n{input}",
+    "trec": (
+        "Please determine the type of the question below. Here are some "
+        "examples of questions.\n\n"
+        "{context}\n{input}"
+    ),
     "triviaqa": (
         "Answer the question based on the given passage. Only give me the "
-        "answer and do not output any other words.\n\n"
-        "The following are given passages.\n{context}\n\n"
-        "Answer the question based on the given passages. Only give me the "
-        "answer and do not output any other words.\n\n"
-        "Question: {input}\nAnswer:"
+        "answer and do not output any other words. The following are some "
+        "examples.\n\n"
+        "{context}\n\n{input}"
     ),
-    "samsum": "{context}\n{input}",
+    "samsum": (
+        "Summarize the dialogue into a few short sentences. The following are "
+        "some examples.\n\n"
+        "{context}\n\n{input}"
+    ),
     "passage_count": (
         "There are some paragraphs below sourced from Wikipedia. Some of them "
         "may be duplicates. Please carefully read these paragraphs and "
@@ -170,13 +181,19 @@ TASK_PROMPTS = {
         "{context}\n\n"
         "Please enter the final count of unique paragraphs after removing "
         "duplicates. The output format should only contain the number, such as "
-        "1, 2, 3, and so on.\n\nOutput:"
+        "1, 2, 3, and so on.\n\n"
+        "The final answer is: "
     ),
     "passage_retrieval_en": (
         "Here are 30 paragraphs from Wikipedia, along with an abstract. Please "
         "determine which paragraph the abstract is from.\n\n"
         "{context}\n\n"
-        "The abstract is from Paragraph"
+        "The following is an abstract.\n\n"
+        "{input}\n\n"
+        "Please enter the number of the paragraph that the abstract is from. "
+        "The answer format must be like \"Paragraph 1\", \"Paragraph 2\", "
+        "etc.\n\n"
+        "The answer is: "
     ),
     "lcc": (
         "Please complete the code given below.\n"
@@ -184,7 +201,7 @@ TASK_PROMPTS = {
     ),
     "repobench-p": (
         "Please complete the code given below.\n"
-        "{context}{input}"
+        "{context}{input}Next line of code:\n"
     ),
 }
 
@@ -238,17 +255,13 @@ def _lcs_length(x, y):
 
 
 def rouge_l_f1(prediction, reference):
-    """ROUGE-L F1 score (word-level LCS)."""
-    pred_tokens = prediction.split()
-    ref_tokens = reference.split()
-    if not pred_tokens or not ref_tokens:
+    """ROUGE-L F1 score aligned with FastKV eval semantics."""
+    rouge = Rouge()
+    try:
+        scores = rouge.get_scores([prediction], [reference], avg=True)
+    except Exception:
         return 0.0
-    lcs = _lcs_length(pred_tokens, ref_tokens)
-    precision = lcs / len(pred_tokens)
-    recall = lcs / len(ref_tokens)
-    if precision + recall == 0:
-        return 0.0
-    return (2 * precision * recall) / (precision + recall)
+    return scores["rouge-l"]["f"]
 
 
 def classification_score(prediction, ground_truth, all_classes):
@@ -257,9 +270,13 @@ def classification_score(prediction, ground_truth, all_classes):
     for class_name in all_classes:
         if class_name in prediction:
             em_match_list.append(class_name)
-    for match in em_match_list:
-        if match in ground_truth:
-            return 1.0 / len(em_match_list)
+    filtered = []
+    for match_term in em_match_list:
+        if match_term in ground_truth and match_term != ground_truth:
+            continue
+        filtered.append(match_term)
+    if ground_truth in filtered:
+        return 1.0 / len(filtered)
     return 0.0
 
 
@@ -271,20 +288,30 @@ def retrieval_score(prediction, ground_truth):
         return 0.0
     ground_truth_id = int(matches[0])
     numbers = re.findall(r"\d+", prediction)
+    if not numbers:
+        return 0.0
     right = sum(1 for n in numbers if int(n) == ground_truth_id)
-    return min(right, 1)
+    return right / len(numbers)
 
 
 def count_score(prediction, ground_truth):
     """Passage count accuracy (official LongBench)."""
     numbers = re.findall(r"\d+", prediction)
+    if not numbers:
+        return 0.0
     right = sum(1 for n in numbers if int(n) == int(ground_truth))
-    return 1.0 if right > 0 else 0.0
+    return right / len(numbers)
 
 
 def code_sim_score(prediction, ground_truth):
-    """Code edit-similarity using SequenceMatcher."""
-    return difflib.SequenceMatcher(None, prediction, ground_truth).ratio()
+    """Code similarity with FastKV-style first valid line extraction."""
+    all_lines = prediction.lstrip("\n").split("\n")
+    candidate = ""
+    for line in all_lines:
+        if ("`" not in line) and ("#" not in line) and ("//" not in line):
+            candidate = line
+            break
+    return fuzz.ratio(candidate, ground_truth) / 100.0
 
 
 def score_single(prediction, answers, task, all_classes=None):
@@ -321,22 +348,32 @@ def build_prompt(context, input_text, task):
 # ---------------------------------------------------------------------------
 # Tokenise + truncate (first-half + last-half, same as official)
 # ---------------------------------------------------------------------------
-def tokenize_and_truncate(prompt_text, tokenizer, max_input_len):
-    messages = [{"role": "user", "content": prompt_text}]
-    input_ids = tokenizer.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
+def tokenize_and_truncate(prompt_text, tokenizer, max_input_len, task):
+    if task not in NO_CHAT_TASKS:
+        messages = [{"role": "user", "content": prompt_text}]
+        prompt_text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    tokenized = tokenizer(
+        prompt_text,
         return_tensors="pt",
+        add_special_tokens=True,
     )
-    # Some transformers versions return BatchEncoding instead of a tensor
-    if not isinstance(input_ids, torch.Tensor):
-        input_ids = input_ids["input_ids"]
+    input_ids = tokenized["input_ids"]
     if input_ids.shape[1] > max_input_len:
         half = max_input_len // 2
-        input_ids = torch.cat(
-            [input_ids[:, :half], input_ids[:, -half:]], dim=1
+        prompt_text = (
+            tokenizer.decode(input_ids[0, :half], skip_special_tokens=True)
+            + tokenizer.decode(input_ids[0, -half:], skip_special_tokens=True)
         )
+        tokenized = tokenizer(
+            prompt_text,
+            return_tensors="pt",
+            add_special_tokens=True,
+        )
+        input_ids = tokenized["input_ids"]
     return input_ids
 
 
@@ -396,7 +433,7 @@ def parse_args():
                         help="Max samples per task (-1 = all)")
 
     # Output
-    parser.add_argument("--output_dir", type=str, default="results_longbench_v1")
+    parser.add_argument("--output_dir", type=str, default="results/longbench_v1")
     parser.add_argument("--run_name", type=str, default=None)
 
     # DCT Page Attention params (only used when mode=page_attention)
@@ -464,7 +501,7 @@ def evaluate_task(model, tokenizer, task, dataset, args):
 
         prompt_text = build_prompt(item["context"], item["input"], task)
         input_ids = tokenize_and_truncate(
-            prompt_text, tokenizer, args.max_input_len
+            prompt_text, tokenizer, args.max_input_len, task
         )
         input_ids = input_ids.to(model.device)
         input_len = input_ids.shape[1]
@@ -473,7 +510,11 @@ def evaluate_task(model, tokenizer, task, dataset, args):
             output_ids = model.generate(
                 input_ids,
                 max_new_tokens=max_gen,
+                num_beams=1,
                 do_sample=False,
+                temperature=1.0,
+                min_length=input_len + 1,
+                eos_token_id=[tokenizer.eos_token_id],
                 use_cache=True,
             )
 
@@ -548,6 +589,74 @@ def print_summary(all_task_results, run_name):
     return task_scores
 
 
+def write_run_summary(run_dir, run_name, mode, model_name, all_task_results, args):
+    """Write incremental per-task summary files for the current run."""
+    task_scores = print_summary(all_task_results, run_name)
+
+    summary_rows = []
+    all_scores = []
+    for task in ENGLISH_TASKS:
+        results = all_task_results.get(task, [])
+        if not results:
+            continue
+        scores = [r["score"] for r in results]
+        input_lens = [r["input_len"] for r in results]
+        avg_score = sum(scores) / len(scores) if scores else 0.0
+        summary_rows.append({
+            "task": task,
+            "n_samples": len(results),
+            "avg_score": avg_score,
+            "avg_input_len": sum(input_lens) / len(input_lens) if input_lens else 0.0,
+            "min_score": min(scores) if scores else 0.0,
+            "max_score": max(scores) if scores else 0.0,
+        })
+        all_scores.extend(scores)
+
+    overall = sum(all_scores) / len(all_scores) if all_scores else 0.0
+
+    summary_json = {
+        "mode": mode,
+        "model": model_name,
+        "run_name": run_name,
+        "task_scores": {k: round(v, 2) for k, v in task_scores.items()},
+        "overall": round(sum(task_scores.values()) / len(task_scores), 2) if task_scores else 0.0,
+        "total_samples": len(all_scores),
+        "tasks": summary_rows,
+    }
+    if mode == "page_attention":
+        summary_json["top_k"] = args.top_k
+        summary_json["page_size"] = args.page_size
+        summary_json["scoring_method"] = args.scoring_method
+        summary_json["group_agg_method"] = args.group_agg_method
+        summary_json["unselected_mode"] = args.unselected_mode
+
+    summary_path = os.path.join(run_dir, "summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary_json, f, indent=2)
+
+    summary_csv_path = os.path.join(run_dir, "summary.csv")
+    fieldnames = [
+        "task",
+        "n_samples",
+        "avg_score",
+        "avg_input_len",
+        "min_score",
+        "max_score",
+    ]
+    with open(summary_csv_path, "w", newline="") as f:
+        import csv
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(summary_rows)
+        writer.writerow({
+            "task": "OVERALL",
+            "n_samples": len(all_scores),
+            "avg_score": overall,
+        })
+
+    return task_scores, summary_path, summary_csv_path
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -602,7 +711,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
         device_map="auto",
         attn_implementation=attn_impl,
     )
@@ -613,38 +722,34 @@ def main():
     all_task_results = {}
     for task in args.tasks:
         print(f"\n--- Loading task: {task} ---")
-        # ds = load_dataset("THUDM/LongBench", task, split="test")
-        ds = load_dataset("json", data_files=f"longbench_v1_data/{task}.jsonl", split="train")
+        local_candidates = [
+            REPO_DIR / "longbench_v1_data" / f"{task}.jsonl",
+            REPO_DIR / "longbench_v1_data" / "data" / f"{task}.jsonl",
+        ]
+        local_path = next((str(p) for p in local_candidates if p.exists()), None)
+        if local_path is not None:
+            ds = load_dataset("json", data_files=local_path, split="train")
+        else:
+            ds = load_dataset("THUDM/LongBench", task, split="test")
         print(f"  {len(ds)} samples")
         all_task_results[task] = evaluate_task(model, tokenizer, task, ds, args)
 
-    # Summary
-    task_scores = print_summary(all_task_results, args.run_name)
+        run_dir = os.path.join(args.output_dir, args.run_name)
+        os.makedirs(run_dir, exist_ok=True)
+        _, summary_path, summary_csv_path = write_run_summary(
+            run_dir, args.run_name, args.mode, args.base_model, all_task_results, args
+        )
+        print(f"  Partial summary updated: {summary_csv_path}")
 
-    # Save summary JSON
     run_dir = os.path.join(args.output_dir, args.run_name)
     os.makedirs(run_dir, exist_ok=True)
-    summary_path = os.path.join(run_dir, "summary.json")
-    summary = {
-        "mode": args.mode,
-        "model": args.base_model,
-        "run_name": args.run_name,
-        "task_scores": {k: round(v, 2) for k, v in task_scores.items()},
-        "overall": round(
-            sum(task_scores.values()) / len(task_scores), 2
-        ) if task_scores else 0,
-    }
-    if args.mode == "page_attention":
-        summary["top_k"] = args.top_k
-        summary["page_size"] = args.page_size
-        summary["scoring_method"] = args.scoring_method
-        summary["group_agg_method"] = args.group_agg_method
-        summary["unselected_mode"] = args.unselected_mode
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
+    task_scores, summary_path, summary_csv_path = write_run_summary(
+        run_dir, args.run_name, args.mode, args.base_model, all_task_results, args
+    )
 
     print(f"\nPer-task results in: {run_dir}/")
     print(f"Summary saved to: {summary_path}")
+    print(f"CSV saved to: {summary_csv_path}")
 
 
 if __name__ == "__main__":

@@ -62,7 +62,7 @@ def parse_args():
                         help="Max samples to evaluate (-1 = all 503)")
 
     # Output
-    parser.add_argument("--output_dir", type=str, default="results_longbench_v2")
+    parser.add_argument("--output_dir", type=str, default="results/longbench_v2")
     parser.add_argument("--run_name", type=str, default=None,
                         help="Name for this run (auto-generated if not given)")
 
@@ -365,7 +365,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
         device_map="auto",
         attn_implementation=attn_impl,
     )

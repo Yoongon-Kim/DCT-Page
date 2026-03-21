@@ -1,14 +1,14 @@
 #!/bin/bash
 # LongBench v1 Evaluation — Baseline vs DCT Page Attention
 # Runs baseline (full attention) then sweeps top_k values.
-# Results are saved per-task under results_longbench_v1/<run_name>/.
+# Results are saved per-task under results/longbench_v1/<run_name>/.
 set -e
 
 # ---- Configuration ----
 BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-127500}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
-OUTPUT_DIR="${OUTPUT_DIR:-results_longbench_v1}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/longbench_v1}"
 
 # Optional: specify tasks (space-separated), empty = all 16 English tasks
 # Example: TASKS="narrativeqa hotpotqa gov_report" ./run_longbench_v1.sh
