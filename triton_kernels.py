@@ -1235,7 +1235,7 @@ def build_assemble_cache(
     total_len = sink_len + middle_len + recent_len
 
     BLOCK_D = triton.next_power_of_2(head_dim)
-    BLOCK_T_FULL = 64
+    BLOCK_T_FULL = min(128, max(64, triton.next_power_of_2(page_size)))
     sink_tiles = (sink_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
     page_tiles = (page_size + BLOCK_T_FULL - 1) // BLOCK_T_FULL
     recent_tiles = (recent_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
@@ -1384,7 +1384,7 @@ def build_assemble_drop_stride_cache(
     sink_len = sink_k.shape[2]
 
     BLOCK_D = triton.next_power_of_2(head_dim)
-    BLOCK_T_FULL = 64
+    BLOCK_T_FULL = min(128, max(64, triton.next_power_of_2(page_size)))
     sink_tiles = (sink_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
     page_tiles = (page_size + BLOCK_T_FULL - 1) // BLOCK_T_FULL
 
@@ -1570,7 +1570,7 @@ def assemble_kv_drop_triton(
         rope_stride_t = 0
 
     with torch.cuda.device(device):
-        BLOCK_T_FULL = 64
+        BLOCK_T_FULL = min(128, max(64, triton.next_power_of_2(page_size)))
         sink_tiles = (sink_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
         page_tiles = (page_size + BLOCK_T_FULL - 1) // BLOCK_T_FULL
         recent_tiles = (recent_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
