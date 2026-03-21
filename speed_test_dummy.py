@@ -320,7 +320,7 @@ def parse_args():
     dct.add_argument("--group_agg_method", default="mean",
                      choices=["mean", "max", "topp"])
     dct.add_argument("--unselected_mode", default="drop",
-                     choices=["drop", "compressed"])
+                     choices=["drop", "compressed", "hybrid"])
     dct.add_argument("--no_continuous_rope", action="store_true",
                      help="Disable continuous RoPE (enabled by default)")
     dct.add_argument("--no_triton", action="store_true",

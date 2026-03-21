@@ -11,7 +11,7 @@ class DCTPageConfig:
     proxy_frequency_layout: str = "low"  # "low" | "low_high" | "low_mid_high" | "spread"
     scoring_method: str = "max"    # "mean" | "max" | "sum" — reduction over compressed tokens within a page
     group_agg_method: str = "mean" # "mean" | "max" | "topp" — aggregation of per-head scores within a GQA group
-    unselected_mode: str = "drop"  # "drop" | "compressed"
+    unselected_mode: str = "drop"  # "drop" | "compressed" | "hybrid"
     continuous_rope: bool = True       # Store KV before RoPE, apply continuous RoPE after assembly
     score_use_direct_spectral_proxy: bool = False  # Score with truncated DCT coefficients directly instead of IDCT-reconstructed proxies
     score_use_haar_proxy: bool = True  # Default score path: Haar lowpass block proxies instead of DCT IDCT proxies

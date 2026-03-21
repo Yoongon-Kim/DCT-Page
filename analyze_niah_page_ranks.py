@@ -102,7 +102,7 @@ def parse_args() -> argparse.Namespace:
         "--dct_unselected_mode",
         type=str,
         default="drop",
-        choices=["drop", "compressed"],
+        choices=["drop", "compressed", "hybrid"],
     )
     parser.add_argument("--dct_score_use_direct_spectral_proxy", action="store_true")
     parser.add_argument(

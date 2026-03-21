@@ -84,7 +84,7 @@ def parse_args():
                         choices=["mean", "max", "topp"],
                         help="How to aggregate per-head scores within a GQA group")
     parser.add_argument("--unselected_mode", type=str, default="drop",
-                        choices=["drop", "compressed"])
+                        choices=["drop", "compressed", "hybrid"])
     parser.add_argument("--no_continuous_rope", action="store_true",
                         help="Disable continuous RoPE (enabled by default)")
     parser.add_argument("--no_triton", action="store_true",
@@ -160,7 +160,7 @@ def compute_effective_len(input_len, args):
 
     if args.unselected_mode == "drop":
         return args.sink_size + top_k * args.page_size + actual_recent
-    elif args.unselected_mode == "compressed":
+    elif args.unselected_mode in {"compressed", "hybrid"}:
         comp_size = max(1, int(args.page_size * args.compress_ratio))
         num_unselected = num_pages - top_k
         return args.sink_size + top_k * args.page_size + num_unselected * comp_size + actual_recent

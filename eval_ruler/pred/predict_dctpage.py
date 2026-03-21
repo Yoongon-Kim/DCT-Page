@@ -51,7 +51,7 @@ def parse_args():
     parser.add_argument("--dct_group_agg_method", type=str, default="mean",
                         choices=["mean", "max", "topp"])
     parser.add_argument("--dct_unselected_mode", type=str, default="drop",
-                        choices=["drop", "compressed"])
+                        choices=["drop", "compressed", "hybrid"])
     parser.add_argument("--dct_no_continuous_rope", action="store_true")
     parser.add_argument("--dct_no_triton", action="store_true")
 
