@@ -384,12 +384,12 @@ def profiled_dct_page_attention_forward(
         score_query_states = query_states_rope
         if cfg.score_use_direct_spectral_proxy:
             score_comp_k = _update_score_spectral_key_cache(self, paged_k, num_pages, comp_size, cfg)
-        elif cfg.score_use_haar_proxy:
-            score_comp_k = _update_score_haar_key_cache(self, paged_k, num_pages, comp_size, cfg)
         elif cfg.score_use_haar_mixed_proxy:
             score_comp_k = _update_score_haar_mixed_key_cache(self, paged_k, num_pages, comp_size, cfg)
         elif cfg.score_use_hadamard_proxy:
             score_comp_k = _update_score_hadamard_key_cache(self, paged_k, num_pages, comp_size, cfg)
+        elif cfg.score_use_haar_proxy:
+            score_comp_k = _update_score_haar_key_cache(self, paged_k, num_pages, comp_size, cfg)
         else:
             score_comp_k = _update_score_key_cache(self, paged_k, num_pages, comp_size, cfg)
 

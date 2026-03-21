@@ -1441,16 +1441,16 @@ def dct_page_attention_forward(
             score_comp_k = _update_score_spectral_key_cache(
                 self, paged_k, num_pages, comp_size, cfg
             )
-        elif cfg.score_use_haar_proxy:
-            score_comp_k = _update_score_haar_key_cache(
-                self, paged_k, num_pages, comp_size, cfg
-            )
         elif cfg.score_use_haar_mixed_proxy:
             score_comp_k = _update_score_haar_mixed_key_cache(
                 self, paged_k, num_pages, comp_size, cfg
             )
         elif cfg.score_use_hadamard_proxy:
             score_comp_k = _update_score_hadamard_key_cache(
+                self, paged_k, num_pages, comp_size, cfg
+            )
+        elif cfg.score_use_haar_proxy:
+            score_comp_k = _update_score_haar_key_cache(
                 self, paged_k, num_pages, comp_size, cfg
             )
         else:
@@ -1621,7 +1621,7 @@ def replace_qwen2_attn(
     unselected_mode="drop",
     continuous_rope=True,
     score_use_direct_spectral_proxy=False,
-    score_use_haar_proxy=False,
+    score_use_haar_proxy=True,
     score_use_haar_mixed_proxy=False,
     score_use_hadamard_proxy=False,
     select_with_oracle_page_scores=False,
@@ -1686,7 +1686,7 @@ def replace_llama_attn(
     unselected_mode="drop",
     continuous_rope=True,
     score_use_direct_spectral_proxy=False,
-    score_use_haar_proxy=False,
+    score_use_haar_proxy=True,
     score_use_haar_mixed_proxy=False,
     score_use_hadamard_proxy=False,
     select_with_oracle_page_scores=False,

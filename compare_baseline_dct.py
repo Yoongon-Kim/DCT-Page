@@ -91,12 +91,24 @@ def parse_args() -> argparse.Namespace:
         choices=["drop", "compressed"],
     )
     parser.add_argument("--dct_score_use_direct_spectral_proxy", action="store_true")
-    parser.add_argument("--dct_score_use_haar_proxy", action="store_true")
+    parser.add_argument(
+        "--dct_score_use_haar_proxy",
+        dest="dct_score_use_haar_proxy",
+        action="store_true",
+        help="Use Haar lowpass score proxies (default).",
+    )
+    parser.add_argument(
+        "--dct_score_use_low_proxy",
+        dest="dct_score_use_haar_proxy",
+        action="store_false",
+        help="Use the original low-frequency DCT IDCT score proxy instead of Haar.",
+    )
     parser.add_argument("--dct_score_use_haar_mixed_proxy", action="store_true")
     parser.add_argument("--dct_score_use_hadamard_proxy", action="store_true")
     parser.add_argument("--dct_select_with_oracle_page_scores", action="store_true")
     parser.add_argument("--dct_no_continuous_rope", action="store_true")
     parser.add_argument("--dct_no_triton", action="store_true")
+    parser.set_defaults(dct_score_use_haar_proxy=True)
     return parser.parse_args()
 
 
