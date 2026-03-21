@@ -251,7 +251,7 @@ def profiled_dct_page_attention_forward(
         # Record events on the correct device's stream (critical for multi-GPU)
         _dev = hidden_states.device
         _stream = torch.cuda.current_stream(_dev)
-        ev = [torch.cuda.Event(enable_timing=True) for _ in range(11)]
+        ev = [torch.cuda.Event(enable_timing=True) for _ in range(12)]
         _cpu_ts = []
 
         def _rec(i):
@@ -359,7 +359,7 @@ def profiled_dct_page_attention_forward(
     if _enabled:
         _rec(4)
 
-    # Step 5: score pages
+    # Step 5a: score cache update
     from triton_kernels import score_pages_triton, topk_sort_triton
 
     _num_kv_heads = self.config.num_key_value_heads  # 8 for Llama-3.1-8B
@@ -392,6 +392,10 @@ def profiled_dct_page_attention_forward(
         else:
             score_comp_k = _update_score_key_cache(self, paged_k, num_pages, comp_size, cfg)
 
+    if _enabled:
+        _rec(5)
+
+    # Step 5b: score pages kernel
     page_scores = score_pages_triton(
         score_query_states, score_comp_k,
         cfg.scoring_method, cfg.group_agg_method,
@@ -400,7 +404,7 @@ def profiled_dct_page_attention_forward(
     )
 
     if _enabled:
-        _rec(5)
+        _rec(6)
 
     # Step 6: topk
     actual_top_k = min(cfg.top_k, num_pages)
@@ -419,7 +423,7 @@ def profiled_dct_page_attention_forward(
     selected_indices = topk_sort_triton(page_scores, actual_top_k, out=self._topk_out_buf)
 
     if _enabled:
-        _rec(6)
+        _rec(7)
 
     if cfg.unselected_mode == "drop":
         assembled_len = cfg.sink_size + actual_top_k * cfg.page_size + actual_recent
@@ -456,7 +460,7 @@ def profiled_dct_page_attention_forward(
         raise NotImplementedError("profile_decode only supports the current drop-mode default path.")
 
     if _enabled:
-        _rec(7)
+        _rec(8)
 
     if cfg.continuous_rope:
         if query_states_rope is None:
@@ -473,7 +477,7 @@ def profiled_dct_page_attention_forward(
         )
 
     if _enabled:
-        _rec(8)
+        _rec(9)
 
     attn_output = F.scaled_dot_product_attention(
         query_states, final_k, final_v,
@@ -484,16 +488,17 @@ def profiled_dct_page_attention_forward(
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
 
     if _enabled:
-        _rec(9)
+        _rec(10)
 
     attn_output = self.o_proj(attn_output)
 
     if _enabled:
-        _rec(10)
+        _rec(11)
         step_names = [
             "1_qkv", "2_kv_update", "3_segment",
-            "4_compress", "5_score_pages", "6_topk",
-            "7_assemble_drop", "8_final_k_original_rope", "9_sdpa", "10_o_proj",
+            "4_compress", "5a_score_cache_update", "5b_score_pages_kernel",
+            "6_topk", "7_assemble_drop", "8_final_k_original_rope",
+            "9_sdpa", "10_o_proj",
         ]
         for i, name in enumerate(step_names):
             _pending_events.append((name, ev[i], ev[i + 1]))

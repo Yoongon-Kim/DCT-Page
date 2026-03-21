@@ -123,31 +123,30 @@ def score_pages_triton(
     assert q_len == 1, "score_pages_triton only supports decode (q_len=1)"
 
     query = query_states.squeeze(2).reshape(bsz, num_kv_heads, num_kv_groups, head_dim).contiguous()
-    compressed_keys = compressed_keys.contiguous()
+    # The score cache may be a non-contiguous prefix slice of a growable page-capacity
+    # buffer. Consume its runtime strides directly to avoid copying the full cache
+    # every decode step.
+    assert compressed_keys.stride(-1) == 1, "score_pages_triton expects head_dim-contiguous keys"
 
     if out is not None:
         page_scores = out[:, :, :num_pages]
-        ps_stride_bh = out.shape[2]   # stride(1) = alloc capacity
     else:
         page_scores = torch.empty(
             bsz, num_kv_heads, num_pages,
             dtype=torch.float32, device=query.device,
         )
-        ps_stride_bh = num_pages
 
     BLOCK_D = triton.next_power_of_2(head_dim)
 
-    # query is contiguous [bsz, num_kv_heads, num_kv_groups, head_dim] — compute strides
-    q_stride_0 = num_kv_heads * num_kv_groups * head_dim
-    q_stride_1 = num_kv_groups * head_dim
-    q_stride_2 = head_dim
-    # compressed_keys is contiguous [bsz, num_kv_heads, num_pages, comp_size, head_dim]
-    ck_stride_3 = head_dim
-    ck_stride_2 = comp_size * head_dim
-    ck_stride_1 = num_pages * ck_stride_2
-    ck_stride_0 = num_kv_heads * ck_stride_1
-    # page_scores stride(0) based on actual buffer stride(1)
-    ps_stride_0 = num_kv_heads * ps_stride_bh
+    q_stride_0 = query.stride(0)
+    q_stride_1 = query.stride(1)
+    q_stride_2 = query.stride(2)
+    ck_stride_0 = compressed_keys.stride(0)
+    ck_stride_1 = compressed_keys.stride(1)
+    ck_stride_2 = compressed_keys.stride(2)
+    ck_stride_3 = compressed_keys.stride(3)
+    ps_stride_0 = page_scores.stride(0)
+    ps_stride_bh = page_scores.stride(1)
 
     SCORING = _SCORING_MAP[scoring_method]
     GROUP_AGG = _GROUP_AGG_MAP[group_agg_method]
