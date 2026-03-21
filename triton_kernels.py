@@ -93,6 +93,63 @@ def _score_pages_fused_kernel(
     tl.store(out_ptrs, agg_scores, mask=p_mask)
 
 
+@triton.jit
+def _score_pages_max_mean_c4_g4_kernel(
+    query_ptr,         # [bsz, num_kv_heads, 4, head_dim]
+    comp_keys_ptr,     # [bsz, num_kv_heads, num_pages, 4, head_dim]
+    out_scores_ptr,    # [bsz, num_kv_heads, num_pages]
+    q_stride_b, q_stride_h, q_stride_g,
+    ck_stride_b, ck_stride_h, ck_stride_p, ck_stride_c,
+    os_stride_b, os_stride_h,
+    num_kv_heads,
+    num_pages,
+    head_dim,
+    scaling,
+    BLOCK_D: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+):
+    """Specialized exact path for scoring=max, group_agg=mean, comp_size=4, groups=4."""
+    pid_bh = tl.program_id(0)
+    pid_pt = tl.program_id(1)
+
+    h = pid_bh % num_kv_heads
+    b = pid_bh // num_kv_heads
+
+    p_start = pid_pt * BLOCK_P
+    p_offsets = tl.arange(0, BLOCK_P)
+    p_indices = p_start + p_offsets
+    p_mask = p_indices < num_pages
+
+    d_idx = tl.arange(0, BLOCK_D)
+    d_mask = d_idx < head_dim
+
+    q_base = query_ptr + b * q_stride_b + h * q_stride_h
+    ck_base = comp_keys_ptr + b * ck_stride_b + h * ck_stride_h
+
+    q0 = tl.load(q_base + 0 * q_stride_g + d_idx, mask=d_mask, other=0.0).to(tl.float32) * scaling
+    q1 = tl.load(q_base + 1 * q_stride_g + d_idx, mask=d_mask, other=0.0).to(tl.float32) * scaling
+    q2 = tl.load(q_base + 2 * q_stride_g + d_idx, mask=d_mask, other=0.0).to(tl.float32) * scaling
+    q3 = tl.load(q_base + 3 * q_stride_g + d_idx, mask=d_mask, other=0.0).to(tl.float32) * scaling
+
+    s0 = tl.full([BLOCK_P], float("-inf"), dtype=tl.float32)
+    s1 = tl.full([BLOCK_P], float("-inf"), dtype=tl.float32)
+    s2 = tl.full([BLOCK_P], float("-inf"), dtype=tl.float32)
+    s3 = tl.full([BLOCK_P], float("-inf"), dtype=tl.float32)
+
+    mask_2d = p_mask[:, None] & d_mask[None, :]
+    for c in range(4):
+        k_ptrs = ck_base + p_indices[:, None] * ck_stride_p + c * ck_stride_c + d_idx[None, :]
+        k = tl.load(k_ptrs, mask=mask_2d, other=0.0).to(tl.float32)
+        s0 = tl.maximum(s0, tl.sum(k * q0[None, :], axis=1))
+        s1 = tl.maximum(s1, tl.sum(k * q1[None, :], axis=1))
+        s2 = tl.maximum(s2, tl.sum(k * q2[None, :], axis=1))
+        s3 = tl.maximum(s3, tl.sum(k * q3[None, :], axis=1))
+
+    agg_scores = 0.25 * (s0 + s1 + s2 + s3)
+    out_ptrs = out_scores_ptr + b * os_stride_b + h * os_stride_h + p_indices
+    tl.store(out_ptrs, agg_scores, mask=p_mask)
+
+
 _SCORING_MAP = {"max": 0, "mean": 1, "sum": 2}
 _GROUP_AGG_MAP = {"mean": 0, "max": 1}
 
@@ -122,11 +179,16 @@ def score_pages_triton(
 
     assert q_len == 1, "score_pages_triton only supports decode (q_len=1)"
 
-    query = query_states.squeeze(2).reshape(bsz, num_kv_heads, num_kv_groups, head_dim).contiguous()
+    query_3d = query_states.squeeze(2)
+    if query_3d.stride(-1) == 1 and query_3d.stride(1) == head_dim:
+        query = query_3d.view(bsz, num_kv_heads, num_kv_groups, head_dim)
+    else:
+        query = query_3d.reshape(bsz, num_kv_heads, num_kv_groups, head_dim).contiguous()
     # The score cache may be a non-contiguous prefix slice of a growable page-capacity
     # buffer. Consume its runtime strides directly to avoid copying the full cache
     # every decode step.
     assert compressed_keys.stride(-1) == 1, "score_pages_triton expects head_dim-contiguous keys"
+    assert query.stride(-1) == 1, "score_pages_triton expects head_dim-contiguous query"
 
     if out is not None:
         page_scores = out[:, :, :num_pages]
@@ -154,21 +216,40 @@ def score_pages_triton(
     num_page_tiles = (num_pages + BLOCK_P - 1) // BLOCK_P
     grid = (bsz * num_kv_heads, num_page_tiles)
 
+    use_specialized_c4_g4 = (
+        scoring_method == "max"
+        and group_agg_method == "mean"
+        and num_kv_groups == 4
+        and comp_size == 4
+    )
+
     with torch.cuda.device(query.device):
-        _score_pages_fused_kernel[grid](
-            query, compressed_keys, page_scores,
-            q_stride_0, q_stride_1, q_stride_2,
-            ck_stride_0, ck_stride_1, ck_stride_2, ck_stride_3,
-            ps_stride_0, ps_stride_bh,
-            num_kv_heads, num_pages, head_dim,
-            scaling,
-            NUM_KV_GROUPS=num_kv_groups,
-            COMP_SIZE=comp_size,
-            BLOCK_D=BLOCK_D,
-            BLOCK_P=BLOCK_P,
-            SCORING_METHOD=SCORING,
-            GROUP_AGG_METHOD=GROUP_AGG,
-        )
+        if use_specialized_c4_g4:
+            _score_pages_max_mean_c4_g4_kernel[grid](
+                query, compressed_keys, page_scores,
+                q_stride_0, q_stride_1, q_stride_2,
+                ck_stride_0, ck_stride_1, ck_stride_2, ck_stride_3,
+                ps_stride_0, ps_stride_bh,
+                num_kv_heads, num_pages, head_dim,
+                scaling,
+                BLOCK_D=BLOCK_D,
+                BLOCK_P=BLOCK_P,
+            )
+        else:
+            _score_pages_fused_kernel[grid](
+                query, compressed_keys, page_scores,
+                q_stride_0, q_stride_1, q_stride_2,
+                ck_stride_0, ck_stride_1, ck_stride_2, ck_stride_3,
+                ps_stride_0, ps_stride_bh,
+                num_kv_heads, num_pages, head_dim,
+                scaling,
+                NUM_KV_GROUPS=num_kv_groups,
+                COMP_SIZE=comp_size,
+                BLOCK_D=BLOCK_D,
+                BLOCK_P=BLOCK_P,
+                SCORING_METHOD=SCORING,
+                GROUP_AGG_METHOD=GROUP_AGG,
+            )
 
     return page_scores
 
