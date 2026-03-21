@@ -8,6 +8,7 @@ class DCTPageConfig:
     sink_size: int = 4             # Initial tokens always kept (attention sink)
     recent_size: int = 128         # Recent tokens always kept (absorbs last partial page)
     compress_ratio: float = 0.03125   # Per-page compression (32 -> 1 token)
+    min_decode_kv_len_for_paging: int = 8192  # Fallback to baseline decode attention below this KV length
     proxy_frequency_layout: str = "low"  # "low" | "low_high" | "low_mid_high" | "spread"
     scoring_method: str = "max"    # "mean" | "max" | "sum" — reduction over compressed tokens within a page
     group_agg_method: str = "mean" # "mean" | "max" | "topp" — aggregation of per-head scores within a GQA group

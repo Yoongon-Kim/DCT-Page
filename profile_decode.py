@@ -297,7 +297,10 @@ def profiled_dct_page_attention_forward(
         _rec(2)
 
     # Check if DCT path is active
-    min_len_for_paging = cfg.sink_size + cfg.page_size * (cfg.top_k + 1) + cfg.recent_size
+    min_len_for_paging = max(
+        cfg.sink_size + cfg.page_size * (cfg.top_k + 1) + cfg.recent_size,
+        getattr(cfg, "min_decode_kv_len_for_paging", 0),
+    )
     if kv_len < min_len_for_paging:
         if cfg.continuous_rope:
             if query_states_rope is None:
@@ -493,7 +496,7 @@ def profiled_dct_page_attention_forward(
         is_causal=False,
         enable_gqa=True,
     )
-
+    attn_output = attn_output.transpose(1, 2).contiguous()
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
 
     if _enabled:

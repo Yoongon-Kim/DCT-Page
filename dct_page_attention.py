@@ -955,6 +955,7 @@ def _update_score_haar_key_cache(attn_module, paged_k, num_pages, comp_size, cfg
 
     cached_k = getattr(attn_module, '_dct_score_haar_k_cache', None)
     n_cached = getattr(attn_module, '_dct_score_haar_n_pages_cached', 0)
+    capacity = getattr(attn_module, '_dct_score_haar_cache_capacity', 0)
 
     if (
         cached_k is None
@@ -964,7 +965,9 @@ def _update_score_haar_key_cache(attn_module, paged_k, num_pages, comp_size, cfg
     ):
         attn_module._dct_score_haar_k_cache = None
         attn_module._dct_score_haar_n_pages_cached = 0
+        attn_module._dct_score_haar_cache_capacity = 0
         n_cached = 0
+        capacity = 0
 
     n_new = num_pages - n_cached
     if n_new > 0:
@@ -978,23 +981,32 @@ def _update_score_haar_key_cache(attn_module, paged_k, num_pages, comp_size, cfg
             cfg.sink_size,
             new_proxy_k.device,
         ).reshape(-1)
-        cos_proxy, sin_proxy = _compute_rope_cos_sin(
-            positions, attn_module.config, new_proxy_k.device, new_proxy_k.dtype
+        max_pos = int(positions.max().item()) + 1
+        cos_table, sin_table = _get_or_build_original_position_rope_tables(
+            attn_module, max_pos, attn_module.config, new_proxy_k.device, new_proxy_k.dtype
         )
+        cos_proxy = cos_table[positions].unsqueeze(0).unsqueeze(0)
+        sin_proxy = sin_table[positions].unsqueeze(0).unsqueeze(0)
         flat_proxy_k = new_proxy_k.reshape(bsz, num_kv_heads, n_new * comp_size, head_dim)
         flat_proxy_k = _apply_rope(flat_proxy_k, cos_proxy, sin_proxy)
         new_score_proxy_k = flat_proxy_k.reshape(bsz, num_kv_heads, n_new, comp_size, head_dim)
 
-        if attn_module._dct_score_haar_k_cache is None:
-            attn_module._dct_score_haar_k_cache = new_score_proxy_k
-        else:
-            attn_module._dct_score_haar_k_cache = torch.cat(
-                [attn_module._dct_score_haar_k_cache, new_score_proxy_k], dim=2
+        if num_pages > capacity:
+            new_capacity = _next_page_capacity(num_pages, capacity)
+            new_cache = torch.empty(
+                bsz, num_kv_heads, new_capacity, comp_size, head_dim,
+                dtype=new_score_proxy_k.dtype, device=new_score_proxy_k.device,
             )
+            if n_cached > 0 and attn_module._dct_score_haar_k_cache is not None:
+                new_cache[:, :, :n_cached].copy_(attn_module._dct_score_haar_k_cache[:, :, :n_cached])
+            attn_module._dct_score_haar_k_cache = new_cache
+            attn_module._dct_score_haar_cache_capacity = new_capacity
+
+        attn_module._dct_score_haar_k_cache[:, :, n_cached:num_pages].copy_(new_score_proxy_k)
 
         attn_module._dct_score_haar_n_pages_cached = num_pages
 
-    return attn_module._dct_score_haar_k_cache
+    return attn_module._dct_score_haar_k_cache[:, :, :num_pages]
 
 
 def _update_exec_hybrid_proxy_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg):
@@ -1444,11 +1456,15 @@ def dct_page_attention_forward(
     if num_score_proxy_modes > 1:
         raise ValueError(
             "Only one score-time proxy rope mode may be enabled at once."
-        )
+    )
     input_shape = hidden_states.shape[:-1] # (bsz, q_len)
     hidden_shape = (*input_shape, -1, self.head_dim) # (bsz, q_len, num_heads, head_dim)
     bsz, q_len = input_shape     
     _maybe_reset_dct_runtime_state(self, past_key_value)
+    min_len_for_paging = max(
+        cfg.sink_size + cfg.page_size * (cfg.top_k + 1) + cfg.recent_size,
+        getattr(cfg, "min_decode_kv_len_for_paging", 0),
+    )
 
     if q_len>1:
         # Step 1: Q/K/V projection
@@ -1533,9 +1549,6 @@ def dct_page_attention_forward(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
         kv_len = key_states.shape[2]
-    
-    # Check if DCT path is active
-    min_len_for_paging = cfg.sink_size + cfg.page_size * (cfg.top_k + 1) + cfg.recent_size
     
     # No need to do dct paging since there isn't enough tokens.
     if kv_len < min_len_for_paging:
@@ -1836,6 +1849,7 @@ def replace_qwen2_attn(
     sink_size=4,
     recent_size=128,
     compress_ratio=0.03125,
+    min_decode_kv_len_for_paging=8192,
     proxy_frequency_layout="low",
     scoring_method="max",
     group_agg_method="mean",
@@ -1860,6 +1874,7 @@ def replace_qwen2_attn(
         sink_size=sink_size,
         recent_size=recent_size,
         compress_ratio=compress_ratio,
+        min_decode_kv_len_for_paging=min_decode_kv_len_for_paging,
         proxy_frequency_layout=proxy_frequency_layout,
         scoring_method=scoring_method,
         group_agg_method=group_agg_method,
@@ -1901,6 +1916,7 @@ def replace_llama_attn(
     sink_size=4,
     recent_size=128,
     compress_ratio=0.03125,
+    min_decode_kv_len_for_paging=8192,
     proxy_frequency_layout="low",
     scoring_method="max",
     group_agg_method="mean",
@@ -1927,6 +1943,7 @@ def replace_llama_attn(
         sink_size=sink_size,
         recent_size=recent_size,
         compress_ratio=compress_ratio,
+        min_decode_kv_len_for_paging=min_decode_kv_len_for_paging,
         proxy_frequency_layout=proxy_frequency_layout,
         scoring_method=scoring_method,
         group_agg_method=group_agg_method,
