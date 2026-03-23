@@ -1,0 +1,4 @@
+from seer_attn.decode_sparse.qwen2.modeling_qwen2_seerattn_inference import SeerDecodingQwen2ForCausalLM
+from seer_attn.decode_sparse.qwen3.modeling_qwen3_seerattn_inference import SeerDecodingQwen3ForCausalLM
+
+__all__ = ["SeerDecodingQwen2ForCausalLM", "SeerDecodingQwen3ForCausalLM"]

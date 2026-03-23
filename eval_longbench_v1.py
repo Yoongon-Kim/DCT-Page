@@ -378,11 +378,11 @@ def parse_args():
 
     # Mode
     parser.add_argument("--mode", type=str, required=True,
-                        choices=["baseline", "page_attention"])
+                        choices=["baseline", "page_attention", "seer_attention", "multipole_attention"])
 
     # Model
     parser.add_argument("--base_model", type=str,
-                        default="Qwen/Qwen2.5-7B-Instruct")
+                        default="meta-llama/Llama-3.1-8B-Instruct")
     parser.add_argument("--max_input_len", type=int, default=127500)
     parser.add_argument("--max_new_tokens_override", type=int, default=-1,
                         help="Override per-task max_new_tokens (-1 = use official)")
@@ -424,8 +424,14 @@ def parse_args():
         args.tasks = ENGLISH_TASKS
 
     if args.run_name is None:
-        args.run_name = ("baseline" if args.mode == "baseline"
-                         else f"page_attn_topk{args.top_k}")
+        if args.mode == "baseline":
+            args.run_name = "baseline"
+        elif args.mode == "seer_attention":
+            args.run_name = "seer_attention"
+        elif args.mode == "multipole_attention":
+            args.run_name = "multipole_attention"
+        else:
+            args.run_name = f"page_attn_topk{args.top_k}"
 
     return args
 
@@ -590,24 +596,48 @@ def main():
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
             )
-    else:
+    elif args.mode == "multipole_attention":
+        from multipole_attn import replace_qwen2_attn_multipole
+        from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
+        replace_qwen2_attn_multipole(MULTIPOLE_ATTN_CONFIG)
+    elif args.mode not in ("seer_attention",):
         print("Baseline mode: full attention (no monkey-patch)")
 
-    # Use sdpa for both modes — prefill needs memory-efficient attention for
-    # long sequences; the DCT page attention monkey-patch handles decode itself.
-    attn_impl = "sdpa"
-
     # Load tokenizer + model
-    print(f"Loading model: {args.base_model} (attn: {attn_impl})")
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.base_model,
-        dtype=torch.bfloat16,
-        device_map="auto",
-        attn_implementation=attn_impl,
-    )
-    model.eval()
-    print(f"Model loaded. Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
+    if args.mode == "seer_attention":
+        from seer_attn.config import SEER_ATTN_CONFIG
+        from seer_attn import SeerDecodingQwen3ForCausalLM
+
+        seer_model = SEER_ATTN_CONFIG["seer_model"]
+        print(f"Loading SeerAttention-R model: {seer_model}")
+        model = SeerDecodingQwen3ForCausalLM.from_pretrained(
+            seer_model,
+            torch_dtype=torch.bfloat16,
+            seerattn_sparsity_method=SEER_ATTN_CONFIG["sparsity_method"],
+            seerattn_token_budget=SEER_ATTN_CONFIG["token_budget"],
+            seerattn_threshold=SEER_ATTN_CONFIG["threshold"],
+            seerattn_start_layer=SEER_ATTN_CONFIG["start_layer"],
+        ).cuda()
+        model.eval()
+        tokenizer = AutoTokenizer.from_pretrained(model.config.base_model)
+        print(f"Model loaded. Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
+    else:
+        attn_impl = "sdpa"
+        print(f"Loading model: {args.base_model} (attn: {attn_impl})")
+        tokenizer = AutoTokenizer.from_pretrained(args.base_model)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.base_model,
+            dtype=torch.bfloat16,
+            device_map="auto",
+            attn_implementation=attn_impl,
+        )
+        model.eval()
+        print(f"Model loaded. Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
+
+        if args.mode == "multipole_attention":
+            from multipole_attn import init_multipole_layers
+            init_multipole_layers(model)
+            print("Multipole attention layers initialized.")
 
     # Evaluate each task
     all_task_results = {}
@@ -640,6 +670,12 @@ def main():
         summary["scoring_method"] = args.scoring_method
         summary["group_agg_method"] = args.group_agg_method
         summary["unselected_mode"] = args.unselected_mode
+    elif args.mode == "seer_attention":
+        from seer_attn.config import SEER_ATTN_CONFIG
+        summary["seer_attn_config"] = SEER_ATTN_CONFIG
+    elif args.mode == "multipole_attention":
+        from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
+        summary["multipole_attn_config"] = MULTIPOLE_ATTN_CONFIG
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
 
