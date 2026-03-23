@@ -440,6 +440,11 @@ def dct_page_attention_forward(
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
 
+        # Reset compressed page cache from prior generate() call
+        self._dct_comp_k_cache = None
+        self._dct_comp_v_cache = None
+        self._dct_n_pages_cached = 0
+
         # Cache the model's RoPE table (correctly handles rope_scaling).
         # Pre-allocate with extra slots so decode extends are O(1) writes.
         # cos/sin shape from position_embeddings: [bsz, seq_len, head_dim]
@@ -483,7 +488,7 @@ def dct_page_attention_forward(
     # Check if DCT path is active
     min_len_for_paging = cfg.sink_size + cfg.page_size * (cfg.top_k + 1) + cfg.recent_size
     
-    # No need to do dct paging since there isn't enough tokens.
+    # No need to do dct paging since there aren't enough tokens.
     if kv_len < min_len_for_paging:
         print("FallBackk!!!!!!!!!!!")
         all_pos = torch.arange(kv_len, device=key_cached.device)
