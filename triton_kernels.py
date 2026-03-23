@@ -208,7 +208,55 @@ def _score_pages_c1_g4_kernel(
 
 
 _SCORING_MAP = {"max": 0, "mean": 1, "sum": 2}
-_GROUP_AGG_MAP = {"mean": 0, "max": 1}
+_GROUP_AGG_MAP = {"mean": 0, "max": 1, "topp": 1}
+
+
+def _score_pages_torch_fallback(
+    query_states: torch.Tensor,
+    compressed_keys: torch.Tensor,
+    scoring_method: str,
+    group_agg_method: str,
+    num_kv_groups: int,
+    out: torch.Tensor = None,
+) -> torch.Tensor:
+    bsz, _num_heads, q_len, head_dim = query_states.shape
+    _, num_kv_heads, num_pages, _comp_size, _ = compressed_keys.shape
+    assert q_len == 1, "_score_pages_torch_fallback only supports decode (q_len=1)"
+
+    query_3d = query_states.squeeze(2)
+    if query_3d.stride(-1) == 1 and query_3d.stride(1) == head_dim:
+        query = query_3d.view(bsz, num_kv_heads, num_kv_groups, head_dim)
+    else:
+        query = query_3d.reshape(bsz, num_kv_heads, num_kv_groups, head_dim).contiguous()
+
+    q = query.to(torch.float32) * (head_dim ** -0.5)
+    k = compressed_keys.to(torch.float32)
+    group_token_scores = torch.einsum("bhgd,bhpcd->bhgpc", q, k)
+
+    if scoring_method == "max":
+        group_page_scores = group_token_scores.max(dim=-1).values
+    elif scoring_method == "mean":
+        group_page_scores = group_token_scores.mean(dim=-1)
+    elif scoring_method == "sum":
+        group_page_scores = group_token_scores.sum(dim=-1)
+    else:
+        raise ValueError(f"Unsupported scoring_method: {scoring_method}")
+
+    if group_agg_method == "mean":
+        page_scores = group_page_scores.mean(dim=2)
+    elif group_agg_method == "max":
+        page_scores = group_page_scores.max(dim=2).values
+    elif group_agg_method == "topp":
+        k_top = min(2, num_kv_groups)
+        page_scores = group_page_scores.topk(k_top, dim=2).values.mean(dim=2)
+    else:
+        raise ValueError(f"Unsupported group_agg_method: {group_agg_method}")
+
+    if out is not None:
+        out_view = out[:, :, :num_pages]
+        out_view.copy_(page_scores)
+        return out_view
+    return page_scores.contiguous()
 
 
 def score_pages_triton(
@@ -266,6 +314,16 @@ def score_pages_triton(
     ck_stride_3 = compressed_keys.stride(3)
     ps_stride_0 = page_scores.stride(0)
     ps_stride_bh = page_scores.stride(1)
+
+    if group_agg_method == "topp":
+        return _score_pages_torch_fallback(
+            query_states,
+            compressed_keys,
+            scoring_method,
+            group_agg_method,
+            num_kv_groups,
+            out=out,
+        )
 
     SCORING = _SCORING_MAP[scoring_method]
     GROUP_AGG = _GROUP_AGG_MAP[group_agg_method]
