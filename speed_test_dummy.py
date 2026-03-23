@@ -318,7 +318,7 @@ def parse_args():
     dct.add_argument("--compress_ratio", type=float, default=0.03125)
     dct.add_argument("--scoring_method", default="max", choices=["mean", "max"])
     dct.add_argument("--group_agg_method", default="mean",
-                     choices=["mean", "max", "topp"])
+                     choices=["mean", "max", "meanmax", "top2mean", "topp"])
     dct.add_argument("--unselected_mode", default="drop",
                      choices=["drop", "compressed", "hybrid"])
     dct.add_argument("--no_continuous_rope", action="store_true",
@@ -382,7 +382,7 @@ def benchmark_dummy(model, tokenizer, args, label, context_lengths):
             model,
             tokenizer,
             warmup_ids,
-            min(16, args.max_new_tokens),
+            args.max_new_tokens,
             0,
             use_pre_alloc=use_pre_alloc,
             chunk_size=args.chunk_size,

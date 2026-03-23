@@ -794,14 +794,19 @@ def _project_pages_to_spectral(attn_module, paged_x, comp_size):
 
 def _project_pages_to_haar_lowpass(attn_module, paged_x, comp_size):
     """Project pages to coarse Haar lowpass block means."""
+    page_size = paged_x.shape[3]
     if comp_size == 1:
         return paged_x.mean(dim=3, keepdim=True)
-    page_size = paged_x.shape[3]
+    # The Haar lowpass projection is exactly a contiguous block mean. When the
+    # page splits evenly into `comp_size` blocks (the default fast paths like
+    # 32->4 and 128->4), avoid the projection-matrix einsum entirely.
+    if page_size % comp_size == 0:
+        block_size = page_size // comp_size
+        return paged_x.reshape(*paged_x.shape[:3], comp_size, block_size, paged_x.shape[4]).mean(dim=4)
     M = _get_or_build_haar_projection_matrix(
         attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
     )
     return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
-
 
 def _project_pages_to_haar_mixed(attn_module, paged_x, comp_size):
     """Project pages to mixed global/detail Haar proxies."""
@@ -1025,7 +1030,6 @@ def _update_score_haar_key_cache(attn_module, paged_k, num_pages, comp_size, cfg
         attn_module._dct_score_haar_n_pages_cached = num_pages
 
     return attn_module._dct_score_haar_k_cache[:, :, :num_pages]
-
 
 def _update_exec_hybrid_proxy_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg):
     """Maintain Haar lowpass execution proxies for hybrid unselected-page attention."""
