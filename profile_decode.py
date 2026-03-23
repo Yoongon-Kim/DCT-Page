@@ -275,15 +275,32 @@ def profiled_dct_page_attention_forward(
 
     # Step 2: KV cache update
     cos, sin = position_embeddings
+    force_baseline_decode = False
     if cfg.continuous_rope:
+        base_context_len = 0
         if past_key_value is not None:
-            # cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_cached, value_cached = past_key_value.update(
-                key_states, value_states, self.layer_idx, # cache_kwargs # commented out because we will compute rope table later.
-            )
+            base_context_len = int(past_key_value.layers[self.layer_idx].get_seq_length())
+        force_baseline_decode = getattr(self, "_dct_force_baseline_decode", None)
+        if force_baseline_decode is None:
+            force_baseline_decode = base_context_len <= min_len_for_paging
+            self._dct_force_baseline_decode = force_baseline_decode
+
+        if force_baseline_decode:
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            if past_key_value is not None:
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_states, value_states = past_key_value.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs
+                )
+            kv_len = key_states.shape[2]
         else:
-            key_cached, value_cached = key_states, value_states
-        kv_len = key_cached.shape[2]
+            if past_key_value is not None:
+                key_cached, value_cached = past_key_value.update(
+                    key_states, value_states, self.layer_idx,
+                )
+            else:
+                key_cached, value_cached = key_states, value_states
+            kv_len = key_cached.shape[2]
     else:
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         if past_key_value is not None:
@@ -297,30 +314,10 @@ def profiled_dct_page_attention_forward(
         _rec(2)
 
     # Check if DCT path is active
-    min_len_for_paging = max(
-        cfg.sink_size + cfg.page_size * (cfg.top_k + 1) + cfg.recent_size,
-        getattr(cfg, "min_decode_kv_len_for_paging", 0),
-    )
-    if kv_len < min_len_for_paging:
-        if cfg.continuous_rope:
-            if query_states_rope is None:
-                query_states_rope = _apply_decode_query_rope(self, query_states, cos, sin, cfg)
-            cos_all, sin_all = _get_or_build_original_position_rope_tables(
-                self, kv_len, self.config, key_cached.device, key_cached.dtype
-            )
-            attn_q = query_states_rope
-            attn_k = _apply_rope(
-                key_cached,
-                cos_all.unsqueeze(0).unsqueeze(0),
-                sin_all.unsqueeze(0).unsqueeze(0),
-            )
-            attn_v = value_cached
-        else:
-            attn_q, attn_k, attn_v = query_states, key_states, value_states
-
+    if force_baseline_decode:
         attention_interface = _get_attention_interface(self)
         attn_output, attn_weights = attention_interface(
-            self, attn_q, attn_k, attn_v, attention_mask,
+            self, query_states, key_states, value_states, attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=getattr(self, "sliding_window", None), **kwargs,

@@ -794,6 +794,8 @@ def _project_pages_to_spectral(attn_module, paged_x, comp_size):
 
 def _project_pages_to_haar_lowpass(attn_module, paged_x, comp_size):
     """Project pages to coarse Haar lowpass block means."""
+    if comp_size == 1:
+        return paged_x.mean(dim=3, keepdim=True)
     page_size = paged_x.shape[3]
     M = _get_or_build_haar_projection_matrix(
         attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
@@ -972,24 +974,40 @@ def _update_score_haar_key_cache(attn_module, paged_k, num_pages, comp_size, cfg
     n_new = num_pages - n_cached
     if n_new > 0:
         new_k = paged_k[:, :, n_cached:num_pages]
-        new_proxy_k = _project_pages_to_haar_lowpass(attn_module, new_k, comp_size)
-        positions = _haar_proxy_block_center_positions(
-            n_cached,
-            n_new,
-            cfg.page_size,
-            comp_size,
-            cfg.sink_size,
-            new_proxy_k.device,
-        ).reshape(-1)
-        max_pos = int(positions.max().item()) + 1
-        cos_table, sin_table = _get_or_build_original_position_rope_tables(
-            attn_module, max_pos, attn_module.config, new_proxy_k.device, new_proxy_k.dtype
-        )
-        cos_proxy = cos_table[positions].unsqueeze(0).unsqueeze(0)
-        sin_proxy = sin_table[positions].unsqueeze(0).unsqueeze(0)
-        flat_proxy_k = new_proxy_k.reshape(bsz, num_kv_heads, n_new * comp_size, head_dim)
-        flat_proxy_k = _apply_rope(flat_proxy_k, cos_proxy, sin_proxy)
-        new_score_proxy_k = flat_proxy_k.reshape(bsz, num_kv_heads, n_new, comp_size, head_dim)
+        if comp_size == 1:
+            new_proxy_k = new_k.mean(dim=3, keepdim=True)
+            page_ids = torch.arange(
+                n_cached, num_pages, device=new_proxy_k.device, dtype=torch.long
+            )
+            center_offset = (cfg.page_size - 1) // 2
+            positions = cfg.sink_size + page_ids * cfg.page_size + center_offset
+            max_pos = int(positions[-1].item()) + 1
+            cos_table, sin_table = _get_or_build_original_position_rope_tables(
+                attn_module, max_pos, attn_module.config, new_proxy_k.device, new_proxy_k.dtype
+            )
+            cos_proxy = cos_table.index_select(0, positions).view(1, 1, n_new, head_dim)
+            sin_proxy = sin_table.index_select(0, positions).view(1, 1, n_new, head_dim)
+            flat_proxy_k = _apply_rope(new_proxy_k.squeeze(3), cos_proxy, sin_proxy)
+            new_score_proxy_k = flat_proxy_k.unsqueeze(3)
+        else:
+            new_proxy_k = _project_pages_to_haar_lowpass(attn_module, new_k, comp_size)
+            positions = _haar_proxy_block_center_positions(
+                n_cached,
+                n_new,
+                cfg.page_size,
+                comp_size,
+                cfg.sink_size,
+                new_proxy_k.device,
+            ).reshape(-1)
+            max_pos = int(positions.max().item()) + 1
+            cos_table, sin_table = _get_or_build_original_position_rope_tables(
+                attn_module, max_pos, attn_module.config, new_proxy_k.device, new_proxy_k.dtype
+            )
+            cos_proxy = cos_table[positions].unsqueeze(0).unsqueeze(0)
+            sin_proxy = sin_table[positions].unsqueeze(0).unsqueeze(0)
+            flat_proxy_k = new_proxy_k.reshape(bsz, num_kv_heads, n_new * comp_size, head_dim)
+            flat_proxy_k = _apply_rope(flat_proxy_k, cos_proxy, sin_proxy)
+            new_score_proxy_k = flat_proxy_k.reshape(bsz, num_kv_heads, n_new, comp_size, head_dim)
 
         if num_pages > capacity:
             new_capacity = _next_page_capacity(num_pages, capacity)
@@ -1410,6 +1428,7 @@ _DCT_RUNTIME_STATE_ATTRS = (
     "_orig_pos_rope_sin_2d",
     "_orig_pos_rope_cache_len",
     "_q_rope_buf",
+    "_dct_force_baseline_decode",
 )
 
 
@@ -1532,15 +1551,32 @@ def dct_page_attention_forward(
     
     # Step 2: RoPE + KV cache update
     cos, sin = position_embeddings
+    force_baseline_decode = False
     if cfg.continuous_rope:
+        base_context_len = 0
         if past_key_value is not None:
-            # cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_cached, value_cached = past_key_value.update(
-                key_states, value_states, self.layer_idx, # cache_kwargs # commented out because we will compute rope table later.
-            )
+            base_context_len = int(past_key_value.layers[self.layer_idx].get_seq_length())
+        force_baseline_decode = getattr(self, "_dct_force_baseline_decode", None)
+        if force_baseline_decode is None:
+            force_baseline_decode = base_context_len <= min_len_for_paging
+            self._dct_force_baseline_decode = force_baseline_decode
+
+        if force_baseline_decode:
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            if past_key_value is not None:
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_states, value_states = past_key_value.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs
+                )
+            kv_len = key_states.shape[2]
         else:
-            key_cached, value_cached = key_states, value_states
-        kv_len = key_cached.shape[2]
+            if past_key_value is not None:
+                key_cached, value_cached = past_key_value.update(
+                    key_states, value_states, self.layer_idx,
+                )
+            else:
+                key_cached, value_cached = key_states, value_states
+            kv_len = key_cached.shape[2]
     else:
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         if past_key_value is not None:
@@ -1551,22 +1587,10 @@ def dct_page_attention_forward(
         kv_len = key_states.shape[2]
     
     # No need to do dct paging since there isn't enough tokens.
-    if kv_len < min_len_for_paging:
-        if cfg.continuous_rope:
-            if query_states_rope is None:
-                query_states_rope = _apply_decode_query_rope(self, query_states, cos, sin, cfg)
-            cos_all, sin_all = _get_or_build_original_position_rope_tables(
-                self, kv_len, self.config, key_cached.device, key_cached.dtype
-            )
-            attn_q = query_states_rope
-            attn_k = _apply_rope(key_cached, cos_all.unsqueeze(0).unsqueeze(0), sin_all.unsqueeze(0).unsqueeze(0))
-            attn_v = value_cached
-        else:
-            attn_q, attn_k, attn_v = query_states, key_states, value_states
-
+    if force_baseline_decode:
         attention_interface = _get_attention_interface(self)
         attn_output, attn_weights = attention_interface(
-            self, attn_q, attn_k, attn_v, attention_mask,
+            self, query_states, key_states, value_states, attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=getattr(self, "sliding_window", None), **kwargs,
