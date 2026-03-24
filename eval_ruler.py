@@ -213,9 +213,10 @@ def apply_monkey_patch(args):
                 use_triton=not args.no_triton,
             )
     elif args.mode == "multipole_attention":
-        from multipole_attn import replace_qwen2_attn_multipole
+        from multipole_attn import replace_attn_multipole
         from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
-        replace_qwen2_attn_multipole(MULTIPOLE_ATTN_CONFIG)
+        MULTIPOLE_ATTN_CONFIG["base_model"] = args.base_model
+        replace_attn_multipole(MULTIPOLE_ATTN_CONFIG)
     elif args.mode == "baseline":
         print("Baseline mode: full attention (no monkey-patch)")
 

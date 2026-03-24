@@ -1,10 +1,12 @@
 """
-Multipole Attention monkey-patch for Qwen2Attention.
+Multipole Attention monkey-patch for LlamaAttention, Qwen2Attention, and Qwen3Attention.
 
 Ported from MultipoleAttention/transformers/src/transformers/models/qwen2/modeling_qwen2.py.
 Uses a two-step approach:
-  1. replace_qwen2_attn_multipole(config_dict) — call BEFORE model loading
+  1. replace_attn_multipole(config_dict) — call BEFORE model loading
   2. init_multipole_layers(model) — call AFTER model loading
+
+Supported architectures: Llama 3.x, Qwen2.x, Qwen3.x
 """
 
 import math
@@ -24,8 +26,41 @@ from multipole_attn.clustering import (
     run_clustering_online_update,
 )
 
-# Module-level config set by replace_qwen2_attn_multipole()
+# Module-level config set by replace_attn_multipole()
 _multipole_config = None
+
+
+# ---------------------------------------------------------------------------
+# Architecture detection
+# ---------------------------------------------------------------------------
+def _detect_arch(model_name: str) -> str:
+    """Detect model architecture from HF model name / path."""
+    name = model_name.lower()
+    if "qwen3" in name or "qwen/qwen3" in name:
+        return "qwen3"
+    if "qwen2" in name or "qwen/qwen2" in name:
+        return "qwen2"
+    if "llama" in name:
+        return "llama"
+    raise ValueError(
+        f"Cannot detect architecture from model name '{model_name}'. "
+        f"Expected name containing 'llama', 'qwen2', or 'qwen3'."
+    )
+
+
+def _detect_arch_from_config(model_config) -> str:
+    """Detect model architecture from a loaded model's config."""
+    model_type = getattr(model_config, "model_type", "").lower()
+    if model_type == "qwen3":
+        return "qwen3"
+    if model_type == "qwen2":
+        return "qwen2"
+    if model_type == "llama":
+        return "llama"
+    raise ValueError(
+        f"Unsupported model_type '{model_type}'. "
+        f"Expected 'llama', 'qwen2', or 'qwen3'."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +81,7 @@ def _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 
 
 # ---------------------------------------------------------------------------
-# Replacement forward for Qwen2Attention
+# Replacement forward (architecture-agnostic)
 # ---------------------------------------------------------------------------
 def multipole_attention_forward(
     self,
@@ -72,6 +107,11 @@ def multipole_attention_forward(
     query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    # Qwen3 applies RMSNorm on Q/K after projection
+    if hasattr(self, "q_norm"):
+        query_states = self.q_norm(query_states)
+        key_states = self.k_norm(key_states)
 
     cos, sin = position_embeddings
     query_states_rope, key_states_rope = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -414,9 +454,7 @@ def multipole_attention_forward(
             self.config._attn_implementation, None
         )
         if attention_interface is None:
-            # Fallback to eager
-            from transformers.models.qwen2.modeling_qwen2 import eager_attention_forward
-            attention_interface = eager_attention_forward
+            attention_interface = self._mp_eager_attention_forward
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -438,14 +476,38 @@ def multipole_attention_forward(
 # ---------------------------------------------------------------------------
 # Two-step monkey-patch API
 # ---------------------------------------------------------------------------
-def replace_qwen2_attn_multipole(config_dict):
+_ARCH_MODULES = {
+    "llama": "transformers.models.llama.modeling_llama",
+    "qwen2": "transformers.models.qwen2.modeling_qwen2",
+    "qwen3": "transformers.models.qwen3.modeling_qwen3",
+}
+
+_ARCH_ATTN_CLS = {
+    "llama": "LlamaAttention",
+    "qwen2": "Qwen2Attention",
+    "qwen3": "Qwen3Attention",
+}
+
+_ARCH_ROTARY_CLS = {
+    "llama": "LlamaRotaryEmbedding",
+    "qwen2": "Qwen2RotaryEmbedding",
+    "qwen3": "Qwen3RotaryEmbedding",
+}
+
+
+def replace_attn_multipole(config_dict):
     """
-    Step 1: Monkey-patch Qwen2Attention.forward. Call BEFORE model loading.
+    Step 1: Monkey-patch the correct Attention class. Call BEFORE model loading.
+    Detects architecture from config_dict['base_model'].
     """
+    import importlib
+
     global _multipole_config
     _multipole_config = config_dict
 
-    print("Multipole Attention config:")
+    arch = _detect_arch(config_dict["base_model"])
+
+    print(f"Multipole Attention config (arch={arch}):")
     print(f"  use_centroids={config_dict['use_centroids']}")
     print(f"  percent_clusters_lst={config_dict['percent_clusters_lst']}")
     print(f"  percentiles_lst={config_dict['percentiles_lst']}")
@@ -454,16 +516,28 @@ def replace_qwen2_attn_multipole(config_dict):
     print(f"  inference_tp={config_dict['inference_tp']}")
     print(f"  Multipole attention active during decode only (prefill uses full attention)")
 
-    transformers.models.qwen2.modeling_qwen2.Qwen2Attention.forward = multipole_attention_forward
+    mod = importlib.import_module(_ARCH_MODULES[arch])
+    attn_cls = getattr(mod, _ARCH_ATTN_CLS[arch])
+    attn_cls.forward = multipole_attention_forward
+
+
+# Backward compatibility alias
+replace_qwen2_attn_multipole = replace_attn_multipole
 
 
 def init_multipole_layers(model):
     """
     Step 2: Inject per-layer state after model loading.
+    Auto-detects architecture from model.config.model_type.
     """
-    from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
+    import importlib
 
     config = _multipole_config
+    arch = _detect_arch_from_config(model.config)
+
+    mod = importlib.import_module(_ARCH_MODULES[arch])
+    RotaryEmbCls = getattr(mod, _ARCH_ROTARY_CLS[arch])
+    eager_fn = getattr(mod, "eager_attention_forward")
 
     for layer in model.model.layers:
         attn = layer.self_attn
@@ -476,7 +550,8 @@ def init_multipole_layers(model):
         attn._mp_clustered_length = 0
         attn._mp_clustered_offset = 0
         attn._mp_inference_tp = config["inference_tp"]
-        attn._mp_rotary_emb = Qwen2RotaryEmbedding(config=model.config).to(attn.q_proj.weight.device)
+        attn._mp_rotary_emb = RotaryEmbCls(config=model.config).to(attn.q_proj.weight.device)
         attn._mp_attention_scaling = attn._mp_rotary_emb.attention_scaling
         attn._mp_cos_cache = None
         attn._mp_sin_cache = None
+        attn._mp_eager_attention_forward = eager_fn
