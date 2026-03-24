@@ -79,6 +79,9 @@ class SeerAttnQwen2Config(PretrainedConfig):
         seerattn_implementation="seer_sparse", # [seer_sparse, seer_dense, oracle_sparse]
         seerattn_start_layer=0,  # the first layer to use seerattn, inclusive
         seerattn_output_sparsity=False,
+        pad_token_id=None,
+        bos_token_id=151643,
+        eos_token_id=151645,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -134,6 +137,9 @@ class SeerAttnQwen2Config(PretrainedConfig):
         rope_config_validation(self)
 
         super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )

@@ -124,6 +124,9 @@ def load_task_configs():
     data_tasks = data_constants.TASKS
 
     # Eval constants (metric_fn)
+    # Remove cached data version so we can load the eval version
+    if "synthetic.constants" in sys.modules:
+        del sys.modules["synthetic.constants"]
     sys.path.insert(0, os.path.join(RULER_DIR, "eval"))
     eval_constants = importlib.import_module("synthetic.constants")
     eval_tasks = eval_constants.TASKS
@@ -159,7 +162,7 @@ def prepare_data(args):
                 continue
 
             data_file.parent.mkdir(parents=True, exist_ok=True)
-            save_dir = str(Path("ruler_data") / model_family / str(seq_len))
+            save_dir = str(Path("ruler_data").resolve() / model_family / str(seq_len))
 
             cmd = [
                 sys.executable, prepare_script,

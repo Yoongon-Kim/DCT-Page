@@ -23,7 +23,7 @@ SEER_ATTN_CONFIG = {
     "sparsity_method": "token_budget",
 
     # Max active tokens per decode step (only used when sparsity_method="token_budget")
-    "token_budget": 2180,
+    "token_budget": 1156,
 
     # Gate score threshold (only used when sparsity_method="threshold")
     "threshold": 0.0,

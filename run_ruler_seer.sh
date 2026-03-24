@@ -11,7 +11,7 @@ NUM_SAMPLES="${NUM_SAMPLES:-25}"
 OUTPUT_DIR="${OUTPUT_DIR:-results_ruler/seer_attention}"
 
 # Sequence lengths to evaluate
-SEQ_LENGTHS="${SEQ_LENGTHS:-4096 8192 16384 32768 65536 131072}"
+SEQ_LENGTHS="${SEQ_LENGTHS:-32768}" # "${SEQ_LENGTHS:-4096 8192 16384 32768 65536 131072}"
 
 # Pass --prepare to also prepare data (skips if already exists)
 PREPARE_FLAG=""
