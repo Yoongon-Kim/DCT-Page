@@ -289,8 +289,9 @@ def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
         data = data[:args.num_samples]
 
     tokens_to_generate = task_config["tokens_to_generate"]
-    # Seer uses a thinking model: extend budget so answer isn't truncated
-    if args.mode == "seer_attention":
+    # Qwen3 is a thinking model: <think>...</think> consumes many tokens
+    # before the actual answer. Extend the budget so it isn't truncated.
+    if "qwen3" in args.base_model.lower():
         tokens_to_generate = tokens_to_generate * 10
 
     # Resume support

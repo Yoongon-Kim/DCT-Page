@@ -210,11 +210,10 @@ def evaluate(model, tokenizer, dataset, args):
     correct = 0
     total = 0
 
-    # Qwen3 (used by seer_attention) is a thinking model: <think>...</think>
-    # consumes many tokens before the actual answer.  Extend the budget so
-    # the real answer is not truncated; the thinking tokens are stripped later.
+    # Qwen3 is a thinking model: <think>...</think> consumes many tokens
+    # before the actual answer. Extend the budget so it isn't truncated.
     max_gen = args.max_new_tokens
-    if args.mode == "seer_attention":
+    if "qwen3" in args.base_model.lower():
         max_gen = max_gen * 10
 
     for item in tqdm(samples, desc="Evaluating"):

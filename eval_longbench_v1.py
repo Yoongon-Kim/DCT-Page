@@ -448,10 +448,9 @@ def evaluate_task(model, tokenizer, task, dataset, args):
     max_gen = (args.max_new_tokens_override
                if args.max_new_tokens_override > 0
                else TASK_MAX_NEW_TOKENS.get(task, 64))
-    # Qwen3 (seer_attention) is a thinking model: <think>...</think> consumes
-    # many tokens before the actual answer.  Extend the budget so the real
-    # answer is not truncated; the thinking tokens are stripped later.
-    if args.mode == "seer_attention":
+    # Qwen3 is a thinking model: <think>...</think> consumes many tokens
+    # before the actual answer. Extend the budget so it isn't truncated.
+    if "qwen3" in args.base_model.lower():
         max_gen = max_gen * 10
 
     # Resume support

@@ -7,8 +7,9 @@ set -e
 BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-4B}"
 MODEL_TEMPLATE="${MODEL_TEMPLATE:-qwen-3}"
 TOKENIZER_FAMILY="${TOKENIZER_FAMILY:-qwen3}"
+MODEL_FAMILY="${MODEL_FAMILY:-qwen3}"
 NUM_SAMPLES="${NUM_SAMPLES:-25}"
-OUTPUT_DIR="${OUTPUT_DIR:-results_ruler/seer_attention}"
+OUTPUT_DIR="${OUTPUT_DIR:-results_ruler/seer_attention/${MODEL_FAMILY}}"
 
 # Sequence lengths to evaluate
 SEQ_LENGTHS="${SEQ_LENGTHS:-32768}" # "${SEQ_LENGTHS:-4096 8192 16384 32768 65536 131072}"
@@ -70,7 +71,7 @@ PYEOF
 
 # ---- Sweep token_budget ----
 for TOKEN_BUDGET in 1156 2180; do
-    RUN_NAME="seer_budget${TOKEN_BUDGET}"
+    RUN_NAME="${MODEL_FAMILY}_seer_budget${TOKEN_BUDGET}"
 
     echo ""
     echo "===================================================================="

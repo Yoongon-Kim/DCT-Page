@@ -7,8 +7,9 @@ set -e
 BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 MODEL_TEMPLATE="${MODEL_TEMPLATE:-llama-3}"
 TOKENIZER_FAMILY="${TOKENIZER_FAMILY:-llama}"
+MODEL_FAMILY="${MODEL_FAMILY:-llama}"
 NUM_SAMPLES="${NUM_SAMPLES:-25}"
-OUTPUT_DIR="${OUTPUT_DIR:-results_ruler/multipole_attention}"
+OUTPUT_DIR="${OUTPUT_DIR:-results_ruler/multipole_attention/${MODEL_FAMILY}}"
 
 # Sequence lengths to evaluate
 SEQ_LENGTHS="${SEQ_LENGTHS:-32768}" #"${SEQ_LENGTHS:-4096 8192 16384 32768 65536 131072}"
@@ -75,7 +76,7 @@ PYEOF
 for PCT_CLUSTERS in 6.25; do
     for PERCENTILES in 1156 2180; do
         for REPL in False; do
-            RUN_NAME="llama_multipole_pct${PCT_CLUSTERS}_ptl${PERCENTILES}_repl${REPL}"
+            RUN_NAME="${MODEL_FAMILY}_multipole_pct${PCT_CLUSTERS}_ptl${PERCENTILES}_repl${REPL}"
 
             echo ""
             echo "===================================================================="
