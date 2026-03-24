@@ -210,6 +210,13 @@ def evaluate(model, tokenizer, dataset, args):
     correct = 0
     total = 0
 
+    # Qwen3 (used by seer_attention) is a thinking model: <think>...</think>
+    # consumes many tokens before the actual answer.  Extend the budget so
+    # the real answer is not truncated; the thinking tokens are stripped later.
+    max_gen = args.max_new_tokens
+    if args.mode == "seer_attention":
+        max_gen = max_gen * 10
+
     for item in tqdm(samples, desc="Evaluating"):
         if item["_id"] in completed_ids:
             continue
@@ -220,15 +227,27 @@ def evaluate(model, tokenizer, dataset, args):
         input_len = input_ids.shape[1]
 
         with torch.no_grad():
-            output_ids = model.generate(
-                input_ids,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-                use_cache=True,
-            )
+            if args.mode == "seer_attention":
+                output_ids, _ = model.batch_exist_generate(
+                    input_ids=input_ids,
+                    attention_mask=torch.ones_like(input_ids),
+                    max_length=input_len + max_gen,
+                    do_sample=False,
+                )
+            else:
+                output_ids = model.generate(
+                    input_ids,
+                    max_new_tokens=max_gen,
+                    do_sample=False,
+                    use_cache=True,
+                )
 
         generated_ids = output_ids[0, input_len:]
         response = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        # Qwen3 (used by seer_attention) is a thinking model that wraps
+        # reasoning in <think>...</think>; strip it to get the actual answer.
+        if "</think>" in response:
+            response = response.split("</think>", 1)[1].strip()
 
         predicted = extract_answer(response)
         gold = item["answer"]
