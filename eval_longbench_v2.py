@@ -13,6 +13,7 @@ import re
 import math
 import argparse
 import random
+import csv
 
 import torch
 import numpy as np
@@ -300,6 +301,95 @@ def print_summary(results, run_name):
     print("=" * 60)
 
 
+def build_summary(results, args):
+    total = len(results)
+
+    def subset_stats(records):
+        if not records:
+            return {"accuracy": 0.0, "num_samples": 0}
+        correct = sum(1 for r in records if r["correct"])
+        return {
+            "accuracy": round(correct / len(records) * 100, 2),
+            "num_samples": len(records),
+        }
+
+    easy = [r for r in results if r["difficulty"] == "easy"]
+    hard = [r for r in results if r["difficulty"] == "hard"]
+    short = [r for r in results if r["length"] == "short"]
+    medium = [r for r in results if r["length"] == "medium"]
+    long_ = [r for r in results if r["length"] == "long"]
+
+    by_domain = {}
+    for r in results:
+        by_domain.setdefault(r["domain"], []).append(r)
+
+    overall_acc = round((sum(1 for r in results if r["correct"]) / total * 100), 2) if total else 0.0
+
+    summary = {
+        "mode": args.mode,
+        "model": args.base_model,
+        "run_name": args.run_name,
+        "num_samples": total,
+        "overall_accuracy": overall_acc,
+        "by_difficulty": {
+            "easy": subset_stats(easy),
+            "hard": subset_stats(hard),
+        },
+        "by_length": {
+            "short": subset_stats(short),
+            "medium": subset_stats(medium),
+            "long": subset_stats(long_),
+        },
+        "by_domain": {
+            domain: subset_stats(records)
+            for domain, records in sorted(by_domain.items())
+        },
+    }
+
+    if args.mode == "page_attention":
+        summary["top_k"] = args.top_k
+        summary["page_size"] = args.page_size
+        summary["scoring_method"] = args.scoring_method
+        summary["group_agg_method"] = args.group_agg_method
+        summary["unselected_mode"] = args.unselected_mode
+
+    return summary
+
+
+def write_summary_files(results, args):
+    summary = build_summary(results, args)
+    summary_path = os.path.join(args.output_dir, f"{args.run_name}_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    csv_path = os.path.join(args.output_dir, f"{args.run_name}_summary.csv")
+    rows = [
+        {
+            "group": "overall",
+            "label": "overall",
+            "accuracy": summary["overall_accuracy"],
+            "num_samples": summary["num_samples"],
+        }
+    ]
+    for group_name in ("by_difficulty", "by_length", "by_domain"):
+        for label, payload in summary[group_name].items():
+            rows.append(
+                {
+                    "group": group_name.removeprefix("by_"),
+                    "label": label,
+                    "accuracy": payload["accuracy"],
+                    "num_samples": payload["num_samples"],
+                }
+            )
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["group", "label", "accuracy", "num_samples"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return summary_path, csv_path
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -378,27 +468,11 @@ def main():
     # Print summary
     print_summary(results, args.run_name)
 
-    # # Save summary JSON
-    summary_path = os.path.join(args.output_dir, f"{args.run_name}_summary.json")
-    overall_acc = sum(1 for r in results if r["correct"]) / len(results) * 100 if results else 0
-    summary = {
-        "mode": args.mode,
-        "model": args.base_model,
-        "run_name": args.run_name,
-        "num_samples": len(results),
-        "overall_accuracy": round(overall_acc, 2),
-    }
-    if args.mode == "page_attention":
-        summary["top_k"] = args.top_k
-        summary["page_size"] = args.page_size
-        summary["scoring_method"] = args.scoring_method
-        summary["group_agg_method"] = args.group_agg_method
-        summary["unselected_mode"] = args.unselected_mode
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
+    summary_path, csv_path = write_summary_files(results, args)
 
     print(f"\nResults saved to: {os.path.join(args.output_dir, args.run_name + '.jsonl')}")
     print(f"Summary saved to: {summary_path}")
+    print(f"Summary CSV saved to: {csv_path}")
 
 
 if __name__ == "__main__":
