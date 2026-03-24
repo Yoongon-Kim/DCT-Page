@@ -2,7 +2,7 @@
 SeerAttention-R evaluation configuration.
 
 Edit this file to change model checkpoint, sparsity method, and budget/threshold
-before running eval_longbench_v1.py or eval_longbench_v2.py with --mode seer_attention.
+before running eval_ruler.py with --mode seer_attention.
 
 Available HF checkpoints (SeerAttention-R, decode sparse only):
   - SeerAttention/SeerAttention-Decode-Qwen3-4B-AttnGates
@@ -23,7 +23,7 @@ SEER_ATTN_CONFIG = {
     "sparsity_method": "token_budget",
 
     # Max active tokens per decode step (only used when sparsity_method="token_budget")
-    "token_budget": 1024,
+    "token_budget": 1156,
 
     # Gate score threshold (only used when sparsity_method="threshold")
     "threshold": 0.0,

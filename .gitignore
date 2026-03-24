@@ -2,4 +2,5 @@ page_selections.json
 old_tests/
 results*/
 longbench_v1_data/
+ruler_data/
 __pycache__/
