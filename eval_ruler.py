@@ -66,7 +66,10 @@ def parse_args():
     parser.add_argument("--prepare", action="store_true",
                         help="Run data preparation before prediction (skips if data exists)")
     parser.add_argument("--model_template_type", type=str, default="llama-3",
-                        help="Template type for prepare.py (e.g. llama-3, qwen-2.5)")
+                        help="Template type for prepare.py (e.g. llama-3, qwen-3)")
+    parser.add_argument("--tokenizer_family", type=str, default="llama",
+                        choices=["llama", "qwen2", "qwen3"],
+                        help="Tokenizer family name for data directory (models in same family share data)")
 
     # RULER config
     parser.add_argument("--seq_lengths", type=int, nargs="+",
@@ -145,18 +148,18 @@ def load_task_configs():
 # ---------------------------------------------------------------------------
 def prepare_data(args):
     """Run eval_ruler/data/prepare.py for tasks that don't have data yet."""
-    model_basename = os.path.basename(args.base_model)
+    model_family = args.tokenizer_family
     prepare_script = os.path.join(RULER_DIR, "data", "prepare.py")
 
     for seq_len in args.seq_lengths:
         for task in args.tasks:
-            data_file = Path("ruler_data") / model_basename / str(seq_len) / task / "validation.jsonl"
+            data_file = Path("ruler_data") / model_family / str(seq_len) / task / "validation.jsonl"
             if data_file.exists():
                 print(f"  Data exists, skipping: {data_file}")
                 continue
 
             data_file.parent.mkdir(parents=True, exist_ok=True)
-            save_dir = str(Path("ruler_data") / model_basename / str(seq_len))
+            save_dir = str(Path("ruler_data") / model_family / str(seq_len))
 
             cmd = [
                 sys.executable, prepare_script,
@@ -427,7 +430,7 @@ def main():
     apply_monkey_patch(args)
     model, tokenizer = load_model_and_tokenizer(args)
 
-    model_basename = os.path.basename(args.base_model)
+    model_family = args.tokenizer_family
 
     # Step 3: Predict + evaluate per sequence length
     all_seq_results = {}  # {seq_len: {task: score}}
@@ -437,7 +440,7 @@ def main():
         print(f"SEQUENCE LENGTH: {seq_len}")
         print("=" * 60)
 
-        data_dir = Path("ruler_data") / model_basename / str(seq_len)
+        data_dir = Path("ruler_data") / model_family / str(seq_len)
         pred_dir = Path(args.output_dir) / args.run_name / "synthetic" / str(seq_len) / "pred"
         pred_dir.mkdir(parents=True, exist_ok=True)
 

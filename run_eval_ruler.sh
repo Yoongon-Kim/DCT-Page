@@ -7,11 +7,18 @@ set -e
 # ---- Configuration ----
 BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 MODEL_TEMPLATE="${MODEL_TEMPLATE:-llama-3}"
+TOKENIZER_FAMILY="${TOKENIZER_FAMILY:-llama}"
 NUM_SAMPLES="${NUM_SAMPLES:-25}"
 OUTPUT_DIR="${OUTPUT_DIR:-results_ruler}"
 
 # Sequence lengths to evaluate
 SEQ_LENGTHS="${SEQ_LENGTHS:-4096 8192 16384 32768 65536 131072}"
+
+# Pass --prepare to also prepare data (skips if already exists)
+PREPARE_FLAG=""
+if [[ "$*" == *"--prepare"* ]]; then
+    PREPARE_FLAG="--prepare"
+fi
 
 # DCT Page Attention defaults
 PAGE_SIZE=128
@@ -27,7 +34,7 @@ echo "============================================================"
 python eval_ruler.py \
     --mode baseline \
     --base_model "$BASE_MODEL" \
-    --prepare --model_template_type "$MODEL_TEMPLATE" \
+    $PREPARE_FLAG --model_template_type "$MODEL_TEMPLATE" --tokenizer_family "$TOKENIZER_FAMILY" \
     --seq_lengths $SEQ_LENGTHS \
     --num_samples "$NUM_SAMPLES" \
     --output_dir "$OUTPUT_DIR" \
