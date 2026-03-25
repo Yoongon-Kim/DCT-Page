@@ -6,7 +6,7 @@ set -e
 # ---- Configuration ----
 BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-8B}"
 MODEL_TEMPLATE="${MODEL_TEMPLATE:-qwen3}"
-TOKENIZER_FAMILY="${TOKENIZER_FAMILY:-qwen}"
+TOKENIZER_FAMILY="${TOKENIZER_FAMILY:-qwen3}"
 MODEL_FAMILY="${MODEL_FAMILY:-qwen3}"
 NUM_SAMPLES="${NUM_SAMPLES:-25}"
 OUTPUT_DIR="${OUTPUT_DIR:-results_ruler/multipole_attention/${MODEL_FAMILY}}"
