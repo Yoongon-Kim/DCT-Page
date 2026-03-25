@@ -5,7 +5,7 @@
 set -e
 
 # ---- Configuration ----
-BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
+BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-8B}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-127500}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
 OUTPUT_DIR="${OUTPUT_DIR:-results_longbench_v1/seer_attention}"

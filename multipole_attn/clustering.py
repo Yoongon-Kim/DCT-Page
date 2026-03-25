@@ -145,7 +145,7 @@ def run_clustering_online_onelevel_update(
         centroid_end_offset = int(end_offset * cluster_percentage)
 
         # refine first 16K of the window
-        cent_interim, num_keys_interim, labels_interim = block_kmeans(data_new, num_clusters)
+        cent_interim, num_keys_interim, labels_interim = block_kmeans(window_data, num_clusters)
 
         # copy data over
         centroids_tensor[:,centroid_start_offset:centroid_end_offset] = cent_interim

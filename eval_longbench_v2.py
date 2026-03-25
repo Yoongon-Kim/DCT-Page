@@ -214,7 +214,7 @@ def evaluate(model, tokenizer, dataset, args):
     # before the actual answer. Extend the budget so it isn't truncated.
     max_gen = args.max_new_tokens
     if "qwen3" in args.base_model.lower():
-        max_gen = max_gen * 10
+        max_gen = max_gen * 50
 
     for item in tqdm(samples, desc="Evaluating"):
         if item["_id"] in completed_ids:

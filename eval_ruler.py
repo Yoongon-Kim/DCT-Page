@@ -292,7 +292,7 @@ def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
     # Qwen3 is a thinking model: <think>...</think> consumes many tokens
     # before the actual answer. Extend the budget so it isn't truncated.
     if "qwen3" in args.base_model.lower():
-        tokens_to_generate = tokens_to_generate * 10
+        tokens_to_generate = tokens_to_generate * 100
 
     # Resume support
     pred_file = pred_dir / f"{task}.jsonl"

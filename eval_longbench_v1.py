@@ -451,7 +451,7 @@ def evaluate_task(model, tokenizer, task, dataset, args):
     # Qwen3 is a thinking model: <think>...</think> consumes many tokens
     # before the actual answer. Extend the budget so it isn't truncated.
     if "qwen3" in args.base_model.lower():
-        max_gen = max_gen * 10
+        max_gen = max_gen * 50
 
     # Resume support
     completed_ids = set()

@@ -88,7 +88,7 @@ def multipole_attention_forward(
     hidden_states: torch.Tensor,
     position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     attention_mask: Optional[torch.Tensor] = None,
-    past_key_value=None,
+    past_key_values=None,
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ):
@@ -213,9 +213,9 @@ def multipole_attention_forward(
     # Cache correct keys (with RoPE applied)
     key_states = key_states_rope.clone()
 
-    if past_key_value is not None:
+    if past_key_values is not None:
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
     # --- Re-clustering during generation ---
     if recluster:
