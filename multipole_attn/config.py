@@ -13,7 +13,7 @@ Key parameters:
 
 MULTIPOLE_ATTN_CONFIG = {
     # Base model (HF Hub ID or local path)
-    "base_model": "Qwen/Qwen3-8B",
+    "base_model": "meta-llama/Llama-3.1-8B-Instruct",
 
     # Enable centroid-based sparse attention
     "use_centroids": True,
