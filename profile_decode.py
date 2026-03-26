@@ -65,16 +65,23 @@ from dct_page_attention import (
     _dct_page_cfg,
     segment_kv,
     _update_comp_cache as _update_comp_cache_original,
-    _get_or_build_projection_matrix,
+    _update_score_key_cache,
+    _update_score_spectral_key_cache,
+    _update_score_haar_key_cache,
+    _update_score_haar_mixed_key_cache,
+    _update_score_hadamard_key_cache,
     repeat_kv,
     apply_rotary_pos_emb,
     _apply_rope,
     _compute_rope_cos_sin,
+    _get_or_build_original_position_rope_tables,
+    _apply_original_position_rope_to_final_k,
+    _apply_decode_query_rope,
 )
 
 
 # New fused kernels imported inside profiled_dct_page_attention_forward
-from triton_kernels import apply_rope_q_direct, assemble_kv_drop_triton, build_assemble_stride_cache
+from triton_kernels import assemble_kv_drop_triton
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen2.modeling_qwen2 import eager_attention_forward
 
@@ -128,8 +135,14 @@ class PreAllocatedLayer(DynamicLayer):
         # Return view of valid portion (zero-copy)
         return self.keys[:, :, :end, :], self.values[:, :, :end, :]
 
-    def get_seq_length(self):
+    def get_seq_length(self, cache_position=None):
         return self._seen
+
+
+def _get_attention_interface(attn_module):
+    if attn_module.config._attn_implementation == "eager":
+        return eager_attention_forward
+    return ALL_ATTENTION_FUNCTIONS[attn_module.config._attn_implementation]
 
 
 def pre_allocate_cache(cache, extra_tokens=256):
@@ -167,7 +180,7 @@ def profiled_dct_page_attention_forward(
     hidden_states,
     position_embeddings,
     attention_mask=None,
-    past_key_values=None,
+    past_key_value=None,
     cache_position=None,
     **kwargs,
 ):
@@ -178,12 +191,13 @@ def profiled_dct_page_attention_forward(
     """
     global _current_layer
 
-    from dct_page_attention import _dct_page_cfg as cfg
+    from dct_page_attention import _dct_page_cfg as cfg, _maybe_reset_dct_runtime_state
     from typing import Callable
 
     input_shape = hidden_states.shape[:-1]  # (bsz, q_len)
     hidden_shape = (*input_shape, -1, self.head_dim)  # (bsz, q_len, num_heads, head_dim)
     bsz, q_len = input_shape
+    _maybe_reset_dct_runtime_state(self, past_key_value)
 
     if q_len > 1:
         # Prefill path — always use standard attention (no profiling)
@@ -194,27 +208,37 @@ def profiled_dct_page_attention_forward(
         cos, sin = position_embeddings
         if cfg.continuous_rope:
             query_rope, key_rope = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-            if past_key_values is not None:
+            if past_key_value is not None:
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                key_cached, value_cached = past_key_values.update(
+                key_cached, value_cached = past_key_value.update(
                     key_states, value_states, self.layer_idx, cache_kwargs
                 )
             else:
                 key_cached, value_cached = key_states, value_states
-            attn_q, attn_k, attn_v = query_rope, key_rope, value_states
+            attn_q = query_rope
+            if past_key_value is not None:
+                all_pos = torch.arange(key_cached.shape[2], device=key_cached.device)
+                cos_all, sin_all = _compute_rope_cos_sin(
+                    all_pos, self.config, key_cached.device, key_cached.dtype
+                )
+                attn_k = _apply_rope(key_cached, cos_all, sin_all)
+                attn_v = value_cached
+            else:
+                attn_k, attn_v = key_rope, value_states
         else:
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-            if past_key_values is not None:
+            if past_key_value is not None:
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                key_states, value_states = past_key_values.update(
+                key_states, value_states = past_key_value.update(
                     key_states, value_states, self.layer_idx, cache_kwargs
                 )
             attn_q, attn_k, attn_v = query_states, key_states, value_states
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get("sdpa", eager_attention_forward)
+        attention_interface = _get_attention_interface(self)
         attn_output, attn_weights = attention_interface(
             self, attn_q, attn_k, attn_v, attention_mask,
-            dropout=0.0, scaling=self.scaling,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
             sliding_window=getattr(self, "sliding_window", None), **kwargs,
         )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -223,7 +247,7 @@ def profiled_dct_page_attention_forward(
 
     # ---- DECODE PATH (q_len == 1) ----
     # Chained CUDA events: ev[i] is the boundary between step i and step i+1.
-    # Total attention = ev[0] → ev[9] = sum of steps 1-7 by construction.
+    # Total attention = ev[0] → ev[-1] = exact sum of all profiled steps.
     if _enabled:
         # Record events on the correct device's stream (critical for multi-GPU)
         _dev = hidden_states.device
@@ -240,30 +264,48 @@ def profiled_dct_page_attention_forward(
 
         _rec(0)
 
-    # Step 1: QKV projection
+    # Step 1: qkv
     query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    query_states_rope = None
 
     if _enabled:
         _rec(1)
 
-    # Step 2: RoPE + KV cache update
+    # Step 2: KV cache update
     cos, sin = position_embeddings
+    force_baseline_decode = False
     if cfg.continuous_rope:
-        if past_key_values is not None:
-            # cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_cached, value_cached = past_key_values.update(
-                key_states, value_states, self.layer_idx, # cache_kwargs # commented out because we will compute rope table later.
-            )
+        base_context_len = 0
+        if past_key_value is not None:
+            base_context_len = int(past_key_value.layers[self.layer_idx].get_seq_length())
+        force_baseline_decode = getattr(self, "_dct_force_baseline_decode", None)
+        if force_baseline_decode is None:
+            force_baseline_decode = base_context_len <= min_len_for_paging
+            self._dct_force_baseline_decode = force_baseline_decode
+
+        if force_baseline_decode:
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            if past_key_value is not None:
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_states, value_states = past_key_value.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs
+                )
+            kv_len = key_states.shape[2]
         else:
-            key_cached, value_cached = key_states, value_states
-        kv_len = key_cached.shape[2]
+            if past_key_value is not None:
+                key_cached, value_cached = past_key_value.update(
+                    key_states, value_states, self.layer_idx,
+                )
+            else:
+                key_cached, value_cached = key_states, value_states
+            kv_len = key_cached.shape[2]
     else:
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        if past_key_values is not None:
+        if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(
+            key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
         kv_len = key_states.shape[2]
@@ -272,24 +314,12 @@ def profiled_dct_page_attention_forward(
         _rec(2)
 
     # Check if DCT path is active
-    min_len_for_paging = cfg.sink_size + cfg.page_size * (cfg.top_k + 1) + cfg.recent_size
-    if kv_len < min_len_for_paging:
-        if cfg.continuous_rope:
-            all_pos = torch.arange(kv_len, device=key_cached.device)
-            cos_all, sin_all = _compute_rope_cos_sin(
-                all_pos, self.head_dim, getattr(self.config, 'rope_theta', self.config.rope_parameters['rope_theta'] if hasattr(self.config, 'rope_parameters') else 500000.0),
-                key_cached.device, key_cached.dtype
-            )
-            attn_q, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
-            attn_k = _apply_rope(key_cached, cos_all, sin_all)
-            attn_v = value_cached
-        else:
-            attn_q, attn_k, attn_v = query_states, key_states, value_states
-
-        attention_interface = ALL_ATTENTION_FUNCTIONS.get("sdpa", eager_attention_forward)
+    if force_baseline_decode:
+        attention_interface = _get_attention_interface(self)
         attn_output, attn_weights = attention_interface(
-            self, attn_q, attn_k, attn_v, attention_mask,
-            dropout=0.0, scaling=self.scaling,
+            self, query_states, key_states, value_states, attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
             sliding_window=getattr(self, "sliding_window", None), **kwargs,
         )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -302,7 +332,7 @@ def profiled_dct_page_attention_forward(
         key_states = key_cached
         value_states = value_cached
 
-    # Step 3: Segment KV
+    # Step 3: segment
     comp_size = max(1, int(cfg.page_size * cfg.compress_ratio))
     (sink_k, sink_v, paged_k, paged_v,
      recent_k, recent_v, num_pages, actual_recent) = segment_kv(
@@ -312,44 +342,90 @@ def profiled_dct_page_attention_forward(
     if _enabled:
         _rec(3)
 
-    # Step 4: DCT compression (torch.cat — always contiguous, L2-warm)
-    comp_k, comp_v = _update_comp_cache_original(self, paged_k, paged_v, num_pages, comp_size)
+    # Step 4: compress/cache maintenance. The default path uses a separate
+    # score-time cache and drop-mode assembly, so comp_k/comp_v are only
+    # needed for compatibility paths.
+    need_comp_cache = not (cfg.continuous_rope and cfg.unselected_mode == "drop")
+    comp_k = comp_v = None
+    if need_comp_cache:
+        comp_k, comp_v = _update_comp_cache_original(
+            self,
+            paged_k,
+            paged_v,
+            num_pages,
+            comp_size,
+            need_values=(cfg.unselected_mode != "drop"),
+        )
 
     if _enabled:
         _rec(4)
 
-    # Step 5: Score pages (Triton kernel 1)
-    from triton_kernels import score_pages_triton, assemble_kv_full_triton, assemble_kv_split_triton, apply_rope_q_triton, topk_sort_triton
+    # Step 5a: score cache update
+    from triton_kernels import score_pages_triton, topk_sort_triton
 
-    # Pre-allocate page_scores buffer (reallocate only when num_pages changes, ~every 128 steps)
     _num_kv_heads = self.config.num_key_value_heads  # 8 for Llama-3.1-8B
-    if getattr(self, '_page_scores_np', 0) != num_pages:
-        self._page_scores_buf = torch.empty(bsz, _num_kv_heads, num_pages, dtype=torch.float32, device=comp_k.device)
-        self._page_scores_np = num_pages
+    page_scores_buf = getattr(self, '_page_scores_buf', None)
+    if (
+        page_scores_buf is None
+        or page_scores_buf.shape[0] != bsz
+        or page_scores_buf.shape[1] != _num_kv_heads
+        or page_scores_buf.shape[2] != num_pages
+    ):
+        self._page_scores_buf = torch.empty(
+            bsz, _num_kv_heads, num_pages,
+            dtype=torch.float32, device=paged_k.device,
+        )
 
+    score_query_states = query_states
+    score_comp_k = comp_k
+    if cfg.continuous_rope:
+        if query_states_rope is None:
+            query_states_rope = _apply_decode_query_rope(self, query_states, cos, sin, cfg)
+        score_query_states = query_states_rope
+        if cfg.score_use_direct_spectral_proxy:
+            score_comp_k = _update_score_spectral_key_cache(self, paged_k, num_pages, comp_size, cfg)
+        elif cfg.score_use_haar_mixed_proxy:
+            score_comp_k = _update_score_haar_mixed_key_cache(self, paged_k, num_pages, comp_size, cfg)
+        elif cfg.score_use_hadamard_proxy:
+            score_comp_k = _update_score_hadamard_key_cache(self, paged_k, num_pages, comp_size, cfg)
+        elif cfg.score_use_haar_proxy:
+            score_comp_k = _update_score_haar_key_cache(self, paged_k, num_pages, comp_size, cfg)
+        else:
+            score_comp_k = _update_score_key_cache(self, paged_k, num_pages, comp_size, cfg)
+
+    if _enabled:
+        _rec(5)
+
+    # Step 5b: score pages kernel
     page_scores = score_pages_triton(
-        query_states, comp_k,
+        score_query_states, score_comp_k,
         cfg.scoring_method, cfg.group_agg_method,
         self.num_key_value_groups,
         out=self._page_scores_buf,
     )
 
     if _enabled:
-        _rec(5)
+        _rec(6)
 
-    # Step 6a: TopK + sort (fused Triton kernel — replaces torch.topk + .sort + .to(int32))
+    # Step 6: topk
     actual_top_k = min(cfg.top_k, num_pages)
 
-    # Pre-allocate selected_indices buffer (constant shape across all decode steps)
-    if not hasattr(self, '_topk_out_buf'):
-        self._topk_out_buf = torch.empty(bsz, _num_kv_heads, actual_top_k, dtype=torch.int32, device=comp_k.device)
+    topk_buf = getattr(self, '_topk_out_buf', None)
+    if (
+        topk_buf is None
+        or topk_buf.shape[0] != bsz
+        or topk_buf.shape[1] != _num_kv_heads
+        or topk_buf.shape[2] != actual_top_k
+    ):
+        self._topk_out_buf = torch.empty(
+            bsz, _num_kv_heads, actual_top_k, dtype=torch.int32, device=paged_k.device
+        )
 
     selected_indices = topk_sort_triton(page_scores, actual_top_k, out=self._topk_out_buf)
 
     if _enabled:
-        _rec(6)
+        _rec(7)
 
-    # Step 6a: rope table & buffer setting
     if cfg.unselected_mode == "drop":
         assembled_len = cfg.sink_size + actual_top_k * cfg.page_size + actual_recent
     else:
@@ -359,45 +435,27 @@ def profiled_dct_page_attention_forward(
 
     cos_table = None
     sin_table = None
-    if cfg.continuous_rope:
-        cached_len = getattr(self, '_rope_cache_len', 0)
-        if assembled_len > cached_len:
-            max_len = assembled_len + cfg.page_size
-            positions = torch.arange(max_len, device=comp_k.device)
-            cos_cached, sin_cached = _compute_rope_cos_sin(
-                positions, self.head_dim,
-                getattr(self.config, 'rope_theta', self.config.rope_parameters['rope_theta'] if hasattr(self.config, 'rope_parameters') else 500000.0),
-                comp_k.device, comp_k.dtype,
-            )
-            # Store pre-squeezed 2D [max_len, head_dim] — eliminates [0,0,:N] indexing
-            self._rope_cos_2d = cos_cached[0, 0]  # [max_len, head_dim]
-            self._rope_sin_2d = sin_cached[0, 0]  # [max_len, head_dim]
-            self._rope_cache_len = max_len
-        # Pass full 2D table — kernel only reads positions 0..total_len-1 anyway
-        cos_table = self._rope_cos_2d
-        sin_table = self._rope_sin_2d
+    fuse_final_k_original_rope = cfg.continuous_rope and cfg.unselected_mode == "drop"
+    if fuse_final_k_original_rope:
+        cos_table, sin_table = _get_or_build_original_position_rope_tables(
+            self,
+            num_pages * cfg.page_size + cfg.sink_size + actual_recent,
+            self.config,
+            paged_k.device,
+            paged_k.dtype,
+        )
 
     # Pre-allocate or expand output buffers (avoids torch.empty per step)
     _buf_len = getattr(self, '_assemble_buf_len', 0)
     if assembled_len > _buf_len:
         _max_len = assembled_len + cfg.page_size
         _nkv = _num_kv_heads
-        self._final_k_buf = torch.empty(bsz, _nkv, _max_len, self.head_dim, dtype=comp_k.dtype, device=comp_k.device)
+        self._final_k_buf = torch.empty(bsz, _nkv, _max_len, self.head_dim, dtype=paged_k.dtype, device=paged_k.device)
         self._final_v_buf = torch.empty_like(self._final_k_buf)
-        self._sel_idx_buf = torch.empty(bsz, _nkv, actual_top_k, dtype=torch.int32, device=comp_k.device)
+        self._sel_idx_buf = torch.empty(bsz, _nkv, actual_top_k, dtype=torch.int32, device=paged_k.device)
         self._assemble_buf_len = _max_len
 
-    # Pre-allocate Q-RoPE buffer and fetch cos/sin
-    if cfg.continuous_rope:
-        if not hasattr(self, '_q_rope_buf'):
-            self._q_rope_buf = torch.empty_like(query_states)
-        q_rope_cos = self._rope_cos_2d[assembled_len - 1]  # [head_dim] — 1D index, fast
-        q_rope_sin = self._rope_sin_2d[assembled_len - 1]  # [head_dim]
-
-    if _enabled:
-        _rec(7)
-
-    # Step 6b: Assemble + K-RoPE (+ fused Q-RoPE in Kernel A for split mode)
+    # Step 7: assemble drop
     if cfg.unselected_mode == "drop":
         final_k, final_v = assemble_kv_drop_triton(
             paged_k, paged_v,
@@ -407,55 +465,35 @@ def profiled_dct_page_attention_forward(
             out_k=self._final_k_buf,
             out_v=self._final_v_buf,
             out_sel_idx=self._sel_idx_buf,
+            original_position_rope=fuse_final_k_original_rope,
         )
-        # Q-RoPE not fused into drop mode — apply separately
-        if cfg.continuous_rope:
-            query_states = apply_rope_q_direct(query_states, q_rope_cos, q_rope_sin, self._q_rope_buf)
     else:
-        # Build stride cache on first call (strides never change)
-        if not hasattr(self, '_assemble_stride_cache'):
-            self._assemble_stride_cache = build_assemble_stride_cache(
-                paged_k, comp_k, sink_k, recent_k, selected_indices,
-                cos_table, self._final_k_buf,
-                query_states=query_states if cfg.continuous_rope else None,
-            )
-
-        # Compressed mode: fused Triton assemble (Kernel A + B + Q-RoPE) with stride cache
-        if cfg.continuous_rope:
-            final_k, final_v, q_rope_out = assemble_kv_split_triton(
-                paged_k, paged_v, comp_k, comp_v,
-                sink_k, sink_v, recent_k, recent_v,
-                selected_indices,
-                cos_table, sin_table,
-                out_k=self._final_k_buf,
-                out_v=self._final_v_buf,
-                query_states=query_states,
-                q_rope_cos=q_rope_cos,
-                q_rope_sin=q_rope_sin,
-                q_rope_buf=self._q_rope_buf,
-                stride_cache=self._assemble_stride_cache,
-            )
-            query_states = q_rope_out
-        else:
-            final_k, final_v = assemble_kv_split_triton(
-                paged_k, paged_v, comp_k, comp_v,
-                sink_k, sink_v, recent_k, recent_v,
-                selected_indices,
-                cos_table, sin_table,
-                out_k=self._final_k_buf,
-                out_v=self._final_v_buf,
-                stride_cache=self._assemble_stride_cache,
-            )
+        raise NotImplementedError("profile_decode only supports the current drop-mode default path.")
 
     if _enabled:
         _rec(8)
+
+    if cfg.continuous_rope:
+        if query_states_rope is None:
+            query_states_rope = _apply_decode_query_rope(self, query_states, cos, sin, cfg)
+        query_states = query_states_rope
+        if not fuse_final_k_original_rope:
+            final_k = _apply_original_position_rope_to_final_k(
+                self,
+                final_k,
+                selected_indices,
+                num_pages,
+                actual_recent,
+                cfg,
+                self.config,
+            )
 
     attn_output = F.scaled_dot_product_attention(
         query_states, final_k, final_v,
         is_causal=False,
         enable_gqa=True,
     )
-
+    attn_output = attn_output.transpose(1, 2).contiguous()
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
 
     if _enabled:
@@ -466,9 +504,10 @@ def profiled_dct_page_attention_forward(
     if _enabled:
         _rec(10)
         step_names = [
-            "1_qkv_proj", "2_rope_cache", "3_segment_kv",
-            "4_dct_compress", "5_score_pages", "6a_topk_sort",
-            "6a_ropetable_buffersetting", "6b_assemble", "7a_sdpa", "7b_o_proj",
+            "1_qkv", "2_kv_update", "3_segment",
+            "4_compress", "5a_score_cache_update", "5b_score_pages_kernel",
+            "6_topk", "7_assemble_drop_and_final_k_original_rope",
+            "8_sdpa", "9_o_proj",
         ]
         for i, name in enumerate(step_names):
             _pending_events.append((name, ev[i], ev[i + 1]))
@@ -489,7 +528,7 @@ def profiled_baseline_forward(
     hidden_states,
     position_embeddings,
     attention_mask=None,
-    past_key_values=None,
+    past_key_value=None,
     cache_position=None,
     **kwargs,
 ):
@@ -513,16 +552,17 @@ def profiled_baseline_forward(
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_values is not None:
+        if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(
+            key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get("sdpa", eager_attention_forward)
+        attention_interface = _get_attention_interface(self)
         attn_output, attn_weights = attention_interface(
             self, query_states, key_states, value_states, attention_mask,
-            dropout=0.0, scaling=self.scaling,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
             sliding_window=getattr(self, "sliding_window", None), **kwargs,
         )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -545,9 +585,9 @@ def profiled_baseline_forward(
     # Step 2: RoPE + KV cache update
     cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-    if past_key_values is not None:
+    if past_key_value is not None:
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        key_states, value_states = past_key_values.update(
+        key_states, value_states = past_key_value.update(
             key_states, value_states, self.layer_idx, cache_kwargs
         )
 
@@ -588,14 +628,14 @@ def parse_args():
     p.add_argument("--mode", choices=["dct", "baseline", "both"], default="both")
 
     # DCT config
-    p.add_argument("--page_size", type=int, default=128)
-    p.add_argument("--top_k", type=int, default=8)
+    p.add_argument("--page_size", type=int, default=32)
+    p.add_argument("--top_k", type=int, default=64)
     p.add_argument("--sink_size", type=int, default=4)
     p.add_argument("--recent_size", type=int, default=128)
-    p.add_argument("--compress_ratio", type=float, default=4/128)
-    p.add_argument("--scoring_method", default="mean")
-    p.add_argument("--group_agg_method", default="max")
-    p.add_argument("--unselected_mode", default="compressed",
+    p.add_argument("--compress_ratio", type=float, default=0.03125)
+    p.add_argument("--scoring_method", default="max")
+    p.add_argument("--group_agg_method", default="mean")
+    p.add_argument("--unselected_mode", default="drop",
                    choices=["drop", "compressed"])
     p.add_argument("--no_continuous_rope", action="store_true",
                    help="Disable continuous RoPE (enabled by default)")

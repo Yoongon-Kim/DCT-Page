@@ -62,7 +62,7 @@ def parse_args():
                         help="Max samples to evaluate (-1 = all 503)")
 
     # Output
-    parser.add_argument("--output_dir", type=str, default="results_longbench_v2")
+    parser.add_argument("--output_dir", type=str, default="results/longbench_v2")
     parser.add_argument("--run_name", type=str, default=None,
                         help="Name for this run (auto-generated if not given)")
 
@@ -73,18 +73,18 @@ def parse_args():
                         help="Size of each position gap (multiple of page_size)")
 
     # DCT Page Attention params (only used when mode=page_attention)
-    parser.add_argument("--page_size", type=int, default=128)
-    parser.add_argument("--top_k", type=int, default=8)
+    parser.add_argument("--page_size", type=int, default=32)
+    parser.add_argument("--top_k", type=int, default=64)
     parser.add_argument("--sink_size", type=int, default=4)
     parser.add_argument("--recent_size", type=int, default=128)
-    parser.add_argument("--compress_ratio", type=float, default=0.25)
+    parser.add_argument("--compress_ratio", type=float, default=0.03125)
     parser.add_argument("--scoring_method", type=str, default="max",
                         choices=["mean", "max", "sum"])
     parser.add_argument("--group_agg_method", type=str, default="mean",
                         choices=["mean", "max", "topp"],
                         help="How to aggregate per-head scores within a GQA group")
     parser.add_argument("--unselected_mode", type=str, default="drop",
-                        choices=["drop", "compressed"])
+                        choices=["drop", "compressed", "hybrid"])
     parser.add_argument("--no_continuous_rope", action="store_true",
                         help="Disable continuous RoPE (enabled by default)")
     parser.add_argument("--no_triton", action="store_true",
@@ -168,7 +168,7 @@ def compute_effective_len(input_len, args):
 
     if args.unselected_mode == "drop":
         return args.sink_size + top_k * args.page_size + actual_recent
-    elif args.unselected_mode == "compressed":
+    elif args.unselected_mode in {"compressed", "hybrid"}:
         comp_size = max(1, int(args.page_size * args.compress_ratio))
         num_unselected = num_pages - top_k
         return args.sink_size + top_k * args.page_size + num_unselected * comp_size + actual_recent
@@ -417,7 +417,7 @@ def main():
         device_map = "cuda:0" if args.mode == "multipole_attention" else "auto"
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
-            dtype=torch.bfloat16,
+            torch_dtype=torch.bfloat16,
             device_map=device_map,
             attn_implementation=attn_impl,
         )

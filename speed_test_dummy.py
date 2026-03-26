@@ -5,7 +5,7 @@ Generates random token sequences of configurable lengths, avoiding any dataset
 dependency.  Measures prefill and decode speed separately.
 
 Results are saved under:
-    results_speed_test_dummy/<run_name>/
+    results/speed_test_dummy/<run_name>/
         samples.jsonl   — per-(length, repeat) timing records
         summary.json    — aggregated stats grouped by context length
 
@@ -303,24 +303,24 @@ def parse_args():
     p.add_argument("--num_repeats", type=int, default=3,
                    help="Repeats per context length for averaging")
     p.add_argument("--max_new_tokens", type=int, default=128)
-    p.add_argument("--warmup_steps", type=int, default=8)
+    p.add_argument("--warmup_steps", type=int, default=1)
     p.add_argument("--chunk_size", type=int, default=0,
                    help="Chunked prefill size (0 = single-pass prefill). "
                         "Use e.g. 8192 to reduce peak memory for long contexts.")
-    p.add_argument("--output_dir", default="results_speed_test_dummy")
+    p.add_argument("--output_dir", default="results/speed_test_dummy")
     p.add_argument("--run_name", default=None)
 
     dct = p.add_argument_group("DCT Page Attention config")
-    dct.add_argument("--page_size", type=int, default=128)
-    dct.add_argument("--top_k", type=int, default=8)
+    dct.add_argument("--page_size", type=int, default=32)
+    dct.add_argument("--top_k", type=int, default=64)
     dct.add_argument("--sink_size", type=int, default=4)
     dct.add_argument("--recent_size", type=int, default=128)
-    dct.add_argument("--compress_ratio", type=float, default=0.03)
+    dct.add_argument("--compress_ratio", type=float, default=0.03125)
     dct.add_argument("--scoring_method", default="max", choices=["mean", "max"])
     dct.add_argument("--group_agg_method", default="mean",
                      choices=["mean", "max", "topp"])
     dct.add_argument("--unselected_mode", default="drop",
-                     choices=["drop", "compressed"])
+                     choices=["drop", "compressed", "hybrid"])
     dct.add_argument("--no_continuous_rope", action="store_true",
                      help="Disable continuous RoPE (enabled by default)")
     dct.add_argument("--no_triton", action="store_true",
@@ -361,15 +361,6 @@ def benchmark_dummy(model, tokenizer, args, label, context_lengths):
     vocab_size = tokenizer.vocab_size
     use_pre_alloc = (label == "dct") and not getattr(args, 'no_triton', False)
 
-    # Warmup run: triggers CUDA kernel compilation and memory allocation
-    warmup_len = min(context_lengths)
-    warmup_ids = torch.randint(0, vocab_size, (1, warmup_len), dtype=torch.long, device=device)
-    print(f"  [{label}] Warmup run (ctx={warmup_len})...")
-    time_sample(model, tokenizer, warmup_ids, min(16, args.max_new_tokens), 0,
-                use_pre_alloc=use_pre_alloc, chunk_size=args.chunk_size)
-    del warmup_ids
-    torch.cuda.empty_cache()
-
     all_records = []
     # stats grouped by context length: {ctx_len: {prefill_times, step_times}}
     per_length_stats = {}
@@ -379,6 +370,25 @@ def benchmark_dummy(model, tokenizer, args, label, context_lengths):
 
     for ctx_len in context_lengths:
         per_length_stats[ctx_len] = {"prefill_times": [], "step_times": []}
+
+        # Warm each context length separately so the first measured repeat for a
+        # given length does not absorb shape-specific kernel compilation or
+        # allocator/setup costs.
+        warmup_ids = torch.randint(
+            0, vocab_size, (1, ctx_len), dtype=torch.long, device=device
+        )
+        print(f"  [{label}] Warmup run (ctx={ctx_len})...")
+        time_sample(
+            model,
+            tokenizer,
+            warmup_ids,
+            min(16, args.max_new_tokens),
+            0,
+            use_pre_alloc=use_pre_alloc,
+            chunk_size=args.chunk_size,
+        )
+        del warmup_ids
+        torch.cuda.empty_cache()
 
         for repeat in range(args.num_repeats):
             run_idx += 1
@@ -578,7 +588,12 @@ def main():
     results = {}
 
     def run_mode(label, patch=False):
-        run_name = args.run_name or make_run_name(label, args)
+        if args.run_name is not None:
+            run_name = args.run_name
+            if args.mode == "both":
+                run_name = f"{run_name}_{label}"
+        else:
+            run_name = make_run_name(label, args)
         run_dir = Path(args.output_dir) / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
 

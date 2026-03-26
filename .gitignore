@@ -1,6 +1,9 @@
 page_selections.json
 old_tests/
-results*/
+results/
+results_longbench_compare*/
+results_speed_test_dummy/
+results_ruler/
 longbench_v1_data/
 ruler_data/
 __pycache__/

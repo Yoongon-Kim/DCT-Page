@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Summarize decode-speed benchmark results from results_speed_test_dummy/."""
+"""Summarize decode-speed benchmark results from results/speed_test_dummy/."""
 
 import json
 import sys
 from pathlib import Path
 
-RESULTS_DIR = Path(__file__).parent / "results_speed_test_dummy"
+RESULTS_DIR = Path(__file__).parent / "results" / "speed_test_dummy"
 
 
 def load_summaries(results_dir: Path) -> dict:

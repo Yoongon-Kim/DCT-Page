@@ -28,11 +28,12 @@ from transformers.cache_utils import Cache, DynamicLayer
 from config import DCTPageConfig
 from triton_kernels import (
     assemble_kv_split_triton, 
-    apply_rope_q_direct, 
     build_assemble_stride_cache, 
+    build_assemble_drop_stride_cache,
     topk_sort_triton, 
     assemble_kv_drop_triton, 
     score_pages_triton,
+    apply_rope_q_direct,
 )
 
 # ---------------------------------------------------------------------------
@@ -92,7 +93,7 @@ class PreAllocatedLayer(DynamicLayer):
         # Return view of valid portion (zero-copy, strides unchanged)
         return self.keys[:, :, :end, :], self.values[:, :, :end, :]
 
-    def get_seq_length(self):
+    def get_seq_length(self, cache_position=None):
         return self._seen
 
 
@@ -104,9 +105,23 @@ def pre_allocate_cache(cache, extra_tokens=256):
 
 
 # ---------------------------------------------------------------------------
-# Global config — set by replace_qwen2_attn()
+# Global config / debug hook
 # ---------------------------------------------------------------------------
 _dct_page_cfg: Optional[DCTPageConfig] = None
+_dct_page_debug_hook: Optional[Callable[[dict], None]] = None
+
+
+def set_dct_page_debug_hook(hook: Optional[Callable[[dict], None]]) -> None:
+    """Install an optional callback for decode-time page selection debugging."""
+    global _dct_page_debug_hook
+    _dct_page_debug_hook = hook
+
+
+def _get_attention_interface(attn_module: nn.Module) -> Callable:
+    """Mirror the upstream attention backend dispatch used by HF 4.54.x."""
+    if attn_module.config._attn_implementation == "eager":
+        return eager_attention_forward
+    return ALL_ATTENTION_FUNCTIONS[attn_module.config._attn_implementation]
 
 
 # ---------------------------------------------------------------------------
@@ -222,10 +237,96 @@ def dct_compress_page(x, compressed_len):
     return compressed.reshape(bsz, compressed_len, num_heads, head_dim).transpose(1, 2)
 
 
+def dct_project_page(x, compressed_len):
+    """
+    Project a KV tensor to leading DCT coefficients along the sequence dimension.
+
+    Args:
+        x: [bsz, num_heads, seq_len, head_dim], seq_len: sequence length per page
+        compressed_len: number of low-frequency coefficients to keep
+
+    Returns:
+        [bsz, num_heads, min(compressed_len, seq_len), head_dim]
+    """
+    bsz, num_heads, seq_len, head_dim = x.shape
+    keep_len = min(compressed_len, seq_len)
+
+    x_merged = x.transpose(1, 2).reshape(bsz, seq_len, num_heads * head_dim)
+    x_dct = dct(x_merged.transpose(1, 2), norm='ortho')
+    x_dct = x_dct[:, :, :keep_len].transpose(1, 2)
+    spectral = x_dct.to(x.dtype)
+    return spectral.reshape(bsz, keep_len, num_heads, head_dim).transpose(1, 2)
+
+
+def _normalize_frequency_indices(indices, seq_len, comp_size):
+    """Deduplicate/clamp indices while preserving order and filling missing slots."""
+    seen = set()
+    normalized = []
+    for idx in indices:
+        idx = max(0, min(int(idx), seq_len - 1))
+        if idx in seen:
+            continue
+        normalized.append(idx)
+        seen.add(idx)
+        if len(normalized) == comp_size:
+            return normalized
+
+    for idx in range(seq_len):
+        if idx in seen:
+            continue
+        normalized.append(idx)
+        if len(normalized) == comp_size:
+            break
+    return normalized
+
+
+def _resolve_frequency_keep_indices(seq_len, comp_size, layout):
+    """Choose which DCT frequencies to retain for proxy construction."""
+    if comp_size >= seq_len or layout == "low":
+        return list(range(min(comp_size, seq_len)))
+
+    if layout == "low_high":
+        low_count = (comp_size + 1) // 2
+        high_count = comp_size - low_count
+        indices = list(range(low_count)) + list(range(seq_len - high_count, seq_len))
+        return _normalize_frequency_indices(indices, seq_len, comp_size)
+
+    if layout == "low_mid_high":
+        low_count = min(2, comp_size)
+        remaining = comp_size - low_count
+        indices = list(range(low_count))
+        if remaining > 0:
+            tail = np.linspace(seq_len // 2, seq_len - 1, num=remaining, dtype=int).tolist()
+            indices.extend(tail)
+        return _normalize_frequency_indices(indices, seq_len, comp_size)
+
+    if layout == "spread":
+        indices = np.linspace(0, seq_len - 1, num=comp_size, dtype=int).tolist()
+        return _normalize_frequency_indices(indices, seq_len, comp_size)
+
+    raise ValueError(f"Unsupported proxy_frequency_layout: {layout}")
+
+
+def dct_compress_page_with_indices(x, freq_indices):
+    """Compress a page by selecting specific DCT frequencies before IDCT."""
+    comp_size = len(freq_indices)
+    if comp_size >= x.shape[2] and list(freq_indices) == list(range(x.shape[2])):
+        return x
+
+    bsz, num_heads, seq_len, head_dim = x.shape
+    x_merged = x.transpose(1, 2).reshape(bsz, seq_len, num_heads * head_dim)
+    x_dct = dct(x_merged.transpose(1, 2), norm='ortho')
+    index_tensor = torch.tensor(freq_indices, device=x.device, dtype=torch.long)
+    x_dct = x_dct.index_select(2, index_tensor)
+    x_idct = idct(x_dct, norm='ortho').transpose(1, 2) * math.sqrt(comp_size / seq_len)
+    compressed = x_idct.to(x.dtype)
+    return compressed.reshape(bsz, comp_size, num_heads, head_dim).transpose(1, 2)
+
+
 # ---------------------------------------------------------------------------
 # DCT Projection Matrix (replaces FFT with a single matmul)
 # ---------------------------------------------------------------------------
-def _build_dct_projection_matrix(page_size, comp_size, device, dtype):
+def _build_dct_projection_matrix(page_size, comp_size, device, dtype, layout):
     """Precompute the [comp_size, page_size] projection matrix.
 
     The full DCT compression pipeline (DCT → truncate → IDCT → energy
@@ -234,17 +335,204 @@ def _build_dct_projection_matrix(page_size, comp_size, device, dtype):
     """
     I = torch.eye(page_size, device=device, dtype=torch.float32)
     I = I.unsqueeze(0).unsqueeze(0)  # [1, 1, page_size, page_size]
-    M = dct_compress_page(I, comp_size)  # [1, 1, comp_size, page_size]
+    freq_indices = _resolve_frequency_keep_indices(page_size, comp_size, layout)
+    M = dct_compress_page_with_indices(I, freq_indices)  # [1, 1, comp_size, page_size]
     return M.squeeze(0).squeeze(0).to(dtype)  # [comp_size, page_size]
+
+
+def _build_dct_spectral_projection_matrix(page_size, comp_size, device, dtype, layout):
+    """Precompute the [comp_size, page_size] DCT basis for direct spectral proxies."""
+    I = torch.eye(page_size, device=device, dtype=torch.float32)
+    I = I.unsqueeze(0).unsqueeze(0)  # [1, 1, page_size, page_size]
+    freq_indices = _resolve_frequency_keep_indices(page_size, comp_size, layout)
+    M = dct_project_page(I, page_size)
+    index_tensor = torch.tensor(freq_indices, device=device, dtype=torch.long)
+    M = M.index_select(2, index_tensor)  # [1, 1, comp_size, page_size]
+    return M.squeeze(0).squeeze(0).to(dtype)  # [comp_size, page_size]
+
+
+def _build_haar_lowpass_projection_matrix(page_size, comp_size, device, dtype):
+    """Precompute a coarse Haar-style lowpass projection matrix.
+
+    Each proxy is the mean over an evenly partitioned contiguous block. For
+    `page_size=128, comp_size=4`, this yields four 32-token lowpass proxies.
+    """
+    M = torch.zeros(comp_size, page_size, device=device, dtype=torch.float32)
+    for idx in range(comp_size):
+        start = (idx * page_size) // comp_size
+        end = ((idx + 1) * page_size) // comp_size
+        if end <= start:
+            end = min(page_size, start + 1)
+        M[idx, start:end] = 1.0 / float(end - start)
+    return M.to(dtype)
+
+
+def _build_haar_mixed_supports(page_size, comp_size):
+    """Return support intervals for global-plus-detail Haar proxies."""
+    supports = [(0, page_size)]
+    if comp_size <= 1:
+        return supports
+
+    intervals = [(0, page_size)]
+    queue_idx = 0
+    while len(supports) < comp_size and queue_idx < len(intervals):
+        start, end = intervals[queue_idx]
+        queue_idx += 1
+        if end - start < 2:
+            continue
+
+        mid = (start + end) // 2
+        if mid <= start or mid >= end:
+            continue
+
+        supports.append((start, end))
+        intervals.append((start, mid))
+        intervals.append((mid, end))
+
+    fill_idx = 0
+    while len(supports) < comp_size:
+        start = (fill_idx * page_size) // comp_size
+        end = max(((fill_idx + 1) * page_size) // comp_size, start + 1)
+        supports.append((start, min(page_size, end)))
+        fill_idx += 1
+
+    return supports
+
+
+def _build_haar_mixed_projection_matrix(page_size, comp_size, device, dtype):
+    """Precompute global-mean plus coarse-detail Haar proxies.
+
+    Row 0 is a full-page mean. Remaining rows follow a breadth-first Haar
+    detail decomposition, using half-differences over each interval.
+    """
+    supports = _build_haar_mixed_supports(page_size, comp_size)
+    M = torch.zeros(comp_size, page_size, device=device, dtype=torch.float32)
+
+    for idx, (start, end) in enumerate(supports):
+        if idx == 0:
+            M[idx, start:end] = 1.0 / float(max(end - start, 1))
+            continue
+
+        mid = (start + end) // 2
+        if mid <= start or mid >= end:
+            M[idx, start:end] = 1.0 / float(max(end - start, 1))
+            continue
+
+        left_len = mid - start
+        right_len = end - mid
+        # Keep the proxy scale comparable to block means.
+        M[idx, start:mid] = 0.5 / float(left_len)
+        M[idx, mid:end] = -0.5 / float(right_len)
+
+    return M.to(dtype)
+
+
+def _is_power_of_two(value):
+    return value > 0 and (value & (value - 1)) == 0
+
+
+def _build_walsh_hadamard_matrix(size, device, dtype):
+    """Build an orthonormal Walsh-Hadamard matrix in sequency order."""
+    if not _is_power_of_two(size):
+        raise ValueError(f"Hadamard proxy requires power-of-two size, got {size}")
+
+    H = torch.tensor([[1.0]], device=device, dtype=torch.float32)
+    while H.shape[0] < size:
+        H = torch.cat(
+            [
+                torch.cat([H, H], dim=1),
+                torch.cat([H, -H], dim=1),
+            ],
+            dim=0,
+        )
+    H = H / math.sqrt(size)
+    sign_changes = (H[:, 1:] * H[:, :-1] < 0).sum(dim=1)
+    perm = torch.argsort(sign_changes, stable=True)
+    return H.index_select(0, perm).to(dtype)
+
+
+def _build_hadamard_projection_matrix(page_size, comp_size, device, dtype):
+    """Precompute the [comp_size, page_size] Walsh-Hadamard projection matrix."""
+    if not _is_power_of_two(page_size) or not _is_power_of_two(comp_size):
+        raise ValueError(
+            f"Hadamard proxy requires power-of-two page_size/comp_size, got "
+            f"{page_size}/{comp_size}"
+        )
+    H_page = _build_walsh_hadamard_matrix(page_size, device, torch.float32)
+    H_comp = _build_walsh_hadamard_matrix(comp_size, device, torch.float32)
+    M = math.sqrt(comp_size / page_size) * torch.matmul(H_comp.transpose(0, 1), H_page[:comp_size, :])
+    return M.to(dtype)
 
 
 def _get_or_build_projection_matrix(attn_module, page_size, comp_size, device, dtype):
     """Return cached projection matrix, building it on first call."""
     M = getattr(attn_module, '_dct_proj_matrix', None)
-    if M is None or M.shape != (comp_size, page_size) or M.device != device:
-        M = _build_dct_projection_matrix(page_size, comp_size, device, dtype)
+    layout = _dct_page_cfg.proxy_frequency_layout
+    cached_layout = getattr(attn_module, '_dct_proj_matrix_layout', None)
+    if (
+        M is None
+        or M.shape != (comp_size, page_size)
+        or M.device != device
+        or cached_layout != layout
+    ):
+        M = _build_dct_projection_matrix(page_size, comp_size, device, dtype, layout)
         attn_module._dct_proj_matrix = M
+        attn_module._dct_proj_matrix_layout = layout
     return M
+
+
+def _get_or_build_spectral_projection_matrix(attn_module, page_size, comp_size, device, dtype):
+    """Return cached DCT basis matrix for direct spectral score proxies."""
+    M = getattr(attn_module, '_dct_spectral_proj_matrix', None)
+    layout = _dct_page_cfg.proxy_frequency_layout
+    cached_layout = getattr(attn_module, '_dct_spectral_proj_matrix_layout', None)
+    if (
+        M is None
+        or M.shape != (comp_size, page_size)
+        or M.device != device
+        or cached_layout != layout
+    ):
+        M = _build_dct_spectral_projection_matrix(page_size, comp_size, device, dtype, layout)
+        attn_module._dct_spectral_proj_matrix = M
+        attn_module._dct_spectral_proj_matrix_layout = layout
+    return M
+
+
+def _get_or_build_haar_projection_matrix(attn_module, page_size, comp_size, device, dtype):
+    """Return cached Haar lowpass projection matrix."""
+    M = getattr(attn_module, '_dct_haar_proj_matrix', None)
+    if M is None or M.shape != (comp_size, page_size) or M.device != device:
+        M = _build_haar_lowpass_projection_matrix(page_size, comp_size, device, dtype)
+        attn_module._dct_haar_proj_matrix = M
+    return M
+
+
+def _get_or_build_haar_mixed_projection_matrix(attn_module, page_size, comp_size, device, dtype):
+    """Return cached mixed Haar projection matrix."""
+    M = getattr(attn_module, '_dct_haar_mixed_proj_matrix', None)
+    if M is None or M.shape != (comp_size, page_size) or M.device != device:
+        M = _build_haar_mixed_projection_matrix(page_size, comp_size, device, dtype)
+        attn_module._dct_haar_mixed_proj_matrix = M
+    return M
+
+
+def _get_or_build_hadamard_projection_matrix(attn_module, page_size, comp_size, device, dtype):
+    """Return cached Hadamard projection matrix."""
+    M = getattr(attn_module, '_dct_hadamard_proj_matrix', None)
+    if M is None or M.shape != (comp_size, page_size) or M.device != device:
+        M = _build_hadamard_projection_matrix(page_size, comp_size, device, dtype)
+        attn_module._dct_hadamard_proj_matrix = M
+    return M
+
+
+def _next_page_capacity(required_pages, current_capacity):
+    """Grow page caches geometrically to avoid repeated realloc/copy."""
+    if current_capacity >= required_pages:
+        return current_capacity
+    new_capacity = max(8, current_capacity or 0)
+    while new_capacity < required_pages:
+        new_capacity *= 2
+    return new_capacity
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +584,80 @@ def _compute_rope_cos_sin(positions, config, device, dtype):
     return cos, sin
 
 
+def _apply_decode_query_rope(attn_module, query_states, cos, sin, cfg):
+    """Apply RoPE to a single-token decode query, using Triton when safe."""
+    if (
+        cfg.use_triton
+        and query_states.shape[0] == 1
+        and query_states.shape[2] == 1
+        and cos.ndim == 3
+        and sin.ndim == 3
+        and cos.shape[0] == 1
+        and sin.shape[0] == 1
+        and cos.shape[1] == 1
+        and sin.shape[1] == 1
+    ):
+        q_rope_buf = getattr(attn_module, "_q_rope_buf", None)
+        if q_rope_buf is None or q_rope_buf.shape != query_states.shape:
+            attn_module._q_rope_buf = torch.empty_like(query_states)
+            q_rope_buf = attn_module._q_rope_buf
+        return apply_rope_q_direct(query_states, cos[0, 0].contiguous(), sin[0, 0].contiguous(), q_rope_buf)
+    query_states_rope, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
+    return query_states_rope
+
+
+def _get_or_build_original_position_rope_tables(attn_module, required_len, config, device, dtype):
+    """Cache 2D RoPE tables for contiguous original token positions [0, required_len)."""
+    cached_len = getattr(attn_module, "_orig_pos_rope_cache_len", 0)
+    cached_cos = getattr(attn_module, "_orig_pos_rope_cos_2d", None)
+    cached_sin = getattr(attn_module, "_orig_pos_rope_sin_2d", None)
+
+    need_rebuild = (
+        cached_cos is None
+        or cached_sin is None
+        or cached_len < required_len
+        or cached_cos.device != device
+        or cached_cos.dtype != dtype
+    )
+    if need_rebuild:
+        cache_len = _next_page_capacity(required_len, cached_len)
+        positions = torch.arange(cache_len, device=device)
+        cos, sin = _compute_rope_cos_sin(positions, config, device, dtype)
+        attn_module._orig_pos_rope_cos_2d = cos[0, 0]
+        attn_module._orig_pos_rope_sin_2d = sin[0, 0]
+        attn_module._orig_pos_rope_cache_len = cache_len
+
+    return (
+        attn_module._orig_pos_rope_cos_2d[:required_len],
+        attn_module._orig_pos_rope_sin_2d[:required_len],
+    )
+
+
+def _compute_rope_cos_sin_for_position_ids(position_ids, config, device, dtype):
+    """Compute cos/sin for arbitrary per-head position ids.
+
+    Args:
+        position_ids: integer tensor shaped [..., seq_len]
+
+    Returns:
+        cos, sin: tensors shaped [..., seq_len, head_dim]
+    """
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    rope_type = "default"
+    if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
+        rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type", "default"))
+
+    inv_freq, attention_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, device)
+    freqs = position_ids.to(device=device, dtype=torch.float32).unsqueeze(-1) * inv_freq.view(
+        *([1] * position_ids.dim()), -1
+    )
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos = (emb.cos() * attention_scaling).to(dtype)
+    sin = (emb.sin() * attention_scaling).to(dtype)
+    return cos, sin
+
+
 # ---------------------------------------------------------------------------
 # KV segmentation without DCT (for incremental compression)
 # ---------------------------------------------------------------------------
@@ -336,7 +698,7 @@ def segment_kv(key_states, value_states, cfg):
 # ---------------------------------------------------------------------------
 # Incremental compressed page cache
 # ---------------------------------------------------------------------------
-def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size):
+def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, need_values=True):
     """
     Incrementally maintain DCT-compressed page representations.
 
@@ -347,17 +709,22 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size):
     bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
 
     cached_k = getattr(attn_module, '_dct_comp_k_cache', None)
-    n_cached  = getattr(attn_module, '_dct_n_pages_cached', 0)
+    cached_v = getattr(attn_module, '_dct_comp_v_cache', None)
+    n_cached = getattr(attn_module, '_dct_n_pages_cached', 0)
+    capacity = getattr(attn_module, '_dct_comp_cache_capacity', 0)
 
     # Invalidate cache when the sequence restarts or config changed
     if (cached_k is None
             or num_pages < n_cached
             or cached_k.shape[0] != bsz
-            or cached_k.shape[3] != comp_size):
+            or cached_k.shape[3] != comp_size
+            or (need_values and cached_v is None and n_cached > 0)):
         attn_module._dct_comp_k_cache  = None
         attn_module._dct_comp_v_cache  = None
         attn_module._dct_n_pages_cached = 0
+        attn_module._dct_comp_cache_capacity = 0
         n_cached = 0
+        capacity = 0
 
     n_new = num_pages - n_cached
     if n_new > 0:
@@ -368,22 +735,713 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size):
             attn_module, page_size, comp_size, new_k.device, new_k.dtype
         )
         new_comp_k = torch.einsum('cs,bhnsd->bhncd', M, new_k)
-        new_comp_v = torch.einsum('cs,bhnsd->bhncd', M, new_v)
+        new_comp_v = (
+            torch.einsum('cs,bhnsd->bhncd', M, new_v)
+            if need_values
+            else None
+        )
 
-        if attn_module._dct_comp_k_cache is None:
-            attn_module._dct_comp_k_cache = new_comp_k
-            attn_module._dct_comp_v_cache = new_comp_v
-        else:
-            attn_module._dct_comp_k_cache = torch.cat(
-                [attn_module._dct_comp_k_cache, new_comp_k], dim=2
+        if num_pages > capacity:
+            new_capacity = _next_page_capacity(num_pages, capacity)
+            new_k_cache = torch.empty(
+                bsz, num_kv_heads, new_capacity, comp_size, head_dim,
+                dtype=new_comp_k.dtype, device=new_comp_k.device,
             )
-            attn_module._dct_comp_v_cache = torch.cat(
-                [attn_module._dct_comp_v_cache, new_comp_v], dim=2
-            )
+            if n_cached > 0 and attn_module._dct_comp_k_cache is not None:
+                new_k_cache[:, :, :n_cached].copy_(attn_module._dct_comp_k_cache[:, :, :n_cached])
+            attn_module._dct_comp_k_cache = new_k_cache
+
+            if need_values:
+                new_v_cache = torch.empty_like(new_k_cache)
+                if n_cached > 0 and cached_v is not None:
+                    new_v_cache[:, :, :n_cached].copy_(cached_v[:, :, :n_cached])
+                attn_module._dct_comp_v_cache = new_v_cache
+            else:
+                attn_module._dct_comp_v_cache = None
+
+            attn_module._dct_comp_cache_capacity = new_capacity
+
+        attn_module._dct_comp_k_cache[:, :, n_cached:num_pages].copy_(new_comp_k)
+        if need_values and new_comp_v is not None:
+            attn_module._dct_comp_v_cache[:, :, n_cached:num_pages].copy_(new_comp_v)
 
         attn_module._dct_n_pages_cached = num_pages
 
-    return attn_module._dct_comp_k_cache, attn_module._dct_comp_v_cache
+    comp_k = attn_module._dct_comp_k_cache
+    comp_v = attn_module._dct_comp_v_cache if need_values else None
+    if comp_k is None:
+        return None, None
+    return comp_k[:, :, :num_pages], None if comp_v is None else comp_v[:, :, :num_pages]
+
+
+def _compress_pages(attn_module, paged_x, comp_size):
+    """Project [bsz, kv_heads, num_pages, page_size, head_dim] pages to comp_size."""
+    page_size = paged_x.shape[3]
+    M = _get_or_build_projection_matrix(
+        attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
+    )
+    return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
+
+
+def _project_pages_to_spectral(attn_module, paged_x, comp_size):
+    """Project pages to their leading DCT coefficients without IDCT reconstruction."""
+    page_size = paged_x.shape[3]
+    M = _get_or_build_spectral_projection_matrix(
+        attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
+    )
+    return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
+
+
+def _project_pages_to_haar_lowpass(attn_module, paged_x, comp_size):
+    """Project pages to coarse Haar lowpass block means."""
+    if comp_size == 1:
+        return paged_x.mean(dim=3, keepdim=True)
+    page_size = paged_x.shape[3]
+    M = _get_or_build_haar_projection_matrix(
+        attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
+    )
+    return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
+
+
+def _project_pages_to_haar_mixed(attn_module, paged_x, comp_size):
+    """Project pages to mixed global/detail Haar proxies."""
+    page_size = paged_x.shape[3]
+    M = _get_or_build_haar_mixed_projection_matrix(
+        attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
+    )
+    return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
+
+
+def _project_pages_to_hadamard(attn_module, paged_x, comp_size):
+    """Project pages to Walsh-Hadamard compressed proxies."""
+    page_size = paged_x.shape[3]
+    M = _get_or_build_hadamard_projection_matrix(
+        attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
+    )
+    return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
+
+
+def _update_score_key_cache(attn_module, paged_k, num_pages, comp_size, cfg):
+    """Maintain a separate score-time key cache in original-position RoPE space."""
+    bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
+
+    cached_k = getattr(attn_module, '_dct_score_comp_k_cache', None)
+    n_cached = getattr(attn_module, '_dct_score_n_pages_cached', 0)
+    capacity = getattr(attn_module, '_dct_score_cache_capacity', 0)
+
+    if (
+        cached_k is None
+        or num_pages < n_cached
+        or cached_k.shape[0] != bsz
+        or cached_k.shape[3] != comp_size
+    ):
+        attn_module._dct_score_comp_k_cache = None
+        attn_module._dct_score_n_pages_cached = 0
+        attn_module._dct_score_cache_capacity = 0
+        n_cached = 0
+        capacity = 0
+
+    n_new = num_pages - n_cached
+    if n_new > 0:
+        new_k = paged_k[:, :, n_cached:num_pages]
+        flat_k = new_k.reshape(bsz, num_kv_heads, n_new * page_size, head_dim)
+        start_pos = cfg.sink_size + n_cached * page_size
+        end_pos = start_pos + n_new * page_size
+        cos_table, sin_table = _get_or_build_original_position_rope_tables(
+            attn_module, end_pos, attn_module.config, new_k.device, new_k.dtype
+        )
+        cos_pages = cos_table[start_pos:end_pos].unsqueeze(0).unsqueeze(0)
+        sin_pages = sin_table[start_pos:end_pos].unsqueeze(0).unsqueeze(0)
+        flat_k_rope = _apply_rope(flat_k, cos_pages, sin_pages)
+        new_k_rope = flat_k_rope.reshape(bsz, num_kv_heads, n_new, page_size, head_dim)
+        new_comp_k = _compress_pages(attn_module, new_k_rope, comp_size)
+
+        if num_pages > capacity:
+            new_capacity = _next_page_capacity(num_pages, capacity)
+            new_cache = torch.empty(
+                bsz, num_kv_heads, new_capacity, comp_size, head_dim,
+                dtype=new_comp_k.dtype, device=new_comp_k.device,
+            )
+            if n_cached > 0 and attn_module._dct_score_comp_k_cache is not None:
+                new_cache[:, :, :n_cached].copy_(attn_module._dct_score_comp_k_cache[:, :, :n_cached])
+            attn_module._dct_score_comp_k_cache = new_cache
+            attn_module._dct_score_cache_capacity = new_capacity
+
+        attn_module._dct_score_comp_k_cache[:, :, n_cached:num_pages].copy_(new_comp_k)
+
+        attn_module._dct_score_n_pages_cached = num_pages
+
+    return attn_module._dct_score_comp_k_cache[:, :, :num_pages]
+
+
+def _update_score_spectral_key_cache(attn_module, paged_k, num_pages, comp_size, cfg):
+    """Maintain a score-time cache of direct spectral proxies in original-position RoPE space."""
+    bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
+
+    cached_k = getattr(attn_module, '_dct_score_spectral_k_cache', None)
+    n_cached = getattr(attn_module, '_dct_score_spectral_n_pages_cached', 0)
+
+    if (
+        cached_k is None
+        or num_pages < n_cached
+        or cached_k.shape[0] != bsz
+        or cached_k.shape[3] != comp_size
+    ):
+        attn_module._dct_score_spectral_k_cache = None
+        attn_module._dct_score_spectral_n_pages_cached = 0
+        n_cached = 0
+
+    n_new = num_pages - n_cached
+    if n_new > 0:
+        new_k = paged_k[:, :, n_cached:num_pages]
+        flat_k = new_k.reshape(bsz, num_kv_heads, n_new * page_size, head_dim)
+        start_pos = cfg.sink_size + n_cached * page_size
+        positions = torch.arange(
+            start_pos,
+            start_pos + n_new * page_size,
+            device=new_k.device,
+        )
+        cos_pages, sin_pages = _compute_rope_cos_sin(
+            positions, attn_module.config, new_k.device, new_k.dtype
+        )
+        flat_k_rope = _apply_rope(flat_k, cos_pages, sin_pages)
+        new_k_rope = flat_k_rope.reshape(bsz, num_kv_heads, n_new, page_size, head_dim)
+        new_spec_k = _project_pages_to_spectral(attn_module, new_k_rope, comp_size)
+
+        if attn_module._dct_score_spectral_k_cache is None:
+            attn_module._dct_score_spectral_k_cache = new_spec_k
+        else:
+            attn_module._dct_score_spectral_k_cache = torch.cat(
+                [attn_module._dct_score_spectral_k_cache, new_spec_k], dim=2
+            )
+
+        attn_module._dct_score_spectral_n_pages_cached = num_pages
+
+    return attn_module._dct_score_spectral_k_cache
+
+
+def _haar_proxy_block_center_positions(start_page_idx, n_pages, page_size, comp_size, sink_size, device):
+    """Anchor each Haar lowpass proxy to the center of its source block."""
+    page_ids = torch.arange(start_page_idx, start_page_idx + n_pages, device=device, dtype=torch.long)
+    page_bases = sink_size + page_ids[:, None] * page_size
+    starts = torch.tensor(
+        [(idx * page_size) // comp_size for idx in range(comp_size)],
+        device=device,
+        dtype=torch.long,
+    )
+    ends = torch.tensor(
+        [max(((idx + 1) * page_size) // comp_size, (idx * page_size) // comp_size + 1) for idx in range(comp_size)],
+        device=device,
+        dtype=torch.long,
+    )
+    proxy_offsets = ((starts + ends - 1) // 2).clamp_max(page_size - 1)
+    return page_bases + proxy_offsets[None, :]
+
+
+def _haar_mixed_proxy_anchor_positions(start_page_idx, n_pages, page_size, comp_size, sink_size, device):
+    """Anchor each mixed Haar proxy to the center of its support interval."""
+    page_ids = torch.arange(start_page_idx, start_page_idx + n_pages, device=device, dtype=torch.long)
+    page_bases = sink_size + page_ids[:, None] * page_size
+    supports = _build_haar_mixed_supports(page_size, comp_size)
+    proxy_offsets = torch.tensor(
+        [min(page_size - 1, (start + end - 1) // 2) for start, end in supports],
+        device=device,
+        dtype=torch.long,
+    )
+    return page_bases + proxy_offsets[None, :]
+
+
+def _update_score_haar_key_cache(attn_module, paged_k, num_pages, comp_size, cfg):
+    """Maintain a separate score-time cache of Haar lowpass proxies."""
+    bsz, num_kv_heads, _, _, head_dim = paged_k.shape
+
+    cached_k = getattr(attn_module, '_dct_score_haar_k_cache', None)
+    n_cached = getattr(attn_module, '_dct_score_haar_n_pages_cached', 0)
+    capacity = getattr(attn_module, '_dct_score_haar_cache_capacity', 0)
+
+    if (
+        cached_k is None
+        or num_pages < n_cached
+        or cached_k.shape[0] != bsz
+        or cached_k.shape[3] != comp_size
+    ):
+        attn_module._dct_score_haar_k_cache = None
+        attn_module._dct_score_haar_n_pages_cached = 0
+        attn_module._dct_score_haar_cache_capacity = 0
+        n_cached = 0
+        capacity = 0
+
+    n_new = num_pages - n_cached
+    if n_new > 0:
+        new_k = paged_k[:, :, n_cached:num_pages]
+        if comp_size == 1:
+            new_proxy_k = new_k.mean(dim=3, keepdim=True)
+            page_ids = torch.arange(
+                n_cached, num_pages, device=new_proxy_k.device, dtype=torch.long
+            )
+            center_offset = (cfg.page_size - 1) // 2
+            positions = cfg.sink_size + page_ids * cfg.page_size + center_offset
+            max_pos = int(positions[-1].item()) + 1
+            cos_table, sin_table = _get_or_build_original_position_rope_tables(
+                attn_module, max_pos, attn_module.config, new_proxy_k.device, new_proxy_k.dtype
+            )
+            cos_proxy = cos_table.index_select(0, positions).view(1, 1, n_new, head_dim)
+            sin_proxy = sin_table.index_select(0, positions).view(1, 1, n_new, head_dim)
+            flat_proxy_k = _apply_rope(new_proxy_k.squeeze(3), cos_proxy, sin_proxy)
+            new_score_proxy_k = flat_proxy_k.unsqueeze(3)
+        else:
+            new_proxy_k = _project_pages_to_haar_lowpass(attn_module, new_k, comp_size)
+            positions = _haar_proxy_block_center_positions(
+                n_cached,
+                n_new,
+                cfg.page_size,
+                comp_size,
+                cfg.sink_size,
+                new_proxy_k.device,
+            ).reshape(-1)
+            max_pos = int(positions.max().item()) + 1
+            cos_table, sin_table = _get_or_build_original_position_rope_tables(
+                attn_module, max_pos, attn_module.config, new_proxy_k.device, new_proxy_k.dtype
+            )
+            cos_proxy = cos_table[positions].unsqueeze(0).unsqueeze(0)
+            sin_proxy = sin_table[positions].unsqueeze(0).unsqueeze(0)
+            flat_proxy_k = new_proxy_k.reshape(bsz, num_kv_heads, n_new * comp_size, head_dim)
+            flat_proxy_k = _apply_rope(flat_proxy_k, cos_proxy, sin_proxy)
+            new_score_proxy_k = flat_proxy_k.reshape(bsz, num_kv_heads, n_new, comp_size, head_dim)
+
+        if num_pages > capacity:
+            new_capacity = _next_page_capacity(num_pages, capacity)
+            new_cache = torch.empty(
+                bsz, num_kv_heads, new_capacity, comp_size, head_dim,
+                dtype=new_score_proxy_k.dtype, device=new_score_proxy_k.device,
+            )
+            if n_cached > 0 and attn_module._dct_score_haar_k_cache is not None:
+                new_cache[:, :, :n_cached].copy_(attn_module._dct_score_haar_k_cache[:, :, :n_cached])
+            attn_module._dct_score_haar_k_cache = new_cache
+            attn_module._dct_score_haar_cache_capacity = new_capacity
+
+        attn_module._dct_score_haar_k_cache[:, :, n_cached:num_pages].copy_(new_score_proxy_k)
+
+        attn_module._dct_score_haar_n_pages_cached = num_pages
+
+    return attn_module._dct_score_haar_k_cache[:, :, :num_pages]
+
+
+def _update_exec_hybrid_proxy_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg):
+    """Maintain Haar lowpass execution proxies for hybrid unselected-page attention."""
+    bsz, num_kv_heads, _, _, head_dim = paged_k.shape
+
+    cached_k = getattr(attn_module, "_dct_hybrid_proxy_k_cache", None)
+    cached_v = getattr(attn_module, "_dct_hybrid_proxy_v_cache", None)
+    n_cached = getattr(attn_module, "_dct_hybrid_n_pages_cached", 0)
+    capacity = getattr(attn_module, "_dct_hybrid_cache_capacity", 0)
+
+    if (
+        cached_k is None
+        or cached_v is None
+        or num_pages < n_cached
+        or cached_k.shape[0] != bsz
+        or cached_k.shape[3] != comp_size
+    ):
+        attn_module._dct_hybrid_proxy_k_cache = None
+        attn_module._dct_hybrid_proxy_v_cache = None
+        attn_module._dct_hybrid_n_pages_cached = 0
+        attn_module._dct_hybrid_cache_capacity = 0
+        n_cached = 0
+        capacity = 0
+
+    n_new = num_pages - n_cached
+    if n_new > 0:
+        new_k = paged_k[:, :, n_cached:num_pages]
+        new_v = paged_v[:, :, n_cached:num_pages]
+
+        new_proxy_k = _project_pages_to_haar_lowpass(attn_module, new_k, comp_size)
+        new_proxy_v = _project_pages_to_haar_lowpass(attn_module, new_v, comp_size)
+
+        positions = _haar_proxy_block_center_positions(
+            n_cached,
+            n_new,
+            cfg.page_size,
+            comp_size,
+            cfg.sink_size,
+            new_proxy_k.device,
+        ).reshape(-1)
+        cos_proxy, sin_proxy = _compute_rope_cos_sin(
+            positions, attn_module.config, new_proxy_k.device, new_proxy_k.dtype
+        )
+        flat_proxy_k = new_proxy_k.reshape(bsz, num_kv_heads, n_new * comp_size, head_dim)
+        flat_proxy_k = _apply_rope(flat_proxy_k, cos_proxy, sin_proxy)
+        new_proxy_k = flat_proxy_k.reshape(bsz, num_kv_heads, n_new, comp_size, head_dim)
+
+        if num_pages > capacity:
+            new_capacity = _next_page_capacity(num_pages, capacity)
+            new_k_cache = torch.empty(
+                bsz, num_kv_heads, new_capacity, comp_size, head_dim,
+                dtype=new_proxy_k.dtype, device=new_proxy_k.device,
+            )
+            new_v_cache = torch.empty_like(new_k_cache)
+            if n_cached > 0 and attn_module._dct_hybrid_proxy_k_cache is not None:
+                new_k_cache[:, :, :n_cached].copy_(attn_module._dct_hybrid_proxy_k_cache[:, :, :n_cached])
+                new_v_cache[:, :, :n_cached].copy_(attn_module._dct_hybrid_proxy_v_cache[:, :, :n_cached])
+            attn_module._dct_hybrid_proxy_k_cache = new_k_cache
+            attn_module._dct_hybrid_proxy_v_cache = new_v_cache
+            attn_module._dct_hybrid_cache_capacity = new_capacity
+
+        attn_module._dct_hybrid_proxy_k_cache[:, :, n_cached:num_pages].copy_(new_proxy_k)
+        attn_module._dct_hybrid_proxy_v_cache[:, :, n_cached:num_pages].copy_(new_proxy_v)
+        attn_module._dct_hybrid_n_pages_cached = num_pages
+
+    return (
+        attn_module._dct_hybrid_proxy_k_cache[:, :, :num_pages],
+        attn_module._dct_hybrid_proxy_v_cache[:, :, :num_pages],
+    )
+
+
+def _update_score_haar_mixed_key_cache(attn_module, paged_k, num_pages, comp_size, cfg):
+    """Maintain a separate score-time cache of mixed Haar proxies."""
+    bsz, num_kv_heads, _, _, head_dim = paged_k.shape
+
+    cached_k = getattr(attn_module, '_dct_score_haar_mixed_k_cache', None)
+    n_cached = getattr(attn_module, '_dct_score_haar_mixed_n_pages_cached', 0)
+
+    if (
+        cached_k is None
+        or num_pages < n_cached
+        or cached_k.shape[0] != bsz
+        or cached_k.shape[3] != comp_size
+    ):
+        attn_module._dct_score_haar_mixed_k_cache = None
+        attn_module._dct_score_haar_mixed_n_pages_cached = 0
+        n_cached = 0
+
+    n_new = num_pages - n_cached
+    if n_new > 0:
+        new_k = paged_k[:, :, n_cached:num_pages]
+        new_proxy_k = _project_pages_to_haar_mixed(attn_module, new_k, comp_size)
+        positions = _haar_mixed_proxy_anchor_positions(
+            n_cached,
+            n_new,
+            cfg.page_size,
+            comp_size,
+            cfg.sink_size,
+            new_proxy_k.device,
+        ).reshape(-1)
+        cos_proxy, sin_proxy = _compute_rope_cos_sin(
+            positions, attn_module.config, new_proxy_k.device, new_proxy_k.dtype
+        )
+        flat_proxy_k = new_proxy_k.reshape(bsz, num_kv_heads, n_new * comp_size, head_dim)
+        flat_proxy_k = _apply_rope(flat_proxy_k, cos_proxy, sin_proxy)
+        new_score_proxy_k = flat_proxy_k.reshape(bsz, num_kv_heads, n_new, comp_size, head_dim)
+
+        if attn_module._dct_score_haar_mixed_k_cache is None:
+            attn_module._dct_score_haar_mixed_k_cache = new_score_proxy_k
+        else:
+            attn_module._dct_score_haar_mixed_k_cache = torch.cat(
+                [attn_module._dct_score_haar_mixed_k_cache, new_score_proxy_k], dim=2
+            )
+
+        attn_module._dct_score_haar_mixed_n_pages_cached = num_pages
+
+    return attn_module._dct_score_haar_mixed_k_cache
+
+
+def _update_score_hadamard_key_cache(attn_module, paged_k, num_pages, comp_size, cfg):
+    """Maintain a score-time cache of Hadamard proxies in original-position RoPE space."""
+    bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
+
+    cached_k = getattr(attn_module, '_dct_score_hadamard_k_cache', None)
+    n_cached = getattr(attn_module, '_dct_score_hadamard_n_pages_cached', 0)
+
+    if (
+        cached_k is None
+        or num_pages < n_cached
+        or cached_k.shape[0] != bsz
+        or cached_k.shape[3] != comp_size
+    ):
+        attn_module._dct_score_hadamard_k_cache = None
+        attn_module._dct_score_hadamard_n_pages_cached = 0
+        n_cached = 0
+
+    n_new = num_pages - n_cached
+    if n_new > 0:
+        new_k = paged_k[:, :, n_cached:num_pages]
+        flat_k = new_k.reshape(bsz, num_kv_heads, n_new * page_size, head_dim)
+        start_pos = cfg.sink_size + n_cached * page_size
+        positions = torch.arange(
+            start_pos,
+            start_pos + n_new * page_size,
+            device=new_k.device,
+        )
+        cos_pages, sin_pages = _compute_rope_cos_sin(
+            positions, attn_module.config, new_k.device, new_k.dtype
+        )
+        flat_k_rope = _apply_rope(flat_k, cos_pages, sin_pages)
+        new_k_rope = flat_k_rope.reshape(bsz, num_kv_heads, n_new, page_size, head_dim)
+        new_proxy_k = _project_pages_to_hadamard(attn_module, new_k_rope, comp_size)
+
+        if attn_module._dct_score_hadamard_k_cache is None:
+            attn_module._dct_score_hadamard_k_cache = new_proxy_k
+        else:
+            attn_module._dct_score_hadamard_k_cache = torch.cat(
+                [attn_module._dct_score_hadamard_k_cache, new_proxy_k], dim=2
+            )
+
+        attn_module._dct_score_hadamard_n_pages_cached = num_pages
+
+    return attn_module._dct_score_hadamard_k_cache
+
+
+def _apply_original_position_rope_to_paged_k(paged_k, sink_size, model_config):
+    """Apply original-position RoPE to full paged keys for debug/oracle scoring."""
+    bsz, num_kv_heads, num_pages, page_size, head_dim = paged_k.shape
+    flat_k = paged_k.reshape(bsz, num_kv_heads, num_pages * page_size, head_dim)
+    positions = torch.arange(sink_size + num_pages * page_size, device=paged_k.device)
+    cos_pages, sin_pages = _compute_rope_cos_sin(
+        positions, model_config, paged_k.device, paged_k.dtype
+    )
+    cos_pages = cos_pages[:, :, sink_size:]
+    sin_pages = sin_pages[:, :, sink_size:]
+    flat_k_rope = _apply_rope(flat_k, cos_pages, sin_pages)
+    return flat_k_rope.reshape(bsz, num_kv_heads, num_pages, page_size, head_dim)
+
+
+def _compute_debug_oracle_page_scores(attn_module, query_states, paged_k, cfg, cos, sin):
+    """Compute full-page oracle scores for debug comparisons against proxies."""
+    oracle_query_states = query_states
+    oracle_paged_k = paged_k
+    if cfg.continuous_rope:
+        oracle_query_states, _ = apply_rotary_pos_emb(
+            query_states, query_states, cos, sin
+        )
+        oracle_paged_k = _apply_original_position_rope_to_paged_k(
+            paged_k, cfg.sink_size, attn_module.config
+        )
+    return score_pages_triton(
+        oracle_query_states,
+        oracle_paged_k,
+        cfg.scoring_method,
+        cfg.group_agg_method,
+        attn_module.num_key_value_groups,
+    )
+
+
+def _apply_original_position_rope_to_final_k(
+    attn_module,
+    final_k,
+    selected_indices,
+    num_pages,
+    actual_recent,
+    cfg,
+    model_config,
+):
+    """Apply RoPE to assembled drop-mode KV using the tokens' original positions."""
+    bsz, num_kv_heads, _, head_dim = final_k.shape
+    actual_top_k = selected_indices.shape[2]
+    selected_indices_long = selected_indices.to(torch.long)
+    cos_table, sin_table = _get_or_build_original_position_rope_tables(
+        attn_module,
+        num_pages * cfg.page_size + cfg.sink_size + actual_recent,
+        model_config,
+        final_k.device,
+        final_k.dtype,
+    )
+
+    cos_parts = []
+    sin_parts = []
+
+    if cfg.sink_size > 0:
+        sink_cos = cos_table[:cfg.sink_size].view(1, 1, cfg.sink_size, head_dim)
+        sink_sin = sin_table[:cfg.sink_size].view(1, 1, cfg.sink_size, head_dim)
+        cos_parts.append(sink_cos.expand(bsz, num_kv_heads, -1, -1))
+        sin_parts.append(sink_sin.expand(bsz, num_kv_heads, -1, -1))
+
+    middle_start = cfg.sink_size
+    middle_end = middle_start + num_pages * cfg.page_size
+    if actual_top_k > 0:
+        page_cos_table = cos_table[middle_start:middle_end].view(num_pages, cfg.page_size, head_dim)
+        page_sin_table = sin_table[middle_start:middle_end].view(num_pages, cfg.page_size, head_dim)
+        selected_cos = page_cos_table[selected_indices_long].reshape(
+            bsz, num_kv_heads, actual_top_k * cfg.page_size, head_dim
+        )
+        selected_sin = page_sin_table[selected_indices_long].reshape(
+            bsz, num_kv_heads, actual_top_k * cfg.page_size, head_dim
+        )
+        cos_parts.append(selected_cos)
+        sin_parts.append(selected_sin)
+
+    if actual_recent > 0:
+        recent_start = middle_end
+        recent_cos = cos_table[recent_start:recent_start + actual_recent].view(
+            1, 1, actual_recent, head_dim
+        )
+        recent_sin = sin_table[recent_start:recent_start + actual_recent].view(
+            1, 1, actual_recent, head_dim
+        )
+        cos_parts.append(recent_cos.expand(bsz, num_kv_heads, -1, -1))
+        sin_parts.append(recent_sin.expand(bsz, num_kv_heads, -1, -1))
+
+    if len(cos_parts) == 1:
+        cos = cos_parts[0]
+        sin = sin_parts[0]
+    else:
+        cos = torch.cat(cos_parts, dim=2)
+        sin = torch.cat(sin_parts, dim=2)
+    return _apply_rope(final_k, cos, sin)
+
+
+def _assemble_kv_hybrid_reference(
+    attn_module,
+    paged_k,
+    paged_v,
+    hybrid_proxy_k,
+    hybrid_proxy_v,
+    sink_k,
+    sink_v,
+    recent_k,
+    recent_v,
+    selected_indices,
+    num_pages,
+    actual_recent,
+    cfg,
+    model_config,
+):
+    """Reference hybrid assembly: selected pages use full KV, others use Haar proxy KV."""
+    bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
+    actual_top_k = selected_indices.shape[2]
+    comp_size = hybrid_proxy_k.shape[3]
+    selected_indices_long = selected_indices.to(torch.long)
+
+    total_len = cfg.sink_size + actual_top_k * page_size + (num_pages - actual_top_k) * comp_size + actual_recent
+    middle_start = cfg.sink_size
+    middle_end = middle_start + num_pages * page_size
+
+    cos_table, sin_table = _get_or_build_original_position_rope_tables(
+        attn_module,
+        middle_end + actual_recent,
+        model_config,
+        paged_k.device,
+        paged_k.dtype,
+    )
+
+    k_parts = []
+    v_parts = []
+
+    if cfg.sink_size > 0:
+        sink_cos = cos_table[:cfg.sink_size].view(1, 1, cfg.sink_size, head_dim)
+        sink_sin = sin_table[:cfg.sink_size].view(1, 1, cfg.sink_size, head_dim)
+        k_parts.append(_apply_rope(sink_k, sink_cos.expand(bsz, num_kv_heads, -1, -1), sink_sin.expand(bsz, num_kv_heads, -1, -1)))
+        v_parts.append(sink_v)
+
+    if actual_top_k > 0:
+        selected_expand = selected_indices_long[..., None, None].expand(
+            bsz, num_kv_heads, actual_top_k, page_size, head_dim
+        )
+        selected_k = torch.gather(paged_k, 2, selected_expand)
+        selected_v = torch.gather(paged_v, 2, selected_expand)
+
+        page_cos_table = cos_table[middle_start:middle_end].view(num_pages, page_size, head_dim)
+        page_sin_table = sin_table[middle_start:middle_end].view(num_pages, page_size, head_dim)
+        selected_cos = page_cos_table[selected_indices_long].reshape(
+            bsz, num_kv_heads, actual_top_k * page_size, head_dim
+        )
+        selected_sin = page_sin_table[selected_indices_long].reshape(
+            bsz, num_kv_heads, actual_top_k * page_size, head_dim
+        )
+        selected_k = selected_k.reshape(bsz, num_kv_heads, actual_top_k * page_size, head_dim)
+        selected_v = selected_v.reshape(bsz, num_kv_heads, actual_top_k * page_size, head_dim)
+        k_parts.append(_apply_rope(selected_k, selected_cos, selected_sin))
+        v_parts.append(selected_v)
+
+    num_unselected = num_pages - actual_top_k
+    if num_unselected > 0:
+        all_pages = torch.arange(num_pages, device=selected_indices.device, dtype=torch.long)
+        all_pages = all_pages.view(1, 1, num_pages).expand(bsz, num_kv_heads, num_pages)
+        selected_mask = torch.zeros(
+            bsz, num_kv_heads, num_pages,
+            dtype=torch.bool,
+            device=selected_indices.device,
+        )
+        selected_mask.scatter_(2, selected_indices_long, True)
+        unselected_indices = all_pages.masked_select(~selected_mask).view(
+            bsz, num_kv_heads, num_unselected
+        )
+        unselected_expand = unselected_indices[..., None, None].expand(
+            bsz, num_kv_heads, num_unselected, comp_size, head_dim
+        )
+        unselected_proxy_k = torch.gather(hybrid_proxy_k, 2, unselected_expand).reshape(
+            bsz, num_kv_heads, num_unselected * comp_size, head_dim
+        )
+        unselected_proxy_v = torch.gather(hybrid_proxy_v, 2, unselected_expand).reshape(
+            bsz, num_kv_heads, num_unselected * comp_size, head_dim
+        )
+        k_parts.append(unselected_proxy_k)
+        v_parts.append(unselected_proxy_v)
+
+    if actual_recent > 0:
+        recent_cos = cos_table[middle_end:middle_end + actual_recent].view(
+            1, 1, actual_recent, head_dim
+        )
+        recent_sin = sin_table[middle_end:middle_end + actual_recent].view(
+            1, 1, actual_recent, head_dim
+        )
+        k_parts.append(_apply_rope(recent_k, recent_cos.expand(bsz, num_kv_heads, -1, -1), recent_sin.expand(bsz, num_kv_heads, -1, -1)))
+        v_parts.append(recent_v)
+
+    final_k = torch.cat(k_parts, dim=2)
+    final_v = torch.cat(v_parts, dim=2)
+    assert final_k.shape[2] == total_len, (final_k.shape, total_len)
+    assert final_v.shape[2] == total_len, (final_v.shape, total_len)
+    return final_k, final_v
+
+
+_DCT_RUNTIME_STATE_ATTRS = (
+    "_dct_comp_k_cache",
+    "_dct_comp_v_cache",
+    "_dct_n_pages_cached",
+    "_dct_comp_cache_capacity",
+    "_dct_score_comp_k_cache",
+    "_dct_score_n_pages_cached",
+    "_dct_score_cache_capacity",
+    "_dct_score_spectral_k_cache",
+    "_dct_score_spectral_n_pages_cached",
+    "_dct_score_haar_k_cache",
+    "_dct_score_haar_n_pages_cached",
+    "_dct_score_haar_mixed_k_cache",
+    "_dct_score_haar_mixed_n_pages_cached",
+    "_dct_score_hadamard_k_cache",
+    "_dct_score_hadamard_n_pages_cached",
+    "_dct_hybrid_proxy_k_cache",
+    "_dct_hybrid_proxy_v_cache",
+    "_dct_hybrid_n_pages_cached",
+    "_dct_hybrid_cache_capacity",
+    "_page_scores_buf",
+    "_page_scores_np",
+    "_page_scores_capacity",
+    "_topk_out_buf",
+    "_assemble_stride_cache",
+    "_assemble_drop_stride_cache",
+    "_final_k_buf",
+    "_final_v_buf",
+    "_sel_idx_buf",
+    "_assemble_buf_len",
+    "_orig_pos_rope_cos_2d",
+    "_orig_pos_rope_sin_2d",
+    "_orig_pos_rope_cache_len",
+    "_q_rope_buf",
+    "_dct_force_baseline_decode",
+)
+
+
+def _maybe_reset_dct_runtime_state(attn_module, past_key_value):
+    """Clear per-generation runtime caches when the HF cache object changes."""
+    cached_ref = getattr(attn_module, "_dct_runtime_cache_ref", None)
+    if cached_ref is past_key_value:
+        return
+
+    for attr in _DCT_RUNTIME_STATE_ATTRS:
+        if hasattr(attn_module, attr):
+            delattr(attn_module, attr)
+    attn_module._dct_runtime_cache_ref = past_key_value
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +1452,7 @@ def dct_page_attention_forward(
     hidden_states: torch.Tensor,
     position_embeddings: tuple,
     attention_mask: Optional[torch.Tensor] = None, # The type can be torch.Tensor or None, and the default value is None
-    past_key_values: Optional[Cache] = None,
+    past_key_value: Optional[Cache] = None,
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> tuple:
@@ -405,9 +1463,27 @@ def dct_page_attention_forward(
     - Decode (q_len == 1, long KV cache): DCT page attention.
     """
     cfg = _dct_page_cfg
+    num_score_proxy_modes = sum(
+        int(flag)
+        for flag in (
+            cfg.score_use_direct_spectral_proxy,
+            cfg.score_use_haar_proxy,
+            cfg.score_use_haar_mixed_proxy,
+            cfg.score_use_hadamard_proxy,
+        )
+    )
+    if num_score_proxy_modes > 1:
+        raise ValueError(
+            "Only one score-time proxy rope mode may be enabled at once."
+    )
     input_shape = hidden_states.shape[:-1] # (bsz, q_len)
     hidden_shape = (*input_shape, -1, self.head_dim) # (bsz, q_len, num_heads, head_dim)
     bsz, q_len = input_shape     
+    _maybe_reset_dct_runtime_state(self, past_key_value)
+    min_len_for_paging = max(
+        cfg.sink_size + cfg.page_size * (cfg.top_k + 1) + cfg.recent_size,
+        getattr(cfg, "min_decode_kv_len_for_paging", 0),
+    )
 
     if q_len>1:
         # Step 1: Q/K/V projection
@@ -418,14 +1494,27 @@ def dct_page_attention_forward(
         # Step 2 & 3: RoPE and KV cache
         cos, sin = position_embeddings
         query_rope, key_rope = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        if past_key_values is not None: # unless we call the model directly with use_cache=False, past_key_values is not None.
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            past_key_values.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
         attn_q, attn_k, attn_v = query_rope, key_rope, value_states
+        if past_key_value is not None: # unless we call the model directly with use_cache=False, past_key_value is not None.
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            if cfg.continuous_rope:
+                # Keep the cache in pre-RoPE space for decode-time page assembly, but
+                # still attend over the full cached context during chunked prefill.
+                key_cached, value_cached = past_key_value.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs
+                )
+                all_pos = torch.arange(key_cached.shape[2], device=key_cached.device)
+                cos_all, sin_all = _compute_rope_cos_sin(
+                    all_pos, self.config, key_cached.device, key_cached.dtype
+                )
+                attn_k = _apply_rope(key_cached, cos_all, sin_all)
+                attn_v = value_cached
+            else:
+                attn_k, attn_v = past_key_value.update(
+                    key_rope, value_states, self.layer_idx, cache_kwargs
+                )
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get("sdpa", eager_attention_forward)
+        attention_interface = _get_attention_interface(self)
         attn_output, attn_weights = attention_interface(
             self,
             attn_q,
@@ -441,30 +1530,21 @@ def dct_page_attention_forward(
         attn_output = self.o_proj(attn_output)
 
         # Reset compressed page cache from prior generate() call
+        # TODO: Verify if this is needed or not
         self._dct_comp_k_cache = None
         self._dct_comp_v_cache = None
         self._dct_n_pages_cached = 0
 
-        # Cache the model's RoPE table (correctly handles rope_scaling).
-        # Pre-allocate with extra slots so decode extends are O(1) writes.
-        # cos/sin shape from position_embeddings: [bsz, seq_len, head_dim]
-        # _rope_cos_2d / _rope_sin_2d shape: [alloc_len, head_dim]
         extra_tokens = cfg.page_size * 2
-        alloc_len = q_len + extra_tokens
-        self._rope_cos_2d = torch.empty(alloc_len, self.head_dim, dtype=cos.dtype, device=cos.device)
-        self._rope_sin_2d = torch.empty(alloc_len, self.head_dim, dtype=sin.dtype, device=sin.device)
-        self._rope_cos_2d[:q_len] = cos[0]  # [seq_len, head_dim]
-        self._rope_sin_2d[:q_len] = sin[0]
-        self._rope_cache_len = q_len
 
         # Convert DynamicCache → PreAllocatedLayer at end of prefill (last layer only).
         # All layers are converted at once, so by the first decode step every
         # layer's cache.update() already uses PreAllocatedLayer (fixed strides).
-        if (past_key_values is not None
+        if (past_key_value is not None
                 and self.layer_idx == self.config.num_hidden_layers - 1
-                and not getattr(past_key_values, '_preallocated', False)):
-            pre_allocate_cache(past_key_values, extra_tokens=extra_tokens)
-            past_key_values._preallocated = True
+                and not getattr(past_key_value, '_preallocated', False)):
+            pre_allocate_cache(past_key_value, extra_tokens=extra_tokens)
+            past_key_value._preallocated = True
 
         return attn_output, attn_weights
 
@@ -473,36 +1553,52 @@ def dct_page_attention_forward(
     query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    query_states_rope = None
     
     # Step 2: RoPE + KV cache update
     cos, sin = position_embeddings
-    if past_key_values is not None:
-        # cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        key_cached, value_cached = past_key_values.update(
-            key_states, value_states, self.layer_idx, # cache_kwargs # commented out because we will compute rope table later.
-        )
-    else:
-        key_cached, value_cached = key_states, value_states
-    kv_len = key_cached.shape[2]
-    
-    # Check if DCT path is active
-    min_len_for_paging = cfg.sink_size + cfg.page_size * (cfg.top_k + 1) + cfg.recent_size
-    
-    # No need to do dct paging since there aren't enough tokens.
-    if kv_len < min_len_for_paging:
-        print("FallBackk!!!!!!!!!!!")
-        all_pos = torch.arange(kv_len, device=key_cached.device)
-        cos_all, sin_all = _compute_rope_cos_sin(
-            all_pos, self.config, key_cached.device, key_cached.dtype
-        )
-        attn_q, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
-        attn_k = _apply_rope(key_cached, cos_all, sin_all)
-        attn_v = value_cached
+    force_baseline_decode = False
+    if cfg.continuous_rope:
+        base_context_len = 0
+        if past_key_value is not None:
+            base_context_len = int(past_key_value.layers[self.layer_idx].get_seq_length())
+        force_baseline_decode = getattr(self, "_dct_force_baseline_decode", None)
+        if force_baseline_decode is None:
+            force_baseline_decode = base_context_len <= min_len_for_paging
+            self._dct_force_baseline_decode = force_baseline_decode
 
-        attention_interface = ALL_ATTENTION_FUNCTIONS.get("sdpa", eager_attention_forward)
+        if force_baseline_decode:
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            if past_key_value is not None:
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_states, value_states = past_key_value.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs
+                )
+            kv_len = key_states.shape[2]
+        else:
+            if past_key_value is not None:
+                key_cached, value_cached = past_key_value.update(
+                    key_states, value_states, self.layer_idx,
+                )
+            else:
+                key_cached, value_cached = key_states, value_states
+            kv_len = key_cached.shape[2]
+    else:
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+        kv_len = key_states.shape[2]
+    
+    # No need to do dct paging since there isn't enough tokens.
+    if force_baseline_decode:
+        attention_interface = _get_attention_interface(self)
         attn_output, attn_weights = attention_interface(
-            self, attn_q, attn_k, attn_v, attention_mask,
-            dropout=0.0, scaling=self.scaling,
+            self, query_states, key_states, value_states, attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
             sliding_window=getattr(self, "sliding_window", None), **kwargs,
         )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -510,8 +1606,16 @@ def dct_page_attention_forward(
         return attn_output, attn_weights
     
     # Use pre-RoPE KV for page building in continuous_rope mode
-    key_states = key_cached
-    value_states = value_cached
+    if cfg.continuous_rope:
+        key_states = key_cached
+        value_states = value_cached
+
+    if cfg.unselected_mode == "hybrid" and not cfg.continuous_rope:
+        raise NotImplementedError("unselected_mode='hybrid' currently requires continuous_rope=True.")
+    if cfg.continuous_rope and cfg.unselected_mode == "compressed":
+        raise NotImplementedError(
+            "continuous_rope currently supports unselected_mode in {'drop', 'hybrid'} only."
+        )
     
     # Step 3: Segment KV cache and update the incremental compressed page cache.
     # DCT is computed only for pages that are newly finalized since the last
@@ -522,74 +1626,147 @@ def dct_page_attention_forward(
         key_states, value_states, cfg
     )
     
-    # Step 4: DCT compression (torch.cat - always contiguous, L2-warm)
-    comp_k, comp_v = _update_comp_cache(self, paged_k, paged_v, num_pages, comp_size)
+    # Step 4: Compressed cache maintenance. The current default path uses a
+    # separate score-time cache and drop-mode assembly, so comp_k/comp_v are
+    # only required for non-default compatibility paths.
+    if cfg.continuous_rope:
+        need_comp_cache = cfg.unselected_mode == "compressed"
+    else:
+        need_comp_cache = True
+    comp_k = comp_v = None
+    if need_comp_cache:
+        comp_k, comp_v = _update_comp_cache(
+            self,
+            paged_k,
+            paged_v,
+            num_pages,
+            comp_size,
+            need_values=(cfg.unselected_mode == "compressed"),
+        )
 
     # Step 5: Score pages (Triton kernel 1 — returns page_scores only)
-    # Pre-allocate page_scores buffer (reallocate only when num_pages changes)
     _num_kv_heads = self.config.num_key_value_heads # 8 for Llama-3.1-8B
-    if getattr(self, '_page_scores_np', 0) != num_pages:
+    page_scores_buf = getattr(self, '_page_scores_buf', None)
+    if (
+        page_scores_buf is None
+        or page_scores_buf.shape[0] != bsz
+        or page_scores_buf.shape[1] != _num_kv_heads
+        or page_scores_buf.shape[2] != num_pages
+    ):
         self._page_scores_buf = torch.empty(
             bsz, _num_kv_heads, num_pages,
-            dtype=torch.float32, device=comp_k.device,
+            dtype=torch.float32, device=paged_k.device,
         )
-        self._page_scores_np = num_pages
+
+    score_query_states = query_states
+    score_comp_k = comp_k
+    if cfg.continuous_rope:
+        if query_states_rope is None:
+            query_states_rope = _apply_decode_query_rope(self, query_states, cos, sin, cfg)
+        score_query_states = query_states_rope
+        if cfg.score_use_direct_spectral_proxy:
+            score_comp_k = _update_score_spectral_key_cache(
+                self, paged_k, num_pages, comp_size, cfg
+            )
+        elif cfg.score_use_haar_mixed_proxy:
+            score_comp_k = _update_score_haar_mixed_key_cache(
+                self, paged_k, num_pages, comp_size, cfg
+            )
+        elif cfg.score_use_hadamard_proxy:
+            score_comp_k = _update_score_hadamard_key_cache(
+                self, paged_k, num_pages, comp_size, cfg
+            )
+        elif cfg.score_use_haar_proxy:
+            score_comp_k = _update_score_haar_key_cache(
+                self, paged_k, num_pages, comp_size, cfg
+            )
+        else:
+            score_comp_k = _update_score_key_cache(self, paged_k, num_pages, comp_size, cfg)
 
     page_scores = score_pages_triton(
-        query_states, comp_k, cfg.scoring_method, cfg.group_agg_method, self.num_key_value_groups,
+        score_query_states, score_comp_k, cfg.scoring_method, cfg.group_agg_method, self.num_key_value_groups,
         out=self._page_scores_buf,
     )
+    debug_hook = _dct_page_debug_hook
+    oracle_page_scores = None
+    if debug_hook is not None or cfg.select_with_oracle_page_scores:
+        oracle_page_scores = _compute_debug_oracle_page_scores(
+            self, query_states, paged_k, cfg, cos, sin
+        )
+    selection_page_scores = oracle_page_scores if cfg.select_with_oracle_page_scores else page_scores
     
     actual_top_k = min(cfg.top_k, num_pages)
     
     # Pre-allocate selected_indices buffer (constant shape across all decode steps)
-    if not hasattr(self, '_topk_out_buf'):
-        self._topk_out_buf = torch.empty(bsz, _num_kv_heads, actual_top_k, dtype=torch.int32, device=comp_k.device)
+    topk_buf = getattr(self, '_topk_out_buf', None)
+    if (
+        topk_buf is None
+        or topk_buf.shape[0] != bsz
+        or topk_buf.shape[1] != _num_kv_heads
+        or topk_buf.shape[2] != actual_top_k
+    ):
+        self._topk_out_buf = torch.empty(
+            bsz, _num_kv_heads, actual_top_k, dtype=torch.int32, device=paged_k.device
+        )
 
-    selected_indices = topk_sort_triton(page_scores, actual_top_k, out=self._topk_out_buf)
-    
-    if cfg.unselected_mode == "drop":
-        assembled_len = cfg.sink_size + actual_top_k * cfg.page_size + actual_recent
-    else:
-        num_unselected = num_pages - actual_top_k
-        middle_len = actual_top_k * cfg.page_size + num_unselected * comp_size
-        assembled_len = cfg.sink_size + middle_len + actual_recent
+    selected_indices = topk_sort_triton(selection_page_scores, actual_top_k, out=self._topk_out_buf)
+
+    if debug_hook is not None:
+        debug_hook(
+            {
+                "layer_idx": int(self.layer_idx),
+                "kv_len": int(kv_len),
+                "num_pages": int(num_pages),
+                "actual_top_k": int(actual_top_k),
+                "page_size": int(cfg.page_size),
+                "sink_size": int(cfg.sink_size),
+                "recent_size": int(cfg.recent_size),
+                "proxy_frequency_layout": str(cfg.proxy_frequency_layout),
+                "score_use_direct_spectral_proxy": bool(cfg.score_use_direct_spectral_proxy),
+                "score_use_haar_proxy": bool(cfg.score_use_haar_proxy),
+                "score_use_haar_mixed_proxy": bool(cfg.score_use_haar_mixed_proxy),
+                "score_use_hadamard_proxy": bool(cfg.score_use_hadamard_proxy),
+                "cache_position": None
+                if cache_position is None
+                else cache_position.detach().cpu(),
+                "page_scores": page_scores.detach().float().cpu(),
+                "oracle_page_scores": oracle_page_scores.detach().float().cpu(),
+                "selection_used_oracle_page_scores": bool(cfg.select_with_oracle_page_scores),
+                "selected_indices": selected_indices.detach().cpu(),
+            }
+        )
 
     cos_table = None
     sin_table = None
-    cached_len = getattr(self, '_rope_cache_len', 0)
-    if assembled_len > cached_len:
-        max_len = assembled_len + cfg.page_size
-        positions = torch.arange(max_len, device=comp_k.device)
-        cos_cached, sin_cached = _compute_rope_cos_sin(
-            positions, self.config, comp_k.device, comp_k.dtype,
-        )
-        # Store pre-squeezed 2D [max_len, head_dim] — eliminates [0,0,:N] indexing
-        self._rope_cos_2d = cos_cached[0, 0] # [max_len, head_dim]
-        self._rope_sin_2d = sin_cached[0, 0] # [max_len, head_dim]
-        self._rope_cache_len = max_len
-    # Pass full 2D table — kernel only reads positions 0..total_len-1
-    cos_table = self._rope_cos_2d
-    sin_table = self._rope_sin_2d
+    final_k_has_original_rope = False
 
-    # Pre-allocate or expand output buffers (avoids torch.empty per step)
-    _buf_len = getattr(self, '_assemble_buf_len', 0)
-    if assembled_len > _buf_len:
-        _max_len = assembled_len + cfg.page_size
-        _nkv = _num_kv_heads
-        self._final_k_buf = torch.empty(bsz, _nkv, _max_len, self.head_dim, dtype=comp_k.dtype, device=comp_k.device)
-        self._final_v_buf = torch.empty_like(self._final_k_buf)
-        self._sel_idx_buf = torch.empty(bsz, _nkv, actual_top_k, dtype=torch.int32, device=comp_k.device)
-        self._assemble_buf_len = _max_len
-
-    # Pre-allocate Q-RoPE buffer
-    if not hasattr(self, '_q_rope_buf'):
-        self._q_rope_buf = torch.empty_like(query_states)
-    q_rope_cos = self._rope_cos_2d[assembled_len - 1] # [head_dim] — 1D index, fast
-    q_rope_sin = self._rope_sin_2d[assembled_len - 1] # [head_dim]
-
-    # Step 6b: Assemble + K-RoPE (+ fused Q-RoPE in Kernel A for split mode)
+    # Step 6b: Assemble KV for attention.
     if cfg.unselected_mode == "drop":
+        assembled_len = cfg.sink_size + actual_top_k * cfg.page_size + actual_recent
+        fuse_final_k_original_rope = cfg.continuous_rope
+        if fuse_final_k_original_rope:
+            cos_table, sin_table = _get_or_build_original_position_rope_tables(
+                self,
+                num_pages * cfg.page_size + cfg.sink_size + actual_recent,
+                self.config,
+                paged_k.device,
+                paged_k.dtype,
+            )
+
+        # Pre-allocate or expand output buffers (avoids torch.empty per step)
+        _buf_len = getattr(self, '_assemble_buf_len', 0)
+        if assembled_len > _buf_len:
+            _max_len = assembled_len + cfg.page_size
+            _nkv = _num_kv_heads
+            self._final_k_buf = torch.empty(
+                bsz, _nkv, _max_len, self.head_dim, dtype=paged_k.dtype, device=paged_k.device
+            )
+            self._final_v_buf = torch.empty_like(self._final_k_buf)
+            self._sel_idx_buf = torch.empty(
+                bsz, _nkv, actual_top_k, dtype=torch.int32, device=paged_k.device
+            )
+            self._assemble_buf_len = _max_len
+
         final_k, final_v = assemble_kv_drop_triton(
             paged_k, paged_v,
             sink_k, sink_v, recent_k, recent_v,
@@ -598,10 +1775,51 @@ def dct_page_attention_forward(
             out_k=self._final_k_buf,
             out_v=self._final_v_buf,
             out_sel_idx=self._sel_idx_buf,
+            original_position_rope=fuse_final_k_original_rope,
         )
-        query_states = apply_rope_q_direct(query_states, q_rope_cos, q_rope_sin, self._q_rope_buf)
-    
+        final_k_has_original_rope = fuse_final_k_original_rope
+
+    elif cfg.unselected_mode == "hybrid":
+        hybrid_proxy_k, hybrid_proxy_v = _update_exec_hybrid_proxy_cache(
+            self, paged_k, paged_v, num_pages, comp_size, cfg
+        )
+        final_k, final_v = _assemble_kv_hybrid_reference(
+            self,
+            paged_k,
+            paged_v,
+            hybrid_proxy_k,
+            hybrid_proxy_v,
+            sink_k,
+            sink_v,
+            recent_k,
+            recent_v,
+            selected_indices,
+            num_pages,
+            actual_recent,
+            cfg,
+            self.config,
+        )
+        final_k_has_original_rope = True
+
     else:
+        num_unselected = num_pages - actual_top_k
+        middle_len = actual_top_k * cfg.page_size + num_unselected * comp_size
+        assembled_len = cfg.sink_size + middle_len + actual_recent
+
+        # Pre-allocate or expand output buffers (avoids torch.empty per step)
+        _buf_len = getattr(self, '_assemble_buf_len', 0)
+        if assembled_len > _buf_len:
+            _max_len = assembled_len + cfg.page_size
+            _nkv = _num_kv_heads
+            self._final_k_buf = torch.empty(
+                bsz, _nkv, _max_len, self.head_dim, dtype=paged_k.dtype, device=paged_k.device
+            )
+            self._final_v_buf = torch.empty_like(self._final_k_buf)
+            self._sel_idx_buf = torch.empty(
+                bsz, _nkv, actual_top_k, dtype=torch.int32, device=paged_k.device
+            )
+            self._assemble_buf_len = _max_len
+
         # Build stride cache on first call; rebuild when strides change
         # (strides are fixed within one sample's decode, but change across
         # samples because the pre-allocated KV cache is re-created)
@@ -611,24 +1829,32 @@ def dct_page_attention_forward(
             self._assemble_stride_cache = build_assemble_stride_cache(
                 paged_k, comp_k, sink_k, recent_k, selected_indices,
                 cos_table, self._final_k_buf,
-                query_states=query_states if cfg.continuous_rope else None,
             )
 
-        # Fused assemble + Q-RoPE with stride cache
-        final_k, final_v, q_rope_out = assemble_kv_split_triton(
+        final_k, final_v = assemble_kv_split_triton(
             paged_k, paged_v, comp_k, comp_v,
             sink_k, sink_v, recent_k, recent_v,
             selected_indices,
             cos_table, sin_table,
             out_k=self._final_k_buf,
             out_v=self._final_v_buf,
-            query_states=query_states,
-            q_rope_cos=q_rope_cos,
-            q_rope_sin=q_rope_sin,
-            q_rope_buf=self._q_rope_buf,
             stride_cache=self._assemble_stride_cache,
         )
-        query_states = q_rope_out
+
+    if cfg.continuous_rope:
+        if query_states_rope is None:
+            query_states_rope = _apply_decode_query_rope(self, query_states, cos, sin, cfg)
+        query_states = query_states_rope
+        if not final_k_has_original_rope:
+            final_k = _apply_original_position_rope_to_final_k(
+                self,
+                final_k,
+                selected_indices,
+                num_pages,
+                actual_recent,
+                cfg,
+                self.config,
+            )
 
     # Step 7a: Compute attention (no causal mask needed for q_len=1)
     attn_output = F.scaled_dot_product_attention(
@@ -648,15 +1874,22 @@ def dct_page_attention_forward(
 # Monkey-patch entry point
 # ---------------------------------------------------------------------------
 def replace_qwen2_attn(
-    page_size=128,
-    top_k=8,
+    page_size=32,
+    top_k=64,
     sink_size=4,
     recent_size=128,
-    compress_ratio=0.25,
+    compress_ratio=0.03125,
+    min_decode_kv_len_for_paging=8192,
+    proxy_frequency_layout="low",
     scoring_method="max",
     group_agg_method="mean",
     unselected_mode="drop",
     continuous_rope=True,
+    score_use_direct_spectral_proxy=False,
+    score_use_haar_proxy=True,
+    score_use_haar_mixed_proxy=False,
+    score_use_hadamard_proxy=False,
+    select_with_oracle_page_scores=False,
     use_triton=True,
 ):
     """
@@ -671,10 +1904,17 @@ def replace_qwen2_attn(
         sink_size=sink_size,
         recent_size=recent_size,
         compress_ratio=compress_ratio,
+        min_decode_kv_len_for_paging=min_decode_kv_len_for_paging,
+        proxy_frequency_layout=proxy_frequency_layout,
         scoring_method=scoring_method,
         group_agg_method=group_agg_method,
         unselected_mode=unselected_mode,
         continuous_rope=continuous_rope,
+        score_use_direct_spectral_proxy=score_use_direct_spectral_proxy,
+        score_use_haar_proxy=score_use_haar_proxy,
+        score_use_haar_mixed_proxy=score_use_haar_mixed_proxy,
+        score_use_hadamard_proxy=score_use_hadamard_proxy,
+        select_with_oracle_page_scores=select_with_oracle_page_scores,
         use_triton=use_triton,
     )
 
@@ -683,24 +1923,40 @@ def replace_qwen2_attn(
     print(f"  page_size={page_size}, top_k={top_k}")
     print(f"  sink_size={sink_size}, recent_size={recent_size}")
     print(f"  compress_ratio={compress_ratio} ({page_size} -> {comp_size} tokens)")
+    print(f"  proxy_frequency_layout={proxy_frequency_layout}")
     print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}")
     print(f"  unselected_mode={unselected_mode}")
-    print(f"  continuous_rope={continuous_rope}, use_triton={use_triton}")
+    print(
+        f"  continuous_rope={continuous_rope}, "
+        f"score_use_direct_spectral_proxy={score_use_direct_spectral_proxy}, "
+        f"score_use_haar_proxy={score_use_haar_proxy}, "
+        f"score_use_haar_mixed_proxy={score_use_haar_mixed_proxy}, "
+        f"score_use_hadamard_proxy={score_use_hadamard_proxy}, "
+        f"select_with_oracle_page_scores={select_with_oracle_page_scores}, "
+        f"use_triton={use_triton}"
+    )
     print(f"  Page attention active during decode only (prefill uses full attention)")
 
     transformers.models.qwen2.modeling_qwen2.Qwen2Attention.forward = dct_page_attention_forward
 
 
 def replace_llama_attn(
-    page_size=128,
-    top_k=8,
+    page_size=32,
+    top_k=64,
     sink_size=4,
     recent_size=128,
-    compress_ratio=0.25,
+    compress_ratio=0.03125,
+    min_decode_kv_len_for_paging=8192,
+    proxy_frequency_layout="low",
     scoring_method="max",
     group_agg_method="mean",
     unselected_mode="drop",
     continuous_rope=True,
+    score_use_direct_spectral_proxy=False,
+    score_use_haar_proxy=True,
+    score_use_haar_mixed_proxy=False,
+    score_use_hadamard_proxy=False,
+    select_with_oracle_page_scores=False,
     use_triton=True,
 ):
     """
@@ -717,10 +1973,17 @@ def replace_llama_attn(
         sink_size=sink_size,
         recent_size=recent_size,
         compress_ratio=compress_ratio,
+        min_decode_kv_len_for_paging=min_decode_kv_len_for_paging,
+        proxy_frequency_layout=proxy_frequency_layout,
         scoring_method=scoring_method,
         group_agg_method=group_agg_method,
         unselected_mode=unselected_mode,
         continuous_rope=continuous_rope,
+        score_use_direct_spectral_proxy=score_use_direct_spectral_proxy,
+        score_use_haar_proxy=score_use_haar_proxy,
+        score_use_haar_mixed_proxy=score_use_haar_mixed_proxy,
+        score_use_hadamard_proxy=score_use_hadamard_proxy,
+        select_with_oracle_page_scores=select_with_oracle_page_scores,
         use_triton=use_triton,
     )
 
@@ -729,9 +1992,18 @@ def replace_llama_attn(
     print(f"  page_size={page_size}, top_k={top_k}")
     print(f"  sink_size={sink_size}, recent_size={recent_size}")
     print(f"  compress_ratio={compress_ratio} ({page_size} -> {comp_size} tokens)")
+    print(f"  proxy_frequency_layout={proxy_frequency_layout}")
     print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}")
     print(f"  unselected_mode={unselected_mode}")
-    print(f"  continuous_rope={continuous_rope}, use_triton={use_triton}")
+    print(
+        f"  continuous_rope={continuous_rope}, "
+        f"score_use_direct_spectral_proxy={score_use_direct_spectral_proxy}, "
+        f"score_use_haar_proxy={score_use_haar_proxy}, "
+        f"score_use_haar_mixed_proxy={score_use_haar_mixed_proxy}, "
+        f"score_use_hadamard_proxy={score_use_hadamard_proxy}, "
+        f"select_with_oracle_page_scores={select_with_oracle_page_scores}, "
+        f"use_triton={use_triton}"
+    )
     print(f"  Page attention active during decode only (prefill uses full attention)")
 
     transformers.models.llama.modeling_llama.LlamaAttention.forward = dct_page_attention_forward
