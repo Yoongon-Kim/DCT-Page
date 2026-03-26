@@ -4,11 +4,12 @@
 set -e
 
 # ---- Configuration ----
-BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
-MODEL_FAMILY="${MODEL_FAMILY:-llama3.1}"
+BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-8B}"
+MODEL_FAMILY="${MODEL_FAMILY:-qwen3}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-127500}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
+PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-8192}"
 OUTPUT_DIR="${OUTPUT_DIR:-results_longbench_v2/multipole_attention}"
 
 # Fixed multipole parameters
@@ -82,6 +83,7 @@ for PCT_CLUSTERS in 6.25; do
                 --max_input_len "$MAX_INPUT_LEN" \
                 --max_new_tokens "$MAX_NEW_TOKENS" \
                 --num_samples "$NUM_SAMPLES" \
+                --prefill_chunk_size "$PREFILL_CHUNK_SIZE" \
                 --output_dir "$OUTPUT_DIR" \
                 --run_name "$RUN_NAME"
         done

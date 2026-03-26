@@ -116,8 +116,9 @@ def multipole_attention_forward(
     cos, sin = position_embeddings
     query_states_rope, key_states_rope = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-    # Compute wRoPE embeddings for centroid lookup
-    if self._mp_use_centroids:
+    # Compute wRoPE embeddings for centroid lookup (decode only;
+    # during prefill, clustering is deferred so wRoPE is not needed)
+    if self._mp_use_centroids and query_states.shape[2] == 1:
         fixed_position = 0
         cos_wrope, sin_wrope = self._mp_rotary_emb(
             hidden_states, torch.tensor([[fixed_position]]).to(query_states.device)
@@ -134,18 +135,21 @@ def multipole_attention_forward(
         query_states_wrope = None
 
     # Determine which path to take
-    recompute_context = self._mp_use_centroids and (self._mp_num_clusters_lst is None)
+    is_prefill = query_states.shape[2] > 1
+    recompute_context = self._mp_use_centroids and (self._mp_num_clusters_lst is None) and not is_prefill
     online_gen = self._mp_use_centroids and not recompute_context and query_states.shape[2] == 1
 
     # Check for re-clustering
     buffer_len = past_seen_tokens + 1 - self._mp_clustered_length - self._mp_clustered_offset
     recluster = online_gen and buffer_len >= 2 * self._mp_cluster_interval
 
-    # Initial clustering setup
+    # Initial clustering setup (deferred to first decode token so that
+    # chunked prefill accumulates the full KV cache before clustering)
     if recompute_context:
+        prompt_len = past_seen_tokens  # cache not yet updated with current token
         self._mp_clustered_offset = 10  # attention sink
-        prompt_len = key_states.shape[2] - self._mp_clustered_offset
-        num_blocks = (prompt_len // self._mp_cluster_interval - 1)
+        clusterable_len = prompt_len - self._mp_clustered_offset
+        num_blocks = (clusterable_len // self._mp_cluster_interval - 1)
         self._mp_clustered_length = num_blocks * self._mp_cluster_interval
         self._mp_num_clusters_lst = [
             int(self._mp_clustered_length * pct)
@@ -156,22 +160,44 @@ def multipole_attention_forward(
     if recluster:
         self._mp_clustered_length += self._mp_cluster_interval
 
-    # --- Recompute centroids (prefill) ---
+    # --- Recompute centroids (first decode token) ---
     if recompute_context:
         num_levels = len(self._mp_num_clusters_lst)
         rank = (
             dist.get_rank() if self._mp_inference_tp > 1
-            else key_states.device.index
+            else (key_states.device.index or 0)
         )
 
-        key_states_cluster = key_states_wrope[
+        # Read full prompt keys/values from KV cache
+        cached_keys = past_key_values.layers[self.layer_idx].keys    # [B, H, prompt_len, D]
+        cached_values = past_key_values.layers[self.layer_idx].values
+
+        # Invert RoPE on the clustered region to recover raw (unrotated) keys
+        N = self._mp_clustered_offset + self._mp_clustered_length
+        cos_inv = self._mp_cos_cache[:, :N] / self._mp_attention_scaling
+        sin_inv = self._mp_sin_cache[:, :N] / self._mp_attention_scaling
+        _, raw_keys = _apply_rotary_pos_emb(
+            cached_keys[:, :, :N, :],
+            cached_keys[:, :, :N, :],
+            cos_inv, -sin_inv,
+        )
+
+        # Apply wRoPE at fixed position 0 for clustering
+        cos_wrope_k, sin_wrope_k = self._mp_rotary_emb(
+            hidden_states,
+            torch.tensor([[0]], device=key_states.device),
+        )
+        _, keys_wrope = _apply_rotary_pos_emb(raw_keys, raw_keys, cos_wrope_k, sin_wrope_k)
+
+        # Slice clustered region (excluding attention sink)
+        key_states_cluster = keys_wrope[
             :, :,
-            self._mp_clustered_offset : self._mp_clustered_length + self._mp_clustered_offset,
+            self._mp_clustered_offset : self._mp_clustered_offset + self._mp_clustered_length,
             :,
         ].contiguous()
-        value_states_cluster = value_states[
+        value_states_cluster = cached_values[
             :, :,
-            self._mp_clustered_offset : self._mp_clustered_length + self._mp_clustered_offset,
+            self._mp_clustered_offset : self._mp_clustered_offset + self._mp_clustered_length,
             :,
         ].contiguous()
 
@@ -184,7 +210,7 @@ def multipole_attention_forward(
             value_centers_lst = []
             for cluster_labels, num_clusters in zip(cluster_labels_list, self._mp_num_clusters_lst):
                 temp_value_centers = []
-                for H in range(key_states.shape[1]):
+                for H in range(key_states_cluster.shape[1]):
                     value_data = value_states_cluster[0, H]
                     cluster_data = cluster_labels[0, H]
                     sums = torch.zeros(num_clusters, value_data.shape[-1], device=value_data.device, dtype=value_data.dtype)
@@ -222,7 +248,7 @@ def multipole_attention_forward(
         num_levels = len(self._mp_num_clusters_lst)
         rank = (
             dist.get_rank() if self._mp_inference_tp > 1
-            else key_states.device.index
+            else (key_states.device.index or 0)
         )
 
         num_new_clusters = [

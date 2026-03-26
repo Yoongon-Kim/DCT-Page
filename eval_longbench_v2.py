@@ -90,6 +90,10 @@ def parse_args():
     parser.add_argument("--no_triton", action="store_true",
                         help="Disable Triton kernels (use pure PyTorch for comparison)")
 
+    # Chunked prefill (useful for multipole_attention on single GPU)
+    parser.add_argument("--prefill_chunk_size", type=int, default=0,
+                        help="Chunk size for prefill (0 = no chunking)")
+
     args = parser.parse_args()
     args.continuous_rope = not args.no_continuous_rope
 
@@ -234,12 +238,14 @@ def evaluate(model, tokenizer, dataset, args):
                     do_sample=False,
                 )
             else:
-                output_ids = model.generate(
-                    input_ids,
+                gen_kwargs = dict(
                     max_new_tokens=max_gen,
                     do_sample=False,
                     use_cache=True,
                 )
+                if args.prefill_chunk_size > 0:
+                    gen_kwargs["prefill_chunk_size"] = args.prefill_chunk_size
+                output_ids = model.generate(input_ids, **gen_kwargs)
 
         generated_ids = output_ids[0, input_len:]
         response = tokenizer.decode(generated_ids, skip_special_tokens=True)
@@ -405,10 +411,14 @@ def main():
         attn_impl = "sdpa"
         print(f"Loading model: {args.base_model} (attn: {attn_impl})")
         tokenizer = AutoTokenizer.from_pretrained(args.base_model)
+        # Multipole attention requires all layers on a single GPU (the original
+        # MultipoleAttention repo uses model.to(device)); device_map="auto"
+        # spreads layers across GPUs and breaks per-layer clustering state.
+        device_map = "cuda:0" if args.mode == "multipole_attention" else "auto"
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
             dtype=torch.bfloat16,
-            device_map="auto",
+            device_map=device_map,
             attn_implementation=attn_impl,
         )
         model.eval()

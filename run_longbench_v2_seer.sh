@@ -60,7 +60,7 @@ PYEOF
 }
 
 # ---- Sweep token_budget ----
-for TOKEN_BUDGET in 1024 2048 4096 8192; do
+for TOKEN_BUDGET in 1156 2180; do
     RUN_NAME="seer_budget${TOKEN_BUDGET}"
 
     echo ""
