@@ -12,16 +12,14 @@ class _attention_qk_gen(torch.autograd.Function):
         capability = torch.cuda.get_device_capability()
         if capability[0] < 8:
             raise RuntimeError("Flash attention currently only supported for compute capability >= 80")
-        gpu_name = torch.cuda.get_device_name(q.device)  # Assuming you're checking the first GPU
-        if "A6000" in gpu_name or "A5000" in gpu_name:
-            BLOCK_N = 64
-            BLOCK_M = 64
-        elif "A100" in gpu_name or "H100" in gpu_name or "L40S" in gpu_name:
+        gpu_name = torch.cuda.get_device_name(q.device)
+        if "A100" in gpu_name or "H100" in gpu_name or "L40S" in gpu_name:
             BLOCK_N = 128
             BLOCK_M = 128
         else:
-            print(f"GPU not supported: {gpu_name}")
-            assert(False)
+            # Safe default for GPUs with limited shared memory (A6000, A5000, Blackwell, etc.)
+            BLOCK_N = 64
+            BLOCK_M = 64
         BLOCK_KV = 2048
 
         # shape constraints
@@ -95,16 +93,14 @@ class _centroid_lookup_gen(torch.autograd.Function):
         capability = torch.cuda.get_device_capability()
         if capability[0] < 8:
             raise RuntimeError("Flash attention currently only supported for compute capability >= 80")
-        gpu_name = torch.cuda.get_device_name(q.device)  # Assuming you're checking the first GPU
-        if "A6000" in gpu_name or "A5000" in gpu_name:
-            BLOCK_N = 64
-            BLOCK_M = 64
-        elif "A100" in gpu_name or "H100" in gpu_name or "L40S" in gpu_name:
+        gpu_name = torch.cuda.get_device_name(q.device)
+        if "A100" in gpu_name or "H100" in gpu_name or "L40S" in gpu_name:
             BLOCK_N = 128
             BLOCK_M = 128
         else:
-            print(f"GPU not supported: {gpu_name}")
-            assert(False)
+            # Safe default for GPUs with limited shared memory (A6000, A5000, Blackwell, etc.)
+            BLOCK_N = 64
+            BLOCK_M = 64
         BLOCK_KV = 2048
 
         # number of KV heads and GQA factor

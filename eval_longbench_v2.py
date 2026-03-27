@@ -421,18 +421,23 @@ def main():
         # MultipoleAttention repo uses model.to(device)); device_map="auto"
         # spreads layers across GPUs and breaks per-layer clustering state.
         device_map = "cuda:0" if args.mode == "multipole_attention" else "auto"
+        yarn_kwargs = {}
+        if "qwen3" in args.base_model.lower():
+            yarn_kwargs = {
+                "rope_parameters": {
+                    "rope_type": "yarn",
+                    "rope_theta": 1000000.0,
+                    "factor": 4.0,
+                    "original_max_position_embeddings": 32768,
+                },
+                "max_position_embeddings": 131072,
+            }
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
             torch_dtype=torch.bfloat16,
             device_map=device_map,
             attn_implementation=attn_impl,
-            rope_parameters={
-                "rope_type": "yarn",
-                "rope_theta": 1000000.0,
-                "factor": 4.0,
-                "original_max_position_embeddings": 32768,
-            },
-            max_position_embeddings=131072,
+            **yarn_kwargs,
         )
         model.eval()
         print(f"Model loaded. Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
