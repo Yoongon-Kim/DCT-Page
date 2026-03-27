@@ -22,7 +22,7 @@ MULTIPOLE_ATTN_CONFIG = {
     "percent_clusters_lst": [6.25],
 
     # Importance threshold per level (token budget for centroid selection)
-    "percentiles_lst": [2180],
+    "percentiles_lst": [1156],
 
     # Use centroid value approximation for non-selected tokens
     "use_replacement": False,

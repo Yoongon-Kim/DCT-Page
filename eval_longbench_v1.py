@@ -743,6 +743,12 @@ def main():
             seerattn_token_budget=SEER_ATTN_CONFIG["token_budget"],
             seerattn_threshold=SEER_ATTN_CONFIG["threshold"],
             seerattn_start_layer=SEER_ATTN_CONFIG["start_layer"],
+            rope_scaling={
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 32768,
+            },
+            max_position_embeddings=131072,
         ).cuda()
         model.eval()
         tokenizer = AutoTokenizer.from_pretrained(model.config.base_model)
@@ -756,6 +762,13 @@ def main():
             torch_dtype=torch.bfloat16,
             device_map="auto",
             attn_implementation=attn_impl,
+            rope_parameters={
+                "rope_type": "yarn",
+                "rope_theta": 1000000.0,
+                "factor": 4.0,
+                "original_max_position_embeddings": 32768,
+            },
+            max_position_embeddings=131072,
         )
         model.eval()
         print(f"Model loaded. Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
