@@ -248,6 +248,8 @@ def evaluate(model, tokenizer, dataset, args):
                 output_ids = model.generate(input_ids, **gen_kwargs)
 
         generated_ids = output_ids[0, input_len:]
+        del input_ids, output_ids
+        torch.cuda.empty_cache()
         response = tokenizer.decode(generated_ids, skip_special_tokens=True)
         # Qwen3 (used by seer_attention) is a thinking model that wraps
         # reasoning in <think>...</think>; strip it to get the actual answer.
