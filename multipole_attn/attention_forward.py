@@ -471,7 +471,7 @@ def multipole_attention_forward(
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
         query_states_attn = query_states_rope
-        if query_states_attn.shape[2] > 1:  # prefill
+        if query_states_attn.shape[2] > 1 and past_seen_tokens == 0:  # prefill, first chunk only
             key_states = key_states_rope
 
         sliding_window = getattr(self, "sliding_window", None)
