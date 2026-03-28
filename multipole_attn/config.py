@@ -2,7 +2,7 @@
 Multipole Attention evaluation configuration.
 
 Edit this file to change model, clustering parameters, and attention behavior
-before running eval_longbench_v1.py or eval_longbench_v2.py with --mode multipole_attention.
+before running eval_ruler.py with --mode multipole_attention.
 
 Key parameters:
   - percent_clusters_lst: percentage of keys to retain per hierarchy level
@@ -22,7 +22,7 @@ MULTIPOLE_ATTN_CONFIG = {
     "percent_clusters_lst": [6.25],
 
     # Importance threshold per level (token budget for centroid selection)
-    "percentiles_lst": [1156],
+    "percentiles_lst": [2180],
 
     # Use centroid value approximation for non-selected tokens
     "use_replacement": False,
