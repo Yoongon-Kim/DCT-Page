@@ -4,7 +4,7 @@
 set -e
 
 # ---- Configuration ----
-BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-4B}"
+BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-8B}"
 MODEL_TEMPLATE="${MODEL_TEMPLATE:-qwen-3}"
 TOKENIZER_FAMILY="${TOKENIZER_FAMILY:-qwen3}"
 MODEL_FAMILY="${MODEL_FAMILY:-qwen3}"
@@ -21,7 +21,7 @@ if [[ "$*" == *"--prepare"* ]]; then
 fi
 
 # Fixed seer parameters
-SEER_MODEL="${SEER_MODEL:-SeerAttention/SeerAttention-Decode-Qwen3-4B-AttnGates}"
+SEER_MODEL="${SEER_MODEL:-SeerAttention/SeerAttention-Decode-Qwen3-8B-AttnGates}"
 START_LAYER=0
 
 CONFIG_FILE="seer_attn/config.py"

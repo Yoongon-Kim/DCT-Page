@@ -11,7 +11,7 @@ NUM_SAMPLES="${NUM_SAMPLES:--1}"
 OUTPUT_DIR="${OUTPUT_DIR:-results_longbench_v2/seer_attention}"
 
 # Fixed seer parameters
-SEER_MODEL="${SEER_MODEL:-SeerAttention/SeerAttention-Decode-Qwen3-4B-AttnGates}"
+SEER_MODEL="${SEER_MODEL:-SeerAttention/SeerAttention-Decode-Qwen3-8B-AttnGates}"
 START_LAYER=0
 
 CONFIG_FILE="seer_attn/config.py"

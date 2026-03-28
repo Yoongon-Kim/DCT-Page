@@ -14,7 +14,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-results_longbench_v1/seer_attention}"
 TASKS="${TASKS:-narrativeqa qasper gov_report 2wikimqa multifieldqa_en triviaqa}"
 
 # Fixed seer parameters
-SEER_MODEL="${SEER_MODEL:-SeerAttention/SeerAttention-Decode-Qwen3-4B-AttnGates}"
+SEER_MODEL="${SEER_MODEL:-SeerAttention/SeerAttention-Decode-Qwen3-8B-AttnGates}"
 START_LAYER=0
 
 # Build task args
