@@ -37,7 +37,9 @@ dct_page_attention.py     Core page-attention implementation
 triton_kernels.py         Triton kernels for score / topk / assemble / RoPE
 config.py                 Default config values
 
-compare_baseline_dct.py   Baseline vs DCT/Haar comparison on prepared RULER jsonl
+compare_baseline_dct.py   Ad-hoc pairwise baseline vs DCT/Haar comparison
+run_ruler_eval.py         Single-mode RULER runner with flat task jsonl outputs
+compare_ruler_runs.py     Post-hoc comparison across completed RULER runs
 eval_longbench_v1.py      LongBench v1 evaluation
 eval_longbench_v2.py      LongBench v2 evaluation
 speed_test_dummy.py       Decode throughput benchmark
@@ -113,7 +115,69 @@ results_ruler/data/synthetic/16384/
 results_ruler/data/synthetic/32768/
 ```
 
-예:
+단일 모드로 한 번만 돌리고, 비교는 나중에 별도 스크립트로 하는 것이 기본 workflow입니다.
+
+예: drop / Haar run
+
+```bash
+python run_ruler_eval.py \
+  --mode page_attention \
+  --context_len 16384 \
+  --tasks niah_multikey_3 \
+  --tag niah_multikey_3_16k_drop_haar \
+  --num_samples 25 \
+  --max_new_tokens 128 \
+  --cuda_device 0 \
+  --dct_page_size 32 \
+  --dct_top_k 64 \
+  --dct_sink_size 4 \
+  --dct_recent_size 128 \
+  --dct_compress_ratio 0.03125 \
+  --dct_unselected_mode drop
+```
+
+baseline run:
+
+```bash
+python run_ruler_eval.py \
+  --mode baseline \
+  --context_len 16384 \
+  --tasks niah_multikey_3 \
+  --tag niah_multikey_3_16k_baseline \
+  --num_samples 25 \
+  --max_new_tokens 128 \
+  --cuda_device 0
+```
+
+기본은 Haar proxy입니다. low DCT로 강제로 내리고 싶으면:
+
+```bash
+  --dct_score_use_low_proxy
+```
+
+run 디렉터리 안에는 task별로 별도 폴더를 만들지 않고:
+
+```text
+<run_dir>/
+  manifest.json
+  run.log
+  summary.csv
+  summary.json
+  niah_multikey_3.jsonl
+  ...
+```
+
+pairwise compare가 필요하면:
+
+```bash
+python compare_ruler_runs.py \
+  --run_dirs results/ruler_runs/run_a,results/ruler_runs/run_b \
+  --labels baseline,drop_haar \
+  --output_dir results/ruler_compare \
+  --tag baseline_vs_drop_haar
+```
+
+기존 quick pairwise compare workflow가 필요할 때만 아래 스크립트를 씁니다.
 
 ```bash
 python compare_baseline_dct.py \
@@ -130,17 +194,13 @@ python compare_baseline_dct.py \
   --dct_unselected_mode drop
 ```
 
-기본은 Haar proxy입니다. low DCT로 강제로 내리고 싶으면:
-
-```bash
-  --dct_score_use_low_proxy
-```
-
 hybrid 실행 예:
 
 ```bash
-python compare_baseline_dct.py \
-  --data_path results_ruler/data/synthetic/32768/niah_multivalue/validation.jsonl \
+python run_ruler_eval.py \
+  --mode page_attention \
+  --context_len 32768 \
+  --tasks niah_multivalue \
   --tag niah_multivalue_32k_ps32_top64_hybrid \
   --num_samples 25 \
   --max_new_tokens 128 \
@@ -153,12 +213,41 @@ python compare_baseline_dct.py \
   --dct_unselected_mode hybrid
 ```
 
+oracle selection upper bound 실행 예:
+
+```bash
+python run_ruler_oracle_selection.py \
+  --context_len 32768 \
+  --page_sizes 32,64,128 \
+  --selected_token_budget 2048 \
+  --compress_ratio 0.03125 \
+  --num_samples 25 \
+  --max_new_tokens 128 \
+  --cuda_device 0
+```
+
+이 스크립트는 `drop` 모드에서 `--dct_select_with_oracle_page_scores`를 켠 upper bound를
+여러 page size에 대해 반복 실행하고, 각 page-size subrun 안에는 task별 jsonl만 flat하게 저장합니다.
+
+가정:
+
+- `selected full-token budget`을 고정합니다.
+- 따라서 기본 비교는
+  - `page_size=32 -> top_k=64`
+  - `page_size=64 -> top_k=32`
+  - `page_size=128 -> top_k=16`
+  입니다.
+- `compress_ratio=0.03125`를 그대로 유지하므로 `comp_size`는 각각 `1, 2, 4`가 됩니다.
+
 주요 결과 파일:
 
-- `baseline.jsonl`
-- `dct.jsonl`
-- `compare.jsonl`
-- `summary.json`
+- `results/ruler_oracle_selection/<run>/summary.tsv`
+- `results/ruler_oracle_selection/<run>/summary_avg.tsv`
+- `results/ruler_oracle_selection/<run>/summary.json`
+- `results/ruler_oracle_selection/<run>/commands.sh`
+- `results/ruler_oracle_selection/<run>/ps32_topk64/<task>.jsonl`
+- `results/ruler_oracle_selection/<run>/ps64_topk32/<task>.jsonl`
+- `results/ruler_oracle_selection/<run>/ps128_topk16/<task>.jsonl`
 
 ### 2. predict script 사용
 
@@ -309,43 +398,75 @@ python summarize_longbench_v2.py results/longbench_v2/v2_drop
 
 ### Throughput benchmark
 
-decode throughput은 [speed_test_dummy.py](/home/jiwonsong/DCT-Page/speed_test_dummy.py)로 잽니다.
+decode throughput은 [speed_test_dummy.py](/home/jiwonsong/DCT-Page/speed_test_dummy.py)로 재고, 보통은 wrapper인 [run_speed.sh](/home/jiwonsong/DCT-Page/run_speed.sh)를 쓰는 게 편합니다.
 
-baseline + DCT/Haar 동시 비교:
+기본 실행:
 
 ```bash
-python speed_test_dummy.py \
-  --context_lengths 16384 32768 \
-  --mode both \
-  --base_model meta-llama/Llama-3.1-8B-Instruct \
-  --page_size 32 \
-  --top_k 64 \
-  --sink_size 4 \
-  --recent_size 128 \
-  --compress_ratio 0.03125 \
-  --unselected_mode drop
+bash run_speed.sh
 ```
 
-DCT/Haar만 따로:
+single GPU로 고정하려면:
+
+```bash
+GPU=1 bash run_speed.sh
+```
+
+이 스크립트는 기본적으로 아래 3개를 같은 protocol로 돌립니다.
+
+- `baseline`
+- 현재 기본 sparse 설정: `ps32 / topk64 / comp1 / Haar / drop`
+- 정확도 후보 설정: `ps32 / topk64 / comp4 / Haar / drop`
+
+기본 protocol:
+
+- `warmup_steps=1`
+- `num_repeats=3`
+- `max_new_tokens=128`
+
+길이나 반복 수를 바꾸고 싶으면 env var로 넘기면 됩니다.
+
+```bash
+CONTEXT_LENGTHS="8192,16384,32768" NUM_REPEATS=5 bash run_speed.sh
+```
+
+직접 baseline만 재려면:
 
 ```bash
 python speed_test_dummy.py \
-  --context_lengths 16384 32768 \
-  --mode page_attention \
-  --base_model meta-llama/Llama-3.1-8B-Instruct \
+  --mode baseline \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --context_lengths 8192,16384,32768 \
+  --warmup_steps 1 \
+  --num_repeats 3 \
+  --max_new_tokens 128 \
+  --output_dir results/speed_test_dummy
+```
+
+직접 DCT 설정 하나만 재려면:
+
+```bash
+python speed_test_dummy.py \
+  --mode dct \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --context_lengths 8192,16384,32768 \
+  --warmup_steps 1 \
+  --num_repeats 3 \
+  --max_new_tokens 128 \
   --page_size 32 \
   --top_k 64 \
   --sink_size 4 \
   --recent_size 128 \
   --compress_ratio 0.03125 \
+  --scoring_method max \
+  --group_agg_method mean \
   --unselected_mode drop
 ```
 
 주요 산출물:
 
-- `summary.json`
-- `baseline/summary.json` 또는 `dct/summary.json`
-- `compare.json` (`mode=both`일 때)
+- `<run_dir>/summary.json`
+- `<run_dir>/samples.jsonl`
 
 ### Decode profile
 
@@ -354,7 +475,7 @@ python speed_test_dummy.py \
 ```bash
 python profile_decode.py \
   --context_length 32768 \
-  --base_model meta-llama/Llama-3.1-8B-Instruct \
+  --model meta-llama/Llama-3.1-8B-Instruct \
   --page_size 32 \
   --top_k 64 \
   --sink_size 4 \

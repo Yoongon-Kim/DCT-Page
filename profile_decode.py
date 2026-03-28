@@ -276,6 +276,7 @@ def profiled_dct_page_attention_forward(
     # Step 2: KV cache update
     cos, sin = position_embeddings
     force_baseline_decode = False
+    min_len_for_paging = cfg.min_decode_kv_len_for_paging
     if cfg.continuous_rope:
         base_context_len = 0
         if past_key_value is not None:

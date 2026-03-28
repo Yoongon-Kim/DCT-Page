@@ -535,6 +535,103 @@ def _next_page_capacity(required_pages, current_capacity):
     return new_capacity
 
 
+def _get_expected_decode_kv_capacity(past_key_value, layer_idx, current_kv_len):
+    """Best-effort upper bound for the current decode sample's KV length."""
+    if past_key_value is not None:
+        try:
+            layer = past_key_value.layers[layer_idx]
+            alloc_len = getattr(layer, "_alloc_len", None)
+            if alloc_len is not None:
+                return max(int(alloc_len), int(current_kv_len))
+        except Exception:
+            pass
+    return int(current_kv_len)
+
+
+def _reserve_decode_runtime_buffers(
+    attn_module,
+    cfg,
+    past_key_value,
+    current_kv_len,
+    bsz,
+    num_kv_heads,
+    paged_k,
+    comp_size,
+    num_pages,
+):
+    """Reserve decode-time buffers up front to avoid first-use growth spikes."""
+    expected_kv_len = _get_expected_decode_kv_capacity(
+        past_key_value, attn_module.layer_idx, current_kv_len
+    )
+    expected_num_pages = max(
+        num_pages,
+        max(0, (expected_kv_len - cfg.sink_size - cfg.recent_size) // cfg.page_size),
+    )
+    device = paged_k.device
+    dtype = paged_k.dtype
+    head_dim = paged_k.shape[-1]
+
+    if cfg.continuous_rope:
+        _get_or_build_original_position_rope_tables(
+            attn_module, expected_kv_len, attn_module.config, device, dtype
+        )
+
+    page_scores_buf = getattr(attn_module, "_page_scores_buf", None)
+    if (
+        page_scores_buf is None
+        or page_scores_buf.shape[0] != bsz
+        or page_scores_buf.shape[1] != num_kv_heads
+        or page_scores_buf.shape[2] < expected_num_pages
+    ):
+        attn_module._page_scores_buf = torch.empty(
+            bsz, num_kv_heads, expected_num_pages, dtype=torch.float32, device=device
+        )
+
+    topk_capacity = min(cfg.top_k, expected_num_pages)
+    topk_buf = getattr(attn_module, "_topk_out_buf", None)
+    if (
+        topk_buf is None
+        or topk_buf.shape[0] != bsz
+        or topk_buf.shape[1] != num_kv_heads
+        or topk_buf.shape[2] < topk_capacity
+    ):
+        attn_module._topk_out_buf = torch.empty(
+            bsz, num_kv_heads, topk_capacity, dtype=torch.int32, device=device
+        )
+
+    if cfg.unselected_mode == "drop":
+        assembled_capacity = cfg.sink_size + topk_capacity * cfg.page_size + cfg.recent_size + cfg.page_size
+        if getattr(attn_module, "_assemble_buf_len", 0) < assembled_capacity:
+            attn_module._final_k_buf = torch.empty(
+                bsz, num_kv_heads, assembled_capacity, head_dim, dtype=dtype, device=device
+            )
+            attn_module._final_v_buf = torch.empty_like(attn_module._final_k_buf)
+            attn_module._sel_idx_buf = torch.empty(
+                bsz, num_kv_heads, topk_capacity, dtype=torch.int32, device=device
+            )
+            attn_module._assemble_buf_len = assembled_capacity
+
+    if cfg.continuous_rope and cfg.score_use_haar_proxy:
+        cached_k = getattr(attn_module, "_dct_score_haar_k_cache", None)
+        capacity = getattr(attn_module, "_dct_score_haar_cache_capacity", 0)
+        if (
+            cached_k is None
+            or cached_k.shape[0] != bsz
+            or cached_k.shape[1] != num_kv_heads
+            or cached_k.shape[3] != comp_size
+            or capacity < expected_num_pages
+        ):
+            n_cached = min(getattr(attn_module, "_dct_score_haar_n_pages_cached", 0), expected_num_pages)
+            new_capacity = _next_page_capacity(expected_num_pages, capacity)
+            new_cache = torch.empty(
+                bsz, num_kv_heads, new_capacity, comp_size, head_dim, dtype=dtype, device=device
+            )
+            if n_cached > 0 and cached_k is not None:
+                new_cache[:, :, :n_cached].copy_(cached_k[:, :, :n_cached])
+            attn_module._dct_score_haar_k_cache = new_cache
+            attn_module._dct_score_haar_cache_capacity = new_capacity
+
+
 # ---------------------------------------------------------------------------
 # RoPE helpers (for continuous RoPE in continuous_rope mode)
 # ---------------------------------------------------------------------------
@@ -794,14 +891,19 @@ def _project_pages_to_spectral(attn_module, paged_x, comp_size):
 
 def _project_pages_to_haar_lowpass(attn_module, paged_x, comp_size):
     """Project pages to coarse Haar lowpass block means."""
+    page_size = paged_x.shape[3]
     if comp_size == 1:
         return paged_x.mean(dim=3, keepdim=True)
-    page_size = paged_x.shape[3]
+    # The Haar lowpass projection is exactly a contiguous block mean. When the
+    # page splits evenly into `comp_size` blocks (the default fast paths like
+    # 32->4 and 128->4), avoid the projection-matrix einsum entirely.
+    if page_size % comp_size == 0:
+        block_size = page_size // comp_size
+        return paged_x.reshape(*paged_x.shape[:3], comp_size, block_size, paged_x.shape[4]).mean(dim=4)
     M = _get_or_build_haar_projection_matrix(
         attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
     )
     return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
-
 
 def _project_pages_to_haar_mixed(attn_module, paged_x, comp_size):
     """Project pages to mixed global/detail Haar proxies."""
@@ -1025,7 +1127,6 @@ def _update_score_haar_key_cache(attn_module, paged_k, num_pages, comp_size, cfg
         attn_module._dct_score_haar_n_pages_cached = num_pages
 
     return attn_module._dct_score_haar_k_cache[:, :, :num_pages]
-
 
 def _update_exec_hybrid_proxy_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg):
     """Maintain Haar lowpass execution proxies for hybrid unselected-page attention."""
@@ -1625,6 +1726,17 @@ def dct_page_attention_forward(
         recent_k, recent_v, num_pages, actual_recent) = segment_kv(
         key_states, value_states, cfg
     )
+    _reserve_decode_runtime_buffers(
+        self,
+        cfg,
+        past_key_value,
+        key_states.shape[2],
+        bsz,
+        self.config.num_key_value_heads,
+        paged_k,
+        comp_size,
+        num_pages,
+    )
     
     # Step 4: Compressed cache maintenance. The current default path uses a
     # separate score-time cache and drop-mode assembly, so comp_k/comp_v are
@@ -1651,7 +1763,7 @@ def dct_page_attention_forward(
         page_scores_buf is None
         or page_scores_buf.shape[0] != bsz
         or page_scores_buf.shape[1] != _num_kv_heads
-        or page_scores_buf.shape[2] != num_pages
+        or page_scores_buf.shape[2] < num_pages
     ):
         self._page_scores_buf = torch.empty(
             bsz, _num_kv_heads, num_pages,
@@ -1703,13 +1815,15 @@ def dct_page_attention_forward(
         topk_buf is None
         or topk_buf.shape[0] != bsz
         or topk_buf.shape[1] != _num_kv_heads
-        or topk_buf.shape[2] != actual_top_k
+        or topk_buf.shape[2] < actual_top_k
     ):
         self._topk_out_buf = torch.empty(
             bsz, _num_kv_heads, actual_top_k, dtype=torch.int32, device=paged_k.device
         )
 
-    selected_indices = topk_sort_triton(selection_page_scores, actual_top_k, out=self._topk_out_buf)
+    selected_indices = topk_sort_triton(
+        selection_page_scores, actual_top_k, out=self._topk_out_buf[:, :, :actual_top_k]
+    )
 
     if debug_hook is not None:
         debug_hook(
