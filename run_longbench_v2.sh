@@ -4,7 +4,7 @@
 set -e
 
 # ---- Configuration ----
-BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
+BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-8B}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-127500}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
@@ -29,7 +29,7 @@ python eval_longbench_v2.py \
     --max_new_tokens "$MAX_NEW_TOKENS" \
     --num_samples "$NUM_SAMPLES" \
     --output_dir "$OUTPUT_DIR" \
-    --run_name llama_baseline
+    --run_name qwen3_baseline
 
 # ---- Step 2: Sweep compress_ratio x top_k x group_agg_method (page attention) ----
 for COMPRESS_RATIO in 0.03125 0.0625 0.125 0.25; do  # 4/128, 8/128, 16/128, 32/128
@@ -48,7 +48,7 @@ for COMPRESS_RATIO in 0.03125 0.0625 0.125 0.25; do  # 4/128, 8/128, 16/128, 32/
                         --max_new_tokens "$MAX_NEW_TOKENS" \
                         --num_samples "$NUM_SAMPLES" \
                         --output_dir "$OUTPUT_DIR" \
-                        --run_name "llama_page_attn_${COMPRESS_RATIO}_topk${TOP_K}_${SCORING_METHOD}_${GAM}_${MODE}" \
+                        --run_name "qwen3_page_attn_${COMPRESS_RATIO}_topk${TOP_K}_${SCORING_METHOD}_${GAM}_${MODE}" \
                         --page_size "$PAGE_SIZE" \
                         --top_k "$TOP_K" \
                         --sink_size "$SINK_SIZE" \
