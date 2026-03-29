@@ -351,10 +351,15 @@ def build_prompt(context, input_text, task):
 def tokenize_and_truncate(prompt_text, tokenizer, max_input_len, task):
     if task not in NO_CHAT_TASKS:
         messages = [{"role": "user", "content": prompt_text}]
-        prompt_text = tokenizer.apply_chat_template(
-            messages,
+        chat_kwargs = dict(
             tokenize=False,
             add_generation_prompt=True,
+        )
+        if hasattr(tokenizer, "chat_template") and "enable_thinking" in (tokenizer.chat_template or ""):
+            chat_kwargs["enable_thinking"] = False
+        prompt_text = tokenizer.apply_chat_template(
+            messages,
+            **chat_kwargs,
         )
     tokenized = tokenizer(
         prompt_text,
@@ -485,10 +490,6 @@ def evaluate_task(model, tokenizer, task, dataset, args):
     max_gen = (args.max_new_tokens_override
                if args.max_new_tokens_override > 0
                else TASK_MAX_NEW_TOKENS.get(task, 64))
-    # Qwen3 is a thinking model: <think>...</think> consumes many tokens
-    # before the actual answer. Extend the budget so it isn't truncated.
-    if "qwen3" in args.base_model.lower():
-        max_gen = max_gen * 50
 
     # Resume support
     completed_ids = set()
@@ -541,10 +542,6 @@ def evaluate_task(model, tokenizer, task, dataset, args):
         torch.cuda.empty_cache()
 
         response = tokenizer.decode(generated_ids, skip_special_tokens=True)
-        # Qwen3 (used by seer_attention) is a thinking model that wraps
-        # reasoning in <think>...</think>; strip it to get the actual answer.
-        if "</think>" in response:
-            response = response.split("</think>", 1)[1].strip()
 
         sc = score_single(
             response, item["answers"], task,

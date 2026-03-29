@@ -44,10 +44,10 @@ TASKS = [
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run one RULER mode into a flat task-jsonl directory")
     p.add_argument("--mode", choices=["baseline", "page_attention"], required=True)
-    p.add_argument("--model_name_or_path", default="meta-llama/Llama-3.1-8B-Instruct")
+    p.add_argument("--model_name_or_path", default="Qwen/Qwen3-8B")
     p.add_argument("--context_len", type=int, required=True)
-    p.add_argument("--data_root", type=Path, default=Path("results_ruler/data/synthetic"))
-    p.add_argument("--output_root", type=Path, default=Path("results/ruler_runs"))
+    p.add_argument("--data_root", type=Path, default=Path("ruler_data"))
+    p.add_argument("--output_root", type=Path, default=Path("results_ruler_oracle/ruler_runs"))
     p.add_argument("--tag", default="ruler_run")
     p.add_argument("--run_dir", type=Path, default=None)
     p.add_argument("--benchmark", default="synthetic")
@@ -101,6 +101,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dct_no_triton", action="store_true")
     p.set_defaults(dct_score_use_haar_proxy=True)
     return p.parse_args()
+
+
+def resolve_model_family(model_name_or_path: str) -> str:
+    name = model_name_or_path.lower().split("/")[-1]
+    if "qwen3" in name:
+        return "qwen3"
+    elif "qwen2" in name:
+        return "qwen2"
+    elif "llama-3" in name or "llama3" in name:
+        return "llama3"
+    elif "llama" in name:
+        return "llama"
+    else:
+        return name.split("-")[0]
 
 
 def resolve_tasks(value: str) -> list[str]:
@@ -242,7 +256,8 @@ def main() -> None:
         run_start = time.time()
         for task in tasks:
             task_start = time.time()
-            data_path = args.data_root / str(args.context_len) / task / "validation.jsonl"
+            model_family = resolve_model_family(args.model_name_or_path)
+            data_path = args.data_root / model_family / str(args.context_len) / task / "validation.jsonl"
             samples = load_samples(data_path, args.num_samples)
             metric_fn, _ = load_metric_fn(args.benchmark, task)
             logger.log(f"Running task={task} samples={len(samples)} data={data_path}")

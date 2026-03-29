@@ -132,11 +132,16 @@ def build_prompt(item):
 # ---------------------------------------------------------------------------
 def tokenize_and_truncate(prompt_text, tokenizer, max_input_len):
     messages = [{"role": "user", "content": prompt_text}]
-    input_ids = tokenizer.apply_chat_template(
-        messages,
+    chat_kwargs = dict(
         tokenize=True,
         add_generation_prompt=True,
         return_tensors="pt",
+    )
+    if hasattr(tokenizer, "chat_template") and "enable_thinking" in (tokenizer.chat_template or ""):
+        chat_kwargs["enable_thinking"] = False
+    input_ids = tokenizer.apply_chat_template(
+        messages,
+        **chat_kwargs,
     )
     # Some transformers versions return BatchEncoding instead of a tensor
     if not isinstance(input_ids, torch.Tensor):
@@ -215,11 +220,7 @@ def evaluate(model, tokenizer, dataset, args):
     correct = 0
     total = 0
 
-    # Qwen3 is a thinking model: <think>...</think> consumes many tokens
-    # before the actual answer. Extend the budget so it isn't truncated.
     max_gen = args.max_new_tokens
-    if "qwen3" in args.base_model.lower():
-        max_gen = max_gen * 50
 
     for item in tqdm(samples, desc="Evaluating"):
         if item["_id"] in completed_ids:
@@ -252,10 +253,6 @@ def evaluate(model, tokenizer, dataset, args):
         del input_ids, output_ids
         torch.cuda.empty_cache()
         response = tokenizer.decode(generated_ids, skip_special_tokens=True)
-        # Qwen3 (used by seer_attention) is a thinking model that wraps
-        # reasoning in <think>...</think>; strip it to get the actual answer.
-        if "</think>" in response:
-            response = response.split("</think>", 1)[1].strip()
 
         predicted = extract_answer(response)
         gold = item["answer"]

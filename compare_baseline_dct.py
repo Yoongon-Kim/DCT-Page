@@ -183,12 +183,24 @@ def cleanup_model(model=None) -> None:
 
 
 def load_model(args: argparse.Namespace):
+    yarn_kwargs = {}
+    if "qwen3" in args.model_name_or_path.lower():
+        yarn_kwargs = {
+            "rope_parameters": {
+                "rope_type": "yarn",
+                "rope_theta": 1000000.0,
+                "factor": 4.0,
+                "original_max_position_embeddings": 32768,
+            },
+            "max_position_embeddings": 131072,
+        }
     return AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         torch_dtype=torch.bfloat16,
         device_map={"": args.cuda_device},
         attn_implementation="sdpa",
         local_files_only=args.local_files_only,
+        **yarn_kwargs,
     ).eval()
 
 

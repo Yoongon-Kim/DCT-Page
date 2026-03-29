@@ -307,10 +307,6 @@ def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
         data = data[:args.num_samples]
 
     tokens_to_generate = task_config["tokens_to_generate"]
-    # Qwen3 is a thinking model: <think>...</think> consumes many tokens
-    # before the actual answer. Extend the budget so it isn't truncated.
-    if "qwen3" in args.base_model.lower():
-        tokens_to_generate = tokens_to_generate * 100
 
     # Resume support
     pred_file = pred_dir / f"{task}.jsonl"
@@ -354,10 +350,6 @@ def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
 
             generated_ids = output_ids[0, input_len:]
             pred_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-
-            # Strip <think>...</think> for Qwen3 thinking models (seer)
-            if "</think>" in pred_text:
-                pred_text = pred_text.split("</think>", 1)[1].strip()
 
             result = {
                 "index": sample["index"],
