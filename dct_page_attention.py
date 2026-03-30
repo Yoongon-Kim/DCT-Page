@@ -535,11 +535,11 @@ def _next_page_capacity(required_pages, current_capacity):
     return new_capacity
 
 
-def _get_expected_decode_kv_capacity(past_key_value, layer_idx, current_kv_len):
+def _get_expected_decode_kv_capacity(past_key_values, layer_idx, current_kv_len):
     """Best-effort upper bound for the current decode sample's KV length."""
-    if past_key_value is not None:
+    if past_key_values is not None:
         try:
-            layer = past_key_value.layers[layer_idx]
+            layer = past_key_values.layers[layer_idx]
             alloc_len = getattr(layer, "_alloc_len", None)
             if alloc_len is not None:
                 return max(int(alloc_len), int(current_kv_len))
@@ -551,7 +551,7 @@ def _get_expected_decode_kv_capacity(past_key_value, layer_idx, current_kv_len):
 def _reserve_decode_runtime_buffers(
     attn_module,
     cfg,
-    past_key_value,
+    past_key_values,
     current_kv_len,
     bsz,
     num_kv_heads,
@@ -561,7 +561,7 @@ def _reserve_decode_runtime_buffers(
 ):
     """Reserve decode-time buffers up front to avoid first-use growth spikes."""
     expected_kv_len = _get_expected_decode_kv_capacity(
-        past_key_value, attn_module.layer_idx, current_kv_len
+        past_key_values, attn_module.layer_idx, current_kv_len
     )
     expected_num_pages = max(
         num_pages,
@@ -669,8 +669,13 @@ def _compute_rope_cos_sin(positions, config, device, dtype):
     from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
     rope_type = "default"
+    rope_config = None
     if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-        rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type", "default"))
+        rope_config = config.rope_scaling
+    elif hasattr(config, "rope_parameters") and config.rope_parameters is not None:
+        rope_config = config.rope_parameters
+    if rope_config is not None:
+        rope_type = rope_config.get("rope_type", rope_config.get("type", "default"))
 
     inv_freq, attention_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, device)
 
@@ -742,8 +747,13 @@ def _compute_rope_cos_sin_for_position_ids(position_ids, config, device, dtype):
     from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
     rope_type = "default"
+    rope_config = None
     if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-        rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type", "default"))
+        rope_config = config.rope_scaling
+    elif hasattr(config, "rope_parameters") and config.rope_parameters is not None:
+        rope_config = config.rope_parameters
+    if rope_config is not None:
+        rope_type = rope_config.get("rope_type", rope_config.get("type", "default"))
 
     inv_freq, attention_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, device)
     freqs = position_ids.to(device=device, dtype=torch.float32).unsqueeze(-1) * inv_freq.view(
@@ -1533,16 +1543,16 @@ _DCT_RUNTIME_STATE_ATTRS = (
 )
 
 
-def _maybe_reset_dct_runtime_state(attn_module, past_key_value):
+def _maybe_reset_dct_runtime_state(attn_module, past_key_values):
     """Clear per-generation runtime caches when the HF cache object changes."""
     cached_ref = getattr(attn_module, "_dct_runtime_cache_ref", None)
-    if cached_ref is past_key_value:
+    if cached_ref is past_key_values:
         return
 
     for attr in _DCT_RUNTIME_STATE_ATTRS:
         if hasattr(attn_module, attr):
             delattr(attn_module, attr)
-    attn_module._dct_runtime_cache_ref = past_key_value
+    attn_module._dct_runtime_cache_ref = past_key_values
 
 
 # ---------------------------------------------------------------------------
@@ -1553,7 +1563,7 @@ def dct_page_attention_forward(
     hidden_states: torch.Tensor,
     position_embeddings: tuple,
     attention_mask: Optional[torch.Tensor] = None, # The type can be torch.Tensor or None, and the default value is None
-    past_key_value: Optional[Cache] = None,
+    past_key_values: Optional[Cache] = None,
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> tuple:
@@ -1580,28 +1590,37 @@ def dct_page_attention_forward(
     input_shape = hidden_states.shape[:-1] # (bsz, q_len)
     hidden_shape = (*input_shape, -1, self.head_dim) # (bsz, q_len, num_heads, head_dim)
     bsz, q_len = input_shape     
-    _maybe_reset_dct_runtime_state(self, past_key_value)
+    _maybe_reset_dct_runtime_state(self, past_key_values)
     min_len_for_paging = max(
         cfg.sink_size + cfg.page_size * (cfg.top_k + 1) + cfg.recent_size,
         getattr(cfg, "min_decode_kv_len_for_paging", 0),
     )
 
+    # Qwen3 uses QK-norm (RMSNorm on q/k after projection, before RoPE).
+    # Qwen2 and Llama do not have q_norm/k_norm, so we check for their presence.
+    _has_qk_norm = hasattr(self, "q_norm") and hasattr(self, "k_norm")
+
     if q_len>1:
         # Step 1: Q/K/V projection
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2) # (bsz, num_heads, q_len, head_dim)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2) # (bsz, num_kv_heads, q_len, head_dim): num_kv_heads for gqa
+        query_states = self.q_proj(hidden_states).view(hidden_shape)
+        key_states = self.k_proj(hidden_states).view(hidden_shape)
+        if _has_qk_norm:
+            query_states = self.q_norm(query_states)
+            key_states = self.k_norm(key_states)
+        query_states = query_states.transpose(1, 2) # (bsz, num_heads, q_len, head_dim)
+        key_states = key_states.transpose(1, 2) # (bsz, num_kv_heads, q_len, head_dim): num_kv_heads for gqa
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2) # (bsz, num_kv_heads, q_len, head_dim): num_kv_heads for gqa
         
         # Step 2 & 3: RoPE and KV cache
         cos, sin = position_embeddings
         query_rope, key_rope = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         attn_q, attn_k, attn_v = query_rope, key_rope, value_states
-        if past_key_value is not None: # unless we call the model directly with use_cache=False, past_key_value is not None.
+        if past_key_values is not None: # unless we call the model directly with use_cache=False, past_key_values is not None.
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             if cfg.continuous_rope:
                 # Keep the cache in pre-RoPE space for decode-time page assembly, but
                 # still attend over the full cached context during chunked prefill.
-                key_cached, value_cached = past_key_value.update(
+                key_cached, value_cached = past_key_values.update(
                     key_states, value_states, self.layer_idx, cache_kwargs
                 )
                 all_pos = torch.arange(key_cached.shape[2], device=key_cached.device)
@@ -1611,7 +1630,7 @@ def dct_page_attention_forward(
                 attn_k = _apply_rope(key_cached, cos_all, sin_all)
                 attn_v = value_cached
             else:
-                attn_k, attn_v = past_key_value.update(
+                attn_k, attn_v = past_key_values.update(
                     key_rope, value_states, self.layer_idx, cache_kwargs
                 )
 
@@ -1641,18 +1660,23 @@ def dct_page_attention_forward(
         # Convert DynamicCache → PreAllocatedLayer at end of prefill (last layer only).
         # All layers are converted at once, so by the first decode step every
         # layer's cache.update() already uses PreAllocatedLayer (fixed strides).
-        if (past_key_value is not None
+        if (past_key_values is not None
                 and self.layer_idx == self.config.num_hidden_layers - 1
-                and not getattr(past_key_value, '_preallocated', False)):
-            pre_allocate_cache(past_key_value, extra_tokens=extra_tokens)
-            past_key_value._preallocated = True
+                and not getattr(past_key_values, '_preallocated', False)):
+            pre_allocate_cache(past_key_values, extra_tokens=extra_tokens)
+            past_key_values._preallocated = True
 
         return attn_output, attn_weights
 
     # ---- DECODE PATH (q_len == 1, long KV cache) ----
-    # Step 1: QKV projection
-    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    # Step 1: QKV projection (with QK-norm for Qwen3)
+    query_states = self.q_proj(hidden_states).view(hidden_shape)
+    key_states = self.k_proj(hidden_states).view(hidden_shape)
+    if _has_qk_norm:
+        query_states = self.q_norm(query_states)
+        key_states = self.k_norm(key_states)
+    query_states = query_states.transpose(1, 2)
+    key_states = key_states.transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     query_states_rope = None
     
@@ -1661,8 +1685,8 @@ def dct_page_attention_forward(
     force_baseline_decode = False
     if cfg.continuous_rope:
         base_context_len = 0
-        if past_key_value is not None:
-            base_context_len = int(past_key_value.layers[self.layer_idx].get_seq_length())
+        if past_key_values is not None:
+            base_context_len = int(past_key_values.layers[self.layer_idx].get_seq_length())
         force_baseline_decode = getattr(self, "_dct_force_baseline_decode", None)
         if force_baseline_decode is None:
             force_baseline_decode = base_context_len <= min_len_for_paging
@@ -1670,15 +1694,15 @@ def dct_page_attention_forward(
 
         if force_baseline_decode:
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-            if past_key_value is not None:
+            if past_key_values is not None:
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                key_states, value_states = past_key_value.update(
+                key_states, value_states = past_key_values.update(
                     key_states, value_states, self.layer_idx, cache_kwargs
                 )
             kv_len = key_states.shape[2]
         else:
-            if past_key_value is not None:
-                key_cached, value_cached = past_key_value.update(
+            if past_key_values is not None:
+                key_cached, value_cached = past_key_values.update(
                     key_states, value_states, self.layer_idx,
                 )
             else:
@@ -1686,9 +1710,9 @@ def dct_page_attention_forward(
             kv_len = key_cached.shape[2]
     else:
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        if past_key_value is not None:
+        if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(
+            key_states, value_states = past_key_values.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
         kv_len = key_states.shape[2]
@@ -1729,7 +1753,7 @@ def dct_page_attention_forward(
     _reserve_decode_runtime_buffers(
         self,
         cfg,
-        past_key_value,
+        past_key_values,
         key_states.shape[2],
         bsz,
         self.config.num_key_value_heads,
@@ -2052,6 +2076,75 @@ def replace_qwen2_attn(
     print(f"  Page attention active during decode only (prefill uses full attention)")
 
     transformers.models.qwen2.modeling_qwen2.Qwen2Attention.forward = dct_page_attention_forward
+
+
+def replace_qwen3_attn(
+    page_size=32,
+    top_k=64,
+    sink_size=4,
+    recent_size=128,
+    compress_ratio=0.03125,
+    min_decode_kv_len_for_paging=8192,
+    proxy_frequency_layout="low",
+    scoring_method="max",
+    group_agg_method="mean",
+    unselected_mode="drop",
+    continuous_rope=True,
+    score_use_direct_spectral_proxy=False,
+    score_use_haar_proxy=True,
+    score_use_haar_mixed_proxy=False,
+    score_use_hadamard_proxy=False,
+    select_with_oracle_page_scores=False,
+    use_triton=True,
+):
+    """
+    Replace Qwen3Attention.forward with DCT Page Attention.
+
+    Must be called BEFORE loading the model.
+    Qwen3Attention uses QK-norm (q_norm/k_norm) which is handled inside
+    dct_page_attention_forward via hasattr checks.
+    """
+    global _dct_page_cfg
+    _dct_page_cfg = DCTPageConfig(
+        page_size=page_size,
+        top_k=top_k,
+        sink_size=sink_size,
+        recent_size=recent_size,
+        compress_ratio=compress_ratio,
+        min_decode_kv_len_for_paging=min_decode_kv_len_for_paging,
+        proxy_frequency_layout=proxy_frequency_layout,
+        scoring_method=scoring_method,
+        group_agg_method=group_agg_method,
+        unselected_mode=unselected_mode,
+        continuous_rope=continuous_rope,
+        score_use_direct_spectral_proxy=score_use_direct_spectral_proxy,
+        score_use_haar_proxy=score_use_haar_proxy,
+        score_use_haar_mixed_proxy=score_use_haar_mixed_proxy,
+        score_use_hadamard_proxy=score_use_hadamard_proxy,
+        select_with_oracle_page_scores=select_with_oracle_page_scores,
+        use_triton=use_triton,
+    )
+
+    comp_size = max(1, int(page_size * compress_ratio))
+    print(f"DCT Page Attention config (Qwen3):")
+    print(f"  page_size={page_size}, top_k={top_k}")
+    print(f"  sink_size={sink_size}, recent_size={recent_size}")
+    print(f"  compress_ratio={compress_ratio} ({page_size} -> {comp_size} tokens)")
+    print(f"  proxy_frequency_layout={proxy_frequency_layout}")
+    print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}")
+    print(f"  unselected_mode={unselected_mode}")
+    print(
+        f"  continuous_rope={continuous_rope}, "
+        f"score_use_direct_spectral_proxy={score_use_direct_spectral_proxy}, "
+        f"score_use_haar_proxy={score_use_haar_proxy}, "
+        f"score_use_haar_mixed_proxy={score_use_haar_mixed_proxy}, "
+        f"score_use_hadamard_proxy={score_use_hadamard_proxy}, "
+        f"select_with_oracle_page_scores={select_with_oracle_page_scores}, "
+        f"use_triton={use_triton}"
+    )
+    print(f"  Page attention active during decode only (prefill uses full attention)")
+
+    transformers.models.qwen3.modeling_qwen3.Qwen3Attention.forward = dct_page_attention_forward
 
 
 def replace_llama_attn(

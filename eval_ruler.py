@@ -204,6 +204,20 @@ def apply_monkey_patch(args):
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
             )
+        elif "qwen3" in model_name_lower:
+            from dct_page_attention import replace_qwen3_attn
+            replace_qwen3_attn(
+                page_size=args.page_size,
+                top_k=args.top_k,
+                sink_size=args.sink_size,
+                recent_size=args.recent_size,
+                compress_ratio=args.compress_ratio,
+                scoring_method=args.scoring_method,
+                group_agg_method=args.group_agg_method,
+                unselected_mode=args.unselected_mode,
+                continuous_rope=args.continuous_rope,
+                use_triton=not args.no_triton,
+            )
         else:
             from dct_page_attention import replace_qwen2_attn
             replace_qwen2_attn(

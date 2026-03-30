@@ -259,6 +259,10 @@ def apply_dct_patch(args: argparse.Namespace) -> None:
         from dct_page_attention import replace_llama_attn
 
         replace_llama_attn(**common_kwargs)
+    elif "qwen3" in model_name:
+        from dct_page_attention import replace_qwen3_attn
+
+        replace_qwen3_attn(**common_kwargs)
     elif "qwen" in model_name:
         from dct_page_attention import replace_qwen2_attn
 

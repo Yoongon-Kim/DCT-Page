@@ -73,7 +73,7 @@ PYEOF
 }
 
 # ---- Sweep percent_clusters x percentiles x use_replacement ----
-for PCT_CLUSTERS in 6.25; do
+for PCT_CLUSTERS in 3.125; do
     for PERCENTILES in 1156 2180; do
         for REPL in False; do
             RUN_NAME="${MODEL_FAMILY}_multipole_pct${PCT_CLUSTERS}_ptl${PERCENTILES}_repl${REPL}"
