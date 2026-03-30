@@ -92,7 +92,7 @@ def parse_args():
     parser.add_argument("--group_agg_method", type=str, default="mean",
                         choices=["mean", "max", "topp"])
     parser.add_argument("--unselected_mode", type=str, default="drop",
-                        choices=["drop", "compressed"])
+                        choices=["drop", "compressed", "hybrid"])
     parser.add_argument("--no_continuous_rope", action="store_true")
     parser.add_argument("--no_triton", action="store_true")
 

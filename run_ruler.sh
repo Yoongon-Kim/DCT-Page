@@ -25,7 +25,7 @@ SINK_SIZE=4
 RECENT_SIZE=128
 SCORING_METHOD="max"
 GROUP_AGG_METHOD="mean"
-MODE="drop"
+MODE="hybrid"
 
 # ---- Sweep (page_size, top_k) x compress_ratio ----
 for PS_TK in "32,64" "64,32" "128,16" "32,32" "64,16" "128,8"; do
