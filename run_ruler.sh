@@ -26,7 +26,7 @@ RECENT_SIZE=128
 SCORING_METHOD="max"
 GROUP_AGG_METHOD="mean"
 # ---- Sweep (page_size, top_k) x compress_ratio x mode x compression_method ----
-for PS_TK in "32,64" "64,32" "32,32" "64,16"; do
+for PS_TK in "32,64"; do
     IFS=',' read -r PAGE_SIZE TOP_K <<< "$PS_TK"
     for COMPRESS_RATIO in 0.125; do
       for MODE in compressed drop; do
