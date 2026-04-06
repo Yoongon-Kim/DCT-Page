@@ -16,7 +16,7 @@ TASKS="${TASKS:-narrativeqa qasper gov_report 2wikimqa multifieldqa_en triviaqa}
 
 # Fixed multipole parameters
 USE_CENTROIDS=True
-USE_REPLACEMENT=False
+USE_REPLACEMENT="${USE_REPLACEMENT:-False}"
 CLUSTER_INTERVAL=128
 INFERENCE_TP=1
 
@@ -74,8 +74,8 @@ PYEOF
 
 # ---- Sweep percent_clusters x percentiles x use_replacement ----
 for PCT_CLUSTERS in 6.25; do
-    for PERCENTILES in 1156 2180; do
-        for REPL in False; do
+    for PERCENTILES in 2180; do
+        for REPL in True False; do
             RUN_NAME="${MODEL_FAMILY}_multipole_pct${PCT_CLUSTERS}_ptl${PERCENTILES}_repl${REPL}"
 
             echo ""
