@@ -269,7 +269,7 @@ def main() -> None:
 
     # Output directory
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = args.output_dir / f"{args.tag}_{timestamp}"
+    run_dir = args.output_dir / f"{args.tag}_{args.unselected_mode}"
     run_dir.mkdir(parents=True, exist_ok=True)
     per_sample_dir = run_dir / "per_sample"
     per_sample_dir.mkdir(exist_ok=True)
