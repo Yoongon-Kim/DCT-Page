@@ -37,9 +37,10 @@ for COMPRESS_RATIO in 0.03125 0.0625 0.125 0.25; do  # 4/128, 8/128, 16/128, 32/
         for SCORING_METHOD in mean max; do
             for GAM in max mean; do
                 for MODE in drop compressed; do
+                  for COMP_METHOD in haar dct; do
                     echo ""
                     echo "===================================================================="
-                    echo "PAGE ATTENTION : cr=${COMPRESS_RATIO}, top_k=${TOP_K}, scoring_method=${SCORING_METHOD}, group_agg=${GAM}, mode=${MODE}"
+                    echo "PAGE ATTENTION : cr=${COMPRESS_RATIO}, top_k=${TOP_K}, scoring_method=${SCORING_METHOD}, group_agg=${GAM}, mode=${MODE}, comp=${COMP_METHOD}"
                     echo "===================================================================="
                     python eval_longbench_v2.py \
                         --mode page_attention \
@@ -48,7 +49,7 @@ for COMPRESS_RATIO in 0.03125 0.0625 0.125 0.25; do  # 4/128, 8/128, 16/128, 32/
                         --max_new_tokens "$MAX_NEW_TOKENS" \
                         --num_samples "$NUM_SAMPLES" \
                         --output_dir "$OUTPUT_DIR" \
-                        --run_name "qwen3_page_attn_${COMPRESS_RATIO}_topk${TOP_K}_${SCORING_METHOD}_${GAM}_${MODE}" \
+                        --run_name "qwen3_page_attn_${COMPRESS_RATIO}_topk${TOP_K}_${SCORING_METHOD}_${GAM}_${MODE}_${COMP_METHOD}" \
                         --page_size "$PAGE_SIZE" \
                         --top_k "$TOP_K" \
                         --sink_size "$SINK_SIZE" \
@@ -56,7 +57,9 @@ for COMPRESS_RATIO in 0.03125 0.0625 0.125 0.25; do  # 4/128, 8/128, 16/128, 32/
                         --compress_ratio "$COMPRESS_RATIO" \
                         --scoring_method "$SCORING_METHOD" \
                         --group_agg_method "$GAM" \
-                        --unselected_mode "$MODE"
+                        --unselected_mode "$MODE" \
+                        --compression_method "$COMP_METHOD"
+                  done
                 done
             done
         done

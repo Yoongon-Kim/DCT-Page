@@ -8,7 +8,7 @@ set -e
 BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-8B}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-127500}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
-OUTPUT_DIR="${OUTPUT_DIR:-results/longbench_v1}"
+OUTPUT_DIR="${OUTPUT_DIR:-results_longbench_v1}"
 
 # Optional: specify tasks (space-separated), empty = all 16 English tasks
 # Example: TASKS="narrativeqa hotpotqa gov_report" ./run_longbench_v1.sh
@@ -16,7 +16,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-results/longbench_v1}"
 TASKS="${TASKS:-narrativeqa qasper gov_report 2wikimqa multifieldqa_en triviaqa}"
 
 # DCT Page Attention defaults
-PAGE_SIZE=128
+PAGE_SIZE=32
 SINK_SIZE=4
 RECENT_SIZE=128
 SCORING_METHOD="mean"
@@ -42,14 +42,15 @@ python eval_longbench_v1.py \
     $TASK_ARGS
 
 # ---- Step 2: Sweep compress_ratio x top_k x scoring_method x group_agg_method x mode ----
-for COMPRESS_RATIO in 0.03125 0.0625 0.125 0.25; do  # 4/128, 8/128, 16/128, 32/128
-    for TOP_K in 4 8 16 32; do
+for COMPRESS_RATIO in 0.125; do  # 4/128, 8/128, 16/128, 32/128
+    for TOP_K in 64; do
         for SCORING_METHOD in mean max; do
             for GAM in max mean; do
                 for MODE in drop compressed; do
+                  for COMP_METHOD in haar dct; do
                     echo ""
                     echo "===================================================================="
-                    echo "PAGE ATTENTION: cr=${COMPRESS_RATIO}, top_k=${TOP_K}, scoring_method=${SCORING_METHOD}, group_agg=${GAM}, mode=${MODE}"
+                    echo "PAGE ATTENTION: cr=${COMPRESS_RATIO}, top_k=${TOP_K}, scoring_method=${SCORING_METHOD}, group_agg=${GAM}, mode=${MODE}, comp=${COMP_METHOD}"
                     echo "===================================================================="
                     python eval_longbench_v1.py \
                         --mode page_attention \
@@ -57,7 +58,7 @@ for COMPRESS_RATIO in 0.03125 0.0625 0.125 0.25; do  # 4/128, 8/128, 16/128, 32/
                         --max_input_len "$MAX_INPUT_LEN" \
                         --num_samples "$NUM_SAMPLES" \
                         --output_dir "$OUTPUT_DIR" \
-                        --run_name "qwen3_page_attn_${COMPRESS_RATIO}_topk${TOP_K}_${SCORING_METHOD}_${GAM}_${MODE}" \
+                        --run_name "qwen3_page_attn_${COMPRESS_RATIO}_topk${TOP_K}_${SCORING_METHOD}_${GAM}_${MODE}_${COMP_METHOD}" \
                         --page_size "$PAGE_SIZE" \
                         --top_k "$TOP_K" \
                         --sink_size "$SINK_SIZE" \
@@ -66,7 +67,9 @@ for COMPRESS_RATIO in 0.03125 0.0625 0.125 0.25; do  # 4/128, 8/128, 16/128, 32/
                         --scoring_method "$SCORING_METHOD" \
                         --group_agg_method "$GAM" \
                         --unselected_mode "$MODE" \
+                        --compression_method "$COMP_METHOD" \
                         $TASK_ARGS
+                  done
                 done
             done
         done
