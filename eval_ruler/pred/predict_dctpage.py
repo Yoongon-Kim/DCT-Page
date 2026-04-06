@@ -51,8 +51,10 @@ def parse_args():
     parser.add_argument("--dct_group_agg_method", type=str, default="mean",
                         choices=["mean", "max", "topp"])
     parser.add_argument("--dct_unselected_mode", type=str, default="drop",
-                        choices=["drop", "compressed", "hybrid"])
-    parser.add_argument("--dct_no_continuous_rope", action="store_true")
+                        choices=["drop", "compressed"])
+    parser.add_argument("--dct_compression_method", type=str, default="haar", choices=["haar", "dct"])
+    parser.add_argument("--dct_continuous_rope", action="store_true",
+                        help="Temporarily disabled — raises error if used")
     parser.add_argument("--dct_no_triton", action="store_true")
 
     return parser.parse_args()
@@ -95,7 +97,8 @@ def main():
             scoring_method=args.dct_scoring_method,
             group_agg_method=args.dct_group_agg_method,
             unselected_mode=args.dct_unselected_mode,
-            continuous_rope=not args.dct_no_continuous_rope,
+            compression_method=args.dct_compression_method,
+            continuous_rope=args.dct_continuous_rope,
             use_triton=not args.dct_no_triton,
         )
     else:
@@ -109,7 +112,8 @@ def main():
             scoring_method=args.dct_scoring_method,
             group_agg_method=args.dct_group_agg_method,
             unselected_mode=args.dct_unselected_mode,
-            continuous_rope=not args.dct_no_continuous_rope,
+            compression_method=args.dct_compression_method,
+            continuous_rope=args.dct_continuous_rope,
             use_triton=not args.dct_no_triton,
         )
 

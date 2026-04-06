@@ -86,6 +86,7 @@ def apply_dct_patch(args, model=None):
         scoring_method=args.scoring_method,
         group_agg_method=args.group_agg_method,
         unselected_mode=args.unselected_mode,
+        compression_method=args.compression_method,
         continuous_rope=args.continuous_rope,
         use_triton=not getattr(args, 'no_triton', False),
     )
@@ -320,14 +321,14 @@ def parse_args():
     dct.add_argument("--group_agg_method", default="mean",
                      choices=["mean", "max", "meanmax", "top2mean", "topp"])
     dct.add_argument("--unselected_mode", default="drop",
-                     choices=["drop", "compressed", "hybrid"])
-    dct.add_argument("--no_continuous_rope", action="store_true",
-                     help="Disable continuous RoPE (enabled by default)")
+                     choices=["drop", "compressed"])
+    dct.add_argument("--compression_method", default="haar", choices=["haar", "dct"])
+    dct.add_argument("--continuous_rope", action="store_true",
+                     help="Temporarily disabled — raises error if used")
     dct.add_argument("--no_triton", action="store_true",
                      help="Disable Triton kernels (use pure PyTorch for comparison)")
 
     args = p.parse_args()
-    args.continuous_rope = not args.no_continuous_rope
     return args
 
 

@@ -42,7 +42,7 @@ ALL_TASKS = [
     "vt", "cwe", "fwe", "qa_1", "qa_2",
 ]
 
-DEFAULT_SEQ_LENGTHS = [4096, 8192, 16384, 32768, 65536, 131072]
+DEFAULT_SEQ_LENGTHS = [32768] #[4096, 8192, 16384, 32768, 65536, 131072]
 
 RULER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval_ruler")
 
@@ -60,14 +60,14 @@ def parse_args():
 
     # Model
     parser.add_argument("--base_model", type=str,
-                        default="meta-llama/Llama-3.1-8B-Instruct")
+                        default="Qwen/Qwen3-8B")
 
     # Data preparation
     parser.add_argument("--prepare", action="store_true",
                         help="Run data preparation before prediction (skips if data exists)")
-    parser.add_argument("--model_template_type", type=str, default="llama-3",
+    parser.add_argument("--model_template_type", type=str, default="qwen-3",
                         help="Template type for prepare.py (e.g. llama-3, qwen-3)")
-    parser.add_argument("--tokenizer_family", type=str, default="llama",
+    parser.add_argument("--tokenizer_family", type=str, default="qwen3",
                         choices=["llama", "qwen2", "qwen3"],
                         help="Tokenizer family name for data directory (models in same family share data)")
 
@@ -86,18 +86,23 @@ def parse_args():
     parser.add_argument("--top_k", type=int, default=8)
     parser.add_argument("--sink_size", type=int, default=4)
     parser.add_argument("--recent_size", type=int, default=128)
-    parser.add_argument("--compress_ratio", type=float, default=0.25)
+    parser.add_argument("--compress_ratio", type=float, default=0.125)
     parser.add_argument("--scoring_method", type=str, default="max",
                         choices=["mean", "max", "sum"])
     parser.add_argument("--group_agg_method", type=str, default="mean",
                         choices=["mean", "max", "topp"])
     parser.add_argument("--unselected_mode", type=str, default="drop",
-                        choices=["drop", "compressed", "hybrid"])
-    parser.add_argument("--no_continuous_rope", action="store_true")
+                        choices=["drop", "compressed"])
+    parser.add_argument("--compression_method", type=str, default="haar",
+                        choices=["haar", "dct"],
+                        help="Compression method for unselected pages (used when unselected_mode=compressed)")
+    parser.add_argument("--continuous_rope", action="store_true",
+                        help="Temporarily disabled — raises error if used")
     parser.add_argument("--no_triton", action="store_true")
+    parser.add_argument("--skip_existing", action="store_true",
+                        help="Skip run if summary.json already exists in output dir")
 
     args = parser.parse_args()
-    args.continuous_rope = not args.no_continuous_rope
 
     if args.run_name is None:
         if args.mode == "baseline":
@@ -109,6 +114,12 @@ def parse_args():
             args.run_name = "seer_attention"
         elif args.mode == "multipole_attention":
             args.run_name = "multipole_attention"
+
+    if args.skip_existing:
+        summary_path = Path(args.output_dir) / args.run_name / "summary.json"
+        if summary_path.exists():
+            print(f"SKIP (already exists): {summary_path}")
+            sys.exit(0)
 
     return args
 
@@ -201,6 +212,7 @@ def apply_monkey_patch(args):
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
+                compression_method=args.compression_method,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
             )
@@ -215,6 +227,7 @@ def apply_monkey_patch(args):
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
+                compression_method=args.compression_method,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
             )
@@ -229,6 +242,7 @@ def apply_monkey_patch(args):
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
+                compression_method=args.compression_method,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
             )

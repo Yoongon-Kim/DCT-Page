@@ -102,7 +102,7 @@ def parse_args() -> argparse.Namespace:
         "--dct_unselected_mode",
         type=str,
         default="drop",
-        choices=["drop", "compressed", "hybrid"],
+        choices=["drop", "compressed"],
     )
     parser.add_argument("--dct_score_use_direct_spectral_proxy", action="store_true")
     parser.add_argument(
@@ -119,7 +119,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dct_score_use_haar_mixed_proxy", action="store_true")
     parser.add_argument("--dct_score_use_hadamard_proxy", action="store_true")
-    parser.add_argument("--dct_no_continuous_rope", action="store_true")
+    parser.add_argument("--dct_compression_method", type=str, default="haar", choices=["haar", "dct"])
+    parser.add_argument("--dct_continuous_rope", action="store_true",
+                        help="Temporarily disabled — raises error if used")
     parser.add_argument("--dct_no_triton", action="store_true")
     parser.set_defaults(dct_score_use_haar_proxy=True)
     return parser.parse_args()
@@ -169,7 +171,8 @@ def apply_dct_patch(args: argparse.Namespace):
         scoring_method=args.dct_scoring_method,
         group_agg_method=args.dct_group_agg_method,
         unselected_mode=args.dct_unselected_mode,
-        continuous_rope=not args.dct_no_continuous_rope,
+        compression_method=args.dct_compression_method,
+        continuous_rope=args.dct_continuous_rope,
         score_use_direct_spectral_proxy=args.dct_score_use_direct_spectral_proxy,
         score_use_haar_proxy=args.dct_score_use_haar_proxy,
         score_use_haar_mixed_proxy=args.dct_score_use_haar_mixed_proxy,

@@ -79,8 +79,9 @@ def parse_args() -> argparse.Namespace:
         "--dct_unselected_mode",
         type=str,
         default="drop",
-        choices=["drop", "compressed", "hybrid"],
+        choices=["drop", "compressed"],
     )
+    p.add_argument("--dct_compression_method", type=str, default="haar", choices=["haar", "dct"])
     p.add_argument("--dct_score_use_direct_spectral_proxy", action="store_true")
     p.add_argument(
         "--dct_score_use_haar_proxy",
@@ -97,7 +98,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dct_score_use_haar_mixed_proxy", action="store_true")
     p.add_argument("--dct_score_use_hadamard_proxy", action="store_true")
     p.add_argument("--dct_select_with_oracle_page_scores", action="store_true")
-    p.add_argument("--dct_no_continuous_rope", action="store_true")
+    p.add_argument("--dct_continuous_rope", action="store_true",
+                   help="Temporarily disabled — raises error if used")
     p.add_argument("--dct_no_triton", action="store_true")
     p.set_defaults(dct_score_use_haar_proxy=True)
     return p.parse_args()
@@ -127,10 +129,9 @@ def resolve_tasks(value: str) -> list[str]:
     return requested
 
 
-def make_run_dir(output_root: Path, tag: str) -> Path:
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = output_root / f"{tag}_{timestamp}"
-    run_dir.mkdir(parents=True, exist_ok=False)
+def make_run_dir(output_root: Path, page_size: int, top_k: int, compress_ratio: float) -> Path:
+    run_dir = output_root / f"ps{page_size}_topk{top_k}_cr{compress_ratio}"
+    run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
 
@@ -189,9 +190,9 @@ def write_summary(run_dir: Path, manifest: dict, summary_rows: list[dict]) -> No
 def main() -> None:
     args = parse_args()
     tasks = resolve_tasks(args.tasks)
-    run_dir = args.run_dir if args.run_dir is not None else make_run_dir(args.output_root, args.tag)
+    run_dir = args.run_dir if args.run_dir is not None else make_run_dir(args.output_root, args.dct_page_size, args.dct_top_k, args.dct_compress_ratio)
     if args.run_dir is not None:
-        run_dir.mkdir(parents=True, exist_ok=False)
+        run_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = {
         "mode": args.mode,
@@ -212,7 +213,8 @@ def main() -> None:
             "scoring_method": args.dct_scoring_method,
             "group_agg_method": args.dct_group_agg_method,
             "unselected_mode": args.dct_unselected_mode,
-            "continuous_rope": not args.dct_no_continuous_rope,
+            "compression_method": args.dct_compression_method,
+            "continuous_rope": args.dct_continuous_rope,
             "score_use_direct_spectral_proxy": args.dct_score_use_direct_spectral_proxy,
             "score_use_haar_proxy": args.dct_score_use_haar_proxy,
             "score_use_haar_mixed_proxy": args.dct_score_use_haar_mixed_proxy,

@@ -25,34 +25,38 @@ SINK_SIZE=4
 RECENT_SIZE=128
 SCORING_METHOD="max"
 GROUP_AGG_METHOD="mean"
-MODE="hybrid"
-
-# ---- Sweep (page_size, top_k) x compress_ratio ----
-for PS_TK in "32,64" "64,32" "128,16" "32,32" "64,16" "128,8"; do
+# ---- Sweep (page_size, top_k) x compress_ratio x mode x compression_method ----
+for PS_TK in "32,64" "64,32" "32,32" "64,16"; do
     IFS=',' read -r PAGE_SIZE TOP_K <<< "$PS_TK"
-    for COMPRESS_RATIO in 0.03125 0.125; do  # 1/32 and 4/32
-        RUN_NAME="qwen3_haar_ps${PAGE_SIZE}_topk${TOP_K}_cr${COMPRESS_RATIO}_${MODE}"
+    for COMPRESS_RATIO in 0.125; do
+      for MODE in compressed drop; do
+        for COMP_METHOD in haar dct; do
+            RUN_NAME="${TOKENIZER_FAMILY}_ps${PAGE_SIZE}_topk${TOP_K}_cr${COMPRESS_RATIO}_${MODE}_${COMP_METHOD}"
 
-        echo ""
-        echo "===================================================================="
-        echo "PAGE ATTENTION: ps=${PAGE_SIZE}, top_k=${TOP_K}, cr=${COMPRESS_RATIO}"
-        echo "===================================================================="
-        python eval_ruler.py \
-            --mode page_attention \
-            --base_model "$BASE_MODEL" \
-            $PREPARE_FLAG --model_template_type "$MODEL_TEMPLATE" --tokenizer_family "$TOKENIZER_FAMILY" \
-            --seq_lengths $SEQ_LENGTHS \
-            --num_samples "$NUM_SAMPLES" \
-            --output_dir "$OUTPUT_DIR" \
-            --run_name "$RUN_NAME" \
-            --page_size "$PAGE_SIZE" \
-            --top_k "$TOP_K" \
-            --sink_size "$SINK_SIZE" \
-            --recent_size "$RECENT_SIZE" \
-            --compress_ratio "$COMPRESS_RATIO" \
-            --scoring_method "$SCORING_METHOD" \
-            --group_agg_method "$GROUP_AGG_METHOD" \
-            --unselected_mode "$MODE"
+            echo ""
+            echo "===================================================================="
+            echo "PAGE ATTENTION: ps=${PAGE_SIZE}, top_k=${TOP_K}, cr=${COMPRESS_RATIO}, mode=${MODE}, comp=${COMP_METHOD}"
+            echo "===================================================================="
+            python eval_ruler.py \
+                --mode page_attention \
+                --base_model "$BASE_MODEL" \
+                $PREPARE_FLAG --model_template_type "$MODEL_TEMPLATE" --tokenizer_family "$TOKENIZER_FAMILY" \
+                --seq_lengths $SEQ_LENGTHS \
+                --num_samples "$NUM_SAMPLES" \
+                --output_dir "$OUTPUT_DIR" \
+                --run_name "$RUN_NAME" \
+                --page_size "$PAGE_SIZE" \
+                --top_k "$TOP_K" \
+                --sink_size "$SINK_SIZE" \
+                --recent_size "$RECENT_SIZE" \
+                --compress_ratio "$COMPRESS_RATIO" \
+                --scoring_method "$SCORING_METHOD" \
+                --group_agg_method "$GROUP_AGG_METHOD" \
+                --compression_method "$COMP_METHOD" \
+                --skip_existing \
+                --unselected_mode "$MODE"
+        done
+      done
     done
 done
 

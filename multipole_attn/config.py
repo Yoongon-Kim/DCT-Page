@@ -13,19 +13,19 @@ Key parameters:
 
 MULTIPOLE_ATTN_CONFIG = {
     # Base model (HF Hub ID or local path)
-    "base_model": "Qwen/Qwen3-8B",
+    "base_model": "meta-llama/Llama-3.1-8B-Instruct",
 
     # Enable centroid-based sparse attention
     "use_centroids": True,
 
     # Percentage of keys to retain per hierarchy level (list, one per level)
-    "percent_clusters_lst": [3.125],
+    "percent_clusters_lst": [0.78125],
 
     # Importance threshold per level (token budget for centroid selection)
     "percentiles_lst": [2180],
 
     # Use centroid value approximation for non-selected tokens
-    "use_replacement": False,
+    "use_replacement": True,
 
     # Number of new tokens between re-clustering during generation
     "cluster_interval": 128,

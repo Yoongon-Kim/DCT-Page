@@ -404,7 +404,7 @@ def compute_effective_len(input_len, args):
 
     if args.unselected_mode == "drop":
         return args.sink_size + top_k * args.page_size + actual_recent
-    elif args.unselected_mode in {"compressed", "hybrid"}:
+    elif args.unselected_mode == "compressed":
         comp_size = max(1, int(args.page_size * args.compress_ratio))
         num_unselected = num_pages - top_k
         return args.sink_size + top_k * args.page_size + num_unselected * comp_size + actual_recent
@@ -453,14 +453,16 @@ def parse_args():
                         choices=["mean", "max", "topp"],
                         help="How to aggregate per-head scores within a GQA group")
     parser.add_argument("--unselected_mode", type=str, default="drop",
-                        choices=["drop", "compressed", "hybrid"])
-    parser.add_argument("--no_continuous_rope", action="store_true",
-                        help="Disable continuous RoPE (enabled by default)")
+                        choices=["drop", "compressed"])
+    parser.add_argument("--compression_method", type=str, default="haar",
+                        choices=["haar", "dct"],
+                        help="Compression method for unselected pages (used when unselected_mode=compressed)")
+    parser.add_argument("--continuous_rope", action="store_true",
+                        help="Temporarily disabled — raises error if used")
     parser.add_argument("--no_triton", action="store_true",
                         help="Disable Triton kernels (use pure PyTorch for comparison)")
 
     args = parser.parse_args()
-    args.continuous_rope = not args.no_continuous_rope
 
     if args.tasks is None:
         args.tasks = ENGLISH_TASKS
@@ -704,6 +706,7 @@ def main():
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
+                compression_method=args.compression_method,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
             )
@@ -718,6 +721,7 @@ def main():
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
+                compression_method=args.compression_method,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
             )
@@ -732,6 +736,7 @@ def main():
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
+                compression_method=args.compression_method,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
             )

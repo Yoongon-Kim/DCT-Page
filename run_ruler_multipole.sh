@@ -4,10 +4,10 @@
 set -e
 
 # ---- Configuration ----
-BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-8B}"
-MODEL_TEMPLATE="${MODEL_TEMPLATE:-qwen-3}"
-TOKENIZER_FAMILY="${TOKENIZER_FAMILY:-qwen3}"
-MODEL_FAMILY="${MODEL_FAMILY:-qwen3}"
+BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
+MODEL_TEMPLATE="${MODEL_TEMPLATE:-llama-3}"
+TOKENIZER_FAMILY="${TOKENIZER_FAMILY:-llama}"
+MODEL_FAMILY="${MODEL_FAMILY:-llama3}"
 NUM_SAMPLES="${NUM_SAMPLES:-25}"
 OUTPUT_DIR="${OUTPUT_DIR:-results_ruler/multipole_attention/${MODEL_FAMILY}}"
 
@@ -73,9 +73,9 @@ PYEOF
 }
 
 # ---- Sweep percent_clusters x percentiles x use_replacement ----
-for PCT_CLUSTERS in 3.125; do
+for PCT_CLUSTERS in 6.25 3.125 1.5625 0.78125; do
     for PERCENTILES in 1156 2180; do
-        for REPL in False; do
+        for REPL in False True; do
             RUN_NAME="${MODEL_FAMILY}_multipole_pct${PCT_CLUSTERS}_ptl${PERCENTILES}_repl${REPL}"
 
             echo ""
@@ -88,6 +88,7 @@ for PCT_CLUSTERS in 3.125; do
             python eval_ruler.py \
                 --mode multipole_attention \
                 --base_model "$BASE_MODEL" \
+                --skip_existing \
                 $PREPARE_FLAG --model_template_type "$MODEL_TEMPLATE" --tokenizer_family "$TOKENIZER_FAMILY" \
                 --seq_lengths $SEQ_LENGTHS \
                 --num_samples "$NUM_SAMPLES" \

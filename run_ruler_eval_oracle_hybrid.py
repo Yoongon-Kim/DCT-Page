@@ -19,19 +19,19 @@ from pathlib import Path
 
 
 TASKS = [
-    #"niah_single_1",
-    #"niah_single_2",
-    #"niah_single_3",
-    # "niah_multikey_1",
-    # "niah_multikey_2",
-    # "niah_multikey_3",
-    # "niah_multivalue",
-    # "niah_multiquery",
-    # "vt",
+    "niah_single_1",
+    "niah_single_2",
+    "niah_single_3",
+    "niah_multikey_1",
+    "niah_multikey_2",
+    "niah_multikey_3",
+    "niah_multivalue",
+    "niah_multiquery",
+    "vt",
     "cwe",
     "fwe",
-    # "qa_1",
-    # "qa_2",
+    "qa_1",
+    "qa_2",
 ]
 
 
@@ -68,9 +68,8 @@ def resolve_tasks(value: str) -> list[str]:
     return requested
 
 
-def make_run_root(output_root: Path, tag: str) -> Path:
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    run_root = output_root / f"{tag}_{timestamp}"
+def make_run_root(output_root: Path, page_size: int, top_k: int, compress_ratio: float) -> Path:
+    run_root = output_root / f"ps{page_size}_topk{top_k}_cr{compress_ratio}"
     run_root.mkdir(parents=True, exist_ok=True)
     return run_root
 
@@ -123,7 +122,7 @@ def build_run_cmd(
         "--dct_group_agg_method",
         "mean",
         "--dct_unselected_mode",
-        "hybrid",
+        "compressed",
         "--dct_select_with_oracle_page_scores",
     ]
     if local_files_only:
@@ -204,40 +203,39 @@ def main() -> None:
     page_sizes = parse_csv_ints(args.page_sizes)
     tasks = resolve_tasks(args.tasks)
 
-    run_root = make_run_root(args.output_root, args.tag)
-    manifest = {
-        "model_name_or_path": args.model_name_or_path,
-        "context_len": args.context_len,
-        "page_sizes": page_sizes,
-        "selected_token_budget": args.selected_token_budget,
-        "compress_ratio": args.compress_ratio,
-        "unselected_mode": "hybrid",
-        "select_with_oracle_page_scores": True,
-        "num_samples": args.num_samples,
-        "max_new_tokens": args.max_new_tokens,
-        "cuda_device": args.cuda_device,
-        "tasks": tasks,
-        "assumption": "Oracle page selection + hybrid mode: selected pages use full tokens, "
-        "unselected pages use Haar lowpass proxy KV cache.",
-    }
-    (run_root / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-    rows: list[dict] = []
-    command_lines: list[str] = ["#!/usr/bin/env bash", "set -euo pipefail", ""]
     for page_size in page_sizes:
         if args.selected_token_budget % page_size != 0:
             raise ValueError(
                 f"selected_token_budget={args.selected_token_budget} must be divisible by page_size={page_size}"
             )
         top_k = args.selected_token_budget // page_size
-        page_root = run_root / f"ps{page_size}_topk{top_k}"
+        run_root = make_run_root(args.output_root, page_size, top_k, args.compress_ratio)
+
+        manifest = {
+            "model_name_or_path": args.model_name_or_path,
+            "context_len": args.context_len,
+            "page_size": page_size,
+            "top_k": top_k,
+            "selected_token_budget": args.selected_token_budget,
+            "compress_ratio": args.compress_ratio,
+            "unselected_mode": "compressed",
+            "select_with_oracle_page_scores": True,
+            "num_samples": args.num_samples,
+            "max_new_tokens": args.max_new_tokens,
+            "cuda_device": args.cuda_device,
+            "tasks": tasks,
+            "assumption": "Oracle page selection + hybrid mode: selected pages use full tokens, "
+            "unselected pages use Haar lowpass proxy KV cache.",
+        }
+        (run_root / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
         cmd = build_run_cmd(
             repo_root=repo_root,
             model_name_or_path=args.model_name_or_path,
-            run_dir=page_root,
+            run_dir=run_root,
             context_len=args.context_len,
             tasks=tasks,
             page_size=page_size,
@@ -248,19 +246,19 @@ def main() -> None:
             cuda_device=args.cuda_device,
             local_files_only=args.local_files_only,
         )
-        command_lines.append(" ".join(shlex.quote(part) for part in cmd))
+        (run_root / "command.sh").write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\n\n"
+            + " ".join(shlex.quote(part) for part in cmd)
+            + "\n",
+            encoding="utf-8",
+        )
         if args.dry_run:
+            print(f"Dry run: {run_root}")
             continue
         subprocess.run(cmd, cwd=repo_root, check=True)
-        rows.extend(collect_page_summary(page_size, top_k, page_root))
-
-    (run_root / "commands.sh").write_text("\n".join(command_lines) + "\n", encoding="utf-8")
-    if args.dry_run:
-        print(f"Dry run manifest written to: {run_root}")
-        return
-
-    write_summary_files(run_root, rows)
-    print(f"Results written to: {run_root}")
+        rows = collect_page_summary(page_size, top_k, run_root)
+        write_summary_files(run_root, rows)
+        print(f"Results written to: {run_root}")
 
 
 if __name__ == "__main__":
