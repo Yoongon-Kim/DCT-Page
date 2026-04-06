@@ -8,7 +8,7 @@ set -e
 BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-8B}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-127500}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
-OUTPUT_DIR="${OUTPUT_DIR:-results_longbench_v1}"
+OUTPUT_DIR="${OUTPUT_DIR:-results_longbench_v1/page_attention}"
 
 # Optional: specify tasks (space-separated), empty = all 16 English tasks
 # Example: TASKS="narrativeqa hotpotqa gov_report" ./run_longbench_v1.sh
@@ -29,17 +29,17 @@ if [ -n "$TASKS" ]; then
 fi
 
 # ---- Step 1: Baseline (full attention, no monkey-patch) ----
-echo "============================================================"
-echo "BASELINE: Full attention (no monkey-patch)"
-echo "============================================================"
-python eval_longbench_v1.py \
-    --mode baseline \
-    --base_model "$BASE_MODEL" \
-    --max_input_len "$MAX_INPUT_LEN" \
-    --num_samples "$NUM_SAMPLES" \
-    --output_dir "$OUTPUT_DIR" \
-    --run_name qwen3_baseline \
-    $TASK_ARGS
+# echo "============================================================"
+# echo "BASELINE: Full attention (no monkey-patch)"
+# echo "============================================================"
+# python eval_longbench_v1.py \
+#     --mode baseline \
+#     --base_model "$BASE_MODEL" \
+#     --max_input_len "$MAX_INPUT_LEN" \
+#     --num_samples "$NUM_SAMPLES" \
+#     --output_dir "$OUTPUT_DIR" \
+#     --run_name qwen3_baseline \
+#     $TASK_ARGS
 
 # ---- Step 2: Sweep compress_ratio x top_k x scoring_method x group_agg_method x mode ----
 for COMPRESS_RATIO in 0.125; do  # 4/128, 8/128, 16/128, 32/128

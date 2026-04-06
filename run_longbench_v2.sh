@@ -8,7 +8,7 @@ BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-8B}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-127500}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
-OUTPUT_DIR="${OUTPUT_DIR:-results/longbench_v2}"
+OUTPUT_DIR="${OUTPUT_DIR:-results_longbench_v2/page_attention}"
 
 # DCT Page Attention defaults
 PAGE_SIZE=128

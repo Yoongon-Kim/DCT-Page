@@ -63,7 +63,7 @@ def parse_args():
                         help="Max samples to evaluate (-1 = all 503)")
 
     # Output
-    parser.add_argument("--output_dir", type=str, default="results/longbench_v2")
+    parser.add_argument("--output_dir", type=str, default="results_longbench_v2/page_attention")
     parser.add_argument("--run_name", type=str, default=None,
                         help="Name for this run (auto-generated if not given)")
 

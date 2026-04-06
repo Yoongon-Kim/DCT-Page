@@ -438,7 +438,7 @@ def parse_args():
                         help="Max samples per task (-1 = all)")
 
     # Output
-    parser.add_argument("--output_dir", type=str, default="results_longbench_v1")
+    parser.add_argument("--output_dir", type=str, default="results_longbench_v1/page_attention")
     parser.add_argument("--run_name", type=str, default=None)
 
     # DCT Page Attention params (only used when mode=page_attention)
@@ -820,7 +820,7 @@ def main():
 
         run_dir = os.path.join(args.output_dir, args.run_name)
         os.makedirs(run_dir, exist_ok=True)
-        _, summary_path, summary_csv_path = write_run_summary(
+        task_scores, summary_path, summary_csv_path = write_run_summary(
             run_dir, args.run_name, args.mode, args.base_model, all_task_results, args
         )
         print(f"  Partial summary updated: {summary_csv_path}")
