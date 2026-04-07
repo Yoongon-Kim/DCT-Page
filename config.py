@@ -14,6 +14,7 @@ class DCTPageConfig:
     group_agg_method: str = "mean" # "mean" | "max" | "topp" — aggregation of per-head scores within a GQA group
     unselected_mode: str = "drop"  # "drop" | "compressed"
     compression_method: str = "haar"  # "haar" | "dct" — compression method for unselected pages in compressed mode
+    compressed_token_rope: str = "mixed"  # "mixed" | "block_center" — RoPE handling for compressed tokens
     continuous_rope: bool = False      # Temporarily disabled. Store KV before RoPE, apply continuous RoPE after assembly.
     score_use_direct_spectral_proxy: bool = False  # Score with truncated DCT coefficients directly instead of IDCT-reconstructed proxies
     score_use_haar_proxy: bool = True  # Default score path: Haar lowpass block proxies instead of DCT IDCT proxies

@@ -25,17 +25,18 @@ SINK_SIZE=4
 RECENT_SIZE=128
 SCORING_METHOD="max"
 GROUP_AGG_METHOD="mean"
-# ---- Sweep (page_size, top_k) x compress_ratio x mode x compression_method ----
-for PS_TK in "32,128"; do
+# ---- Sweep (page_size, top_k) x compress_ratio x mode x compression_method x compressed_token_rope ----
+for PS_TK in "16,128"; do
     IFS=',' read -r PAGE_SIZE TOP_K <<< "$PS_TK"
     for COMPRESS_RATIO in 0.125; do
-      for MODE in compressed drop; do
-        for COMP_METHOD in haar dct; do
-            RUN_NAME="${TOKENIZER_FAMILY}_ps${PAGE_SIZE}_topk${TOP_K}_cr${COMPRESS_RATIO}_${MODE}_${COMP_METHOD}"
+      for MODE in compressed; do
+        for COMP_METHOD in haar; do
+          for COMP_TOKEN_ROPE in mixed block_center; do
+            RUN_NAME="${TOKENIZER_FAMILY}_ps${PAGE_SIZE}_topk${TOP_K}_cr${COMPRESS_RATIO}_${MODE}_${COMP_METHOD}_tokenrope${COMP_TOKEN_ROPE}"
 
             echo ""
             echo "===================================================================="
-            echo "PAGE ATTENTION: ps=${PAGE_SIZE}, top_k=${TOP_K}, cr=${COMPRESS_RATIO}, mode=${MODE}, comp=${COMP_METHOD}"
+            echo "PAGE ATTENTION: ps=${PAGE_SIZE}, top_k=${TOP_K}, cr=${COMPRESS_RATIO}, mode=${MODE}, comp=${COMP_METHOD}, token_rope=${COMP_TOKEN_ROPE}"
             echo "===================================================================="
             python eval_ruler.py \
                 --mode page_attention \
@@ -53,8 +54,10 @@ for PS_TK in "32,128"; do
                 --scoring_method "$SCORING_METHOD" \
                 --group_agg_method "$GROUP_AGG_METHOD" \
                 --compression_method "$COMP_METHOD" \
+                --compressed_token_rope "$COMP_TOKEN_ROPE" \
                 --skip_existing \
                 --unselected_mode "$MODE"
+          done
         done
       done
     done

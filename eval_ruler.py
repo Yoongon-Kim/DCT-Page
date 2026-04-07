@@ -82,8 +82,8 @@ def parse_args():
     parser.add_argument("--run_name", type=str, default=None)
 
     # DCT Page Attention params
-    parser.add_argument("--page_size", type=int, default=128)
-    parser.add_argument("--top_k", type=int, default=8)
+    parser.add_argument("--page_size", type=int, default=16)
+    parser.add_argument("--top_k", type=int, default=128)
     parser.add_argument("--sink_size", type=int, default=4)
     parser.add_argument("--recent_size", type=int, default=128)
     parser.add_argument("--compress_ratio", type=float, default=0.125)
@@ -96,6 +96,11 @@ def parse_args():
     parser.add_argument("--compression_method", type=str, default="haar",
                         choices=["haar", "dct"],
                         help="Compression method for unselected pages (used when unselected_mode=compressed)")
+    parser.add_argument("--compressed_token_rope", type=str, default="mixed",
+                        choices=["mixed", "block_center"],
+                        help="RoPE handling for compressed tokens. "
+                             "'mixed': compress post-RoPE keys directly. "
+                             "'block_center': invert RoPE, compress raw keys, re-rotate at block-center positions.")
     parser.add_argument("--continuous_rope", action="store_true",
                         help="Temporarily disabled — raises error if used")
     parser.add_argument("--no_triton", action="store_true")
@@ -213,6 +218,7 @@ def apply_monkey_patch(args):
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
                 compression_method=args.compression_method,
+                compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
             )
@@ -228,6 +234,7 @@ def apply_monkey_patch(args):
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
                 compression_method=args.compression_method,
+                compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
             )
@@ -243,6 +250,7 @@ def apply_monkey_patch(args):
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
                 compression_method=args.compression_method,
+                compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
             )

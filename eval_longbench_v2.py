@@ -89,6 +89,9 @@ def parse_args():
     parser.add_argument("--compression_method", type=str, default="haar",
                         choices=["haar", "dct"],
                         help="Compression method for unselected pages (used when unselected_mode=compressed)")
+    parser.add_argument("--compressed_token_rope", type=str, default="mixed",
+                        choices=["mixed", "block_center"],
+                        help="RoPE handling for compressed tokens")
     parser.add_argument("--continuous_rope", action="store_true",
                         help="Temporarily disabled — raises error if used")
     parser.add_argument("--no_triton", action="store_true",
@@ -450,6 +453,7 @@ def main():
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
                 compression_method=args.compression_method,
+                compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
             )
@@ -465,6 +469,7 @@ def main():
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
                 compression_method=args.compression_method,
+                compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
             )
@@ -480,6 +485,7 @@ def main():
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
                 compression_method=args.compression_method,
+                compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
             )

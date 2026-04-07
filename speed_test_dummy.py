@@ -87,6 +87,7 @@ def apply_dct_patch(args, model=None):
         group_agg_method=args.group_agg_method,
         unselected_mode=args.unselected_mode,
         compression_method=args.compression_method,
+        compressed_token_rope=args.compressed_token_rope,
         continuous_rope=args.continuous_rope,
         use_triton=not getattr(args, 'no_triton', False),
     )
@@ -323,6 +324,7 @@ def parse_args():
     dct.add_argument("--unselected_mode", default="drop",
                      choices=["drop", "compressed"])
     dct.add_argument("--compression_method", default="haar", choices=["haar", "dct"])
+    dct.add_argument("--compressed_token_rope", default="mixed", choices=["mixed", "block_center"])
     dct.add_argument("--continuous_rope", action="store_true",
                      help="Temporarily disabled — raises error if used")
     dct.add_argument("--no_triton", action="store_true",

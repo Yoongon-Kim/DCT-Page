@@ -53,6 +53,7 @@ def parse_args():
     parser.add_argument("--dct_unselected_mode", type=str, default="drop",
                         choices=["drop", "compressed"])
     parser.add_argument("--dct_compression_method", type=str, default="haar", choices=["haar", "dct"])
+    parser.add_argument("--dct_compressed_token_rope", type=str, default="mixed", choices=["mixed", "block_center"])
     parser.add_argument("--dct_continuous_rope", action="store_true",
                         help="Temporarily disabled — raises error if used")
     parser.add_argument("--dct_no_triton", action="store_true")
@@ -98,6 +99,7 @@ def main():
             group_agg_method=args.dct_group_agg_method,
             unselected_mode=args.dct_unselected_mode,
             compression_method=args.dct_compression_method,
+            compressed_token_rope=args.dct_compressed_token_rope,
             continuous_rope=args.dct_continuous_rope,
             use_triton=not args.dct_no_triton,
         )
@@ -113,6 +115,7 @@ def main():
             group_agg_method=args.dct_group_agg_method,
             unselected_mode=args.dct_unselected_mode,
             compression_method=args.dct_compression_method,
+            compressed_token_rope=args.dct_compressed_token_rope,
             continuous_rope=args.dct_continuous_rope,
             use_triton=not args.dct_no_triton,
         )

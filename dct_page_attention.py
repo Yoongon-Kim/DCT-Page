@@ -729,7 +729,12 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
       - "dct": DCT-IDCT projection (via _compress_pages)
       - "haar": Haar lowpass block means (via _project_pages_to_haar_lowpass)
 
-    No RoPE is pre-baked — RoPE is applied during assembly by the Triton kernel.
+    RoPE handling for compressed K (cfg.compressed_token_rope):
+      - "mixed":        compress post-RoPE keys directly (current behavior — mixed RoPE phases)
+      - "block_center": invert RoPE on raw page → compress → re-rotate at block-center positions
+                        (mirrors multipole's invert/cluster/wRoPE flow but with block-center positions)
+
+    Values are unaffected by RoPE — always compressed as-is.
     """
     bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
 
@@ -737,31 +742,76 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
     cached_v = getattr(attn_module, '_comp_v_cache', None)
     n_cached = getattr(attn_module, '_comp_n_pages_cached', 0)
     capacity = getattr(attn_module, '_comp_cache_capacity', 0)
+    cached_strategy = getattr(attn_module, '_comp_cache_strategy', None)
+    cur_strategy = (cfg.compression_method, cfg.compressed_token_rope)
 
-    # Invalidate cache when the sequence restarts or config changed
+    # Invalidate cache when the sequence restarts, shape changes, or RoPE/compression strategy changes
     if (cached_k is None
             or cached_v is None
             or num_pages < n_cached
             or cached_k.shape[0] != bsz
-            or cached_k.shape[3] != comp_size):
+            or cached_k.shape[3] != comp_size
+            or cached_strategy != cur_strategy):
         attn_module._comp_k_cache = None
         attn_module._comp_v_cache = None
         attn_module._comp_n_pages_cached = 0
         attn_module._comp_cache_capacity = 0
         n_cached = 0
         capacity = 0
+    attn_module._comp_cache_strategy = cur_strategy
 
     n_new = num_pages - n_cached
     if n_new > 0:
         new_k = paged_k[:, :, n_cached:num_pages]
         new_v = paged_v[:, :, n_cached:num_pages]
 
+        # Step A: optionally invert RoPE on new_k to recover raw (un-roped) keys.
+        # When continuous_rope=False (current default), the cache stores post-RoPE keys.
+        #
+        # The forward RoPE applies (alpha * R_theta) to k, where alpha = attention_scaling
+        # (alpha != 1 for YaRN and similar scaled RoPE types). To invert (alpha * R_theta * k)
+        # and recover k, we apply (1/alpha) * R_{-theta}, which means dividing the rotation
+        # matrix entries by alpha. Since `_compute_rope_cos_sin` already returns cos/sin
+        # pre-multiplied by alpha, we must divide the returned values by alpha**2 (one alpha
+        # to remove the forward scaling, another alpha to apply the 1/alpha inverse scaling).
+        if cfg.compressed_token_rope == "block_center":
+            start_pos = cfg.sink_size + n_cached * page_size
+            end_pos = cfg.sink_size + num_pages * page_size
+            positions = torch.arange(start_pos, end_pos, device=new_k.device)
+            cos, sin = _compute_rope_cos_sin(
+                positions, attn_module.config, new_k.device, new_k.dtype
+            )
+            _, attention_scaling = _get_rope_inv_freq_and_scaling(attn_module.config, new_k.device)
+            inv_factor = 1.0 / (attention_scaling * attention_scaling)
+            cos_inv = cos * inv_factor
+            sin_inv = sin * inv_factor
+            flat_k = new_k.reshape(bsz, num_kv_heads, n_new * page_size, head_dim)
+            flat_raw_k = _apply_rope(flat_k, cos_inv, -sin_inv)
+            new_k_for_compress = flat_raw_k.reshape(bsz, num_kv_heads, n_new, page_size, head_dim)
+        else:
+            # "mixed": compress post-RoPE keys directly (no inversion)
+            new_k_for_compress = new_k
+
+        # Step B: compress K and V with the configured method
         if cfg.compression_method == "haar":
-            new_comp_k = _project_pages_to_haar_lowpass(attn_module, new_k, comp_size)
+            new_comp_k = _project_pages_to_haar_lowpass(attn_module, new_k_for_compress, comp_size)
             new_comp_v = _project_pages_to_haar_lowpass(attn_module, new_v, comp_size)
         else:  # "dct"
-            new_comp_k = _compress_pages(attn_module, new_k, comp_size)
+            new_comp_k = _compress_pages(attn_module, new_k_for_compress, comp_size)
             new_comp_v = _compress_pages(attn_module, new_v, comp_size)
+
+        # Step C: re-apply RoPE to compressed K at block-center positions
+        if cfg.compressed_token_rope == "block_center":
+            new_positions = _block_center_positions(
+                n_cached, n_new, cfg.page_size, comp_size, cfg.sink_size, new_comp_k.device,
+            ).reshape(-1)
+            cos_new, sin_new = _compute_rope_cos_sin(
+                new_positions, attn_module.config, new_comp_k.device, new_comp_k.dtype
+            )
+            flat_comp_k = new_comp_k.reshape(bsz, num_kv_heads, n_new * comp_size, head_dim)
+            flat_comp_k = _apply_rope(flat_comp_k, cos_new, sin_new)
+            new_comp_k = flat_comp_k.reshape(bsz, num_kv_heads, n_new, comp_size, head_dim)
+        # else "mixed": leave new_comp_k as-is
 
         if num_pages > capacity:
             new_capacity = _next_page_capacity(num_pages, capacity)
@@ -1244,6 +1294,7 @@ def dct_page_attention_forward(
 
         # Pre-allocate or expand output buffers
         _buf_len = getattr(self, '_assemble_buf_len', 0)
+        _buf_grew = False
         if assembled_len > _buf_len:
             _max_len = assembled_len + cfg.page_size
             _nkv = _num_kv_heads
@@ -1255,10 +1306,14 @@ def dct_page_attention_forward(
                 bsz, _nkv, actual_top_k, dtype=torch.int32, device=paged_k.device
             )
             self._assemble_buf_len = _max_len
+            _buf_grew = True
 
-        # Build stride cache on first call; rebuild when strides change
+        # Build stride cache on first call; rebuild when strides change.
+        # Must also rebuild when _final_k_buf is reallocated, because the buffer's
+        # dim-0/dim-1 strides depend on max_len (which changes on reallocation).
         _cur_paged_strides = (paged_k.stride(0), paged_k.stride(1), paged_k.stride(2), paged_k.stride(3))
-        if (not hasattr(self, '_assemble_stride_cache')
+        if (_buf_grew
+                or not hasattr(self, '_assemble_stride_cache')
                 or self._assemble_stride_cache['paged_strides'] != _cur_paged_strides):
             self._assemble_stride_cache = build_assemble_stride_cache(
                 paged_k, comp_k, sink_k, recent_k, selected_indices,
@@ -1307,6 +1362,7 @@ def replace_qwen2_attn(
     group_agg_method="mean",
     unselected_mode="drop",
     compression_method="haar",
+    compressed_token_rope="mixed",
     continuous_rope=False,
     score_use_direct_spectral_proxy=False,
     score_use_haar_proxy=True,
@@ -1333,6 +1389,7 @@ def replace_qwen2_attn(
         group_agg_method=group_agg_method,
         unselected_mode=unselected_mode,
         compression_method=compression_method,
+        compressed_token_rope=compressed_token_rope,
         continuous_rope=continuous_rope,
         score_use_direct_spectral_proxy=score_use_direct_spectral_proxy,
         score_use_haar_proxy=score_use_haar_proxy,
@@ -1349,7 +1406,7 @@ def replace_qwen2_attn(
     print(f"  compress_ratio={compress_ratio} ({page_size} -> {comp_size} tokens)")
     print(f"  proxy_frequency_layout={proxy_frequency_layout}")
     print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}")
-    print(f"  unselected_mode={unselected_mode}, compression_method={compression_method}")
+    print(f"  unselected_mode={unselected_mode}, compression_method={compression_method}, compressed_token_rope={compressed_token_rope}")
     print(
         f"  continuous_rope={continuous_rope}, "
         f"score_use_direct_spectral_proxy={score_use_direct_spectral_proxy}, "
@@ -1376,6 +1433,7 @@ def replace_qwen3_attn(
     group_agg_method="mean",
     unselected_mode="drop",
     compression_method="haar",
+    compressed_token_rope="mixed",
     continuous_rope=False,
     score_use_direct_spectral_proxy=False,
     score_use_haar_proxy=True,
@@ -1404,6 +1462,7 @@ def replace_qwen3_attn(
         group_agg_method=group_agg_method,
         unselected_mode=unselected_mode,
         compression_method=compression_method,
+        compressed_token_rope=compressed_token_rope,
         continuous_rope=continuous_rope,
         score_use_direct_spectral_proxy=score_use_direct_spectral_proxy,
         score_use_haar_proxy=score_use_haar_proxy,
@@ -1420,7 +1479,7 @@ def replace_qwen3_attn(
     print(f"  compress_ratio={compress_ratio} ({page_size} -> {comp_size} tokens)")
     print(f"  proxy_frequency_layout={proxy_frequency_layout}")
     print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}")
-    print(f"  unselected_mode={unselected_mode}, compression_method={compression_method}")
+    print(f"  unselected_mode={unselected_mode}, compression_method={compression_method}, compressed_token_rope={compressed_token_rope}")
     print(
         f"  continuous_rope={continuous_rope}, "
         f"score_use_direct_spectral_proxy={score_use_direct_spectral_proxy}, "
@@ -1447,6 +1506,7 @@ def replace_llama_attn(
     group_agg_method="mean",
     unselected_mode="drop",
     compression_method="haar",
+    compressed_token_rope="mixed",
     continuous_rope=False,
     score_use_direct_spectral_proxy=False,
     score_use_haar_proxy=True,
@@ -1475,6 +1535,7 @@ def replace_llama_attn(
         group_agg_method=group_agg_method,
         unselected_mode=unselected_mode,
         compression_method=compression_method,
+        compressed_token_rope=compressed_token_rope,
         continuous_rope=continuous_rope,
         score_use_direct_spectral_proxy=score_use_direct_spectral_proxy,
         score_use_haar_proxy=score_use_haar_proxy,
@@ -1491,7 +1552,7 @@ def replace_llama_attn(
     print(f"  compress_ratio={compress_ratio} ({page_size} -> {comp_size} tokens)")
     print(f"  proxy_frequency_layout={proxy_frequency_layout}")
     print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}")
-    print(f"  unselected_mode={unselected_mode}, compression_method={compression_method}")
+    print(f"  unselected_mode={unselected_mode}, compression_method={compression_method}, compressed_token_rope={compressed_token_rope}")
     print(
         f"  continuous_rope={continuous_rope}, "
         f"score_use_direct_spectral_proxy={score_use_direct_spectral_proxy}, "

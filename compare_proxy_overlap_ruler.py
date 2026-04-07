@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-Compare Haar vs DCT proxy page selection against oracle on RULER benchmark.
+Compare proxy page selection against oracle on RULER benchmark.
 
-For each sample, runs inference twice (Haar proxy, DCT proxy) with the debug
-hook enabled.  Both runs capture proxy scores and oracle scores at the first
-decode step of the last layer.  Computes three overlap comparisons:
-  - Haar-vs-Oracle
-  - DCT-vs-Oracle
-  - Haar-vs-DCT
+For each sample, runs inference for 4 variants of (compression_method, compressed_token_rope):
+  - (haar, mixed)
+  - (haar, block_center)
+  - (dct,  mixed)
+  - (dct,  block_center)
+
+The debug hook captures proxy scores and oracle scores at the first decode step of the
+last layer for each variant. We then compute proxy-vs-oracle overlap for each variant,
+plus pairwise cross-overlap between variants.
 
 Usage:
     # Quick smoke test
@@ -76,8 +79,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_samples", type=int, default=25)
 
     # DCT page config
-    p.add_argument("--page_size", type=int, default=32)
-    p.add_argument("--top_k", type=int, default=64)
+    p.add_argument("--page_size", type=int, default=16)
+    p.add_argument("--top_k", type=int, default=128)
     p.add_argument("--sink_size", type=int, default=4)
     p.add_argument("--recent_size", type=int, default=128)
     p.add_argument("--compress_ratio", type=float, default=0.125)
@@ -269,7 +272,7 @@ def main() -> None:
 
     # Output directory
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = args.output_dir / f"ps{args.page_size}_topk_{args.top_k}"
+    run_dir = args.output_dir / f"ps{args.page_size}_topk_{args.top_k}cr_{args.compress_ratio}"
     run_dir.mkdir(parents=True, exist_ok=True)
     per_sample_dir = run_dir / "per_sample"
     per_sample_dir.mkdir(exist_ok=True)
@@ -320,12 +323,20 @@ def main() -> None:
             metric_fn = task_config["metric_fn"]
             tokens_to_generate = task_config["tokens_to_generate"]
 
-            # Per-sample collection
-            haar_oracle_summaries = []
-            dct_oracle_summaries = []
-            cross_summaries = []
-            haar_gen_rows = []
-            dct_gen_rows = []
+            # 4 variants to compare per sample
+            VARIANTS = [
+                ("haar", "mixed"),
+                ("haar", "block_center"),
+                ("dct",  "mixed"),
+                ("dct",  "block_center"),
+            ]
+
+            def variant_name(comp_method: str, token_rope: str) -> str:
+                return f"{comp_method}_{token_rope}"
+
+            # Per-sample collection (one entry per variant)
+            oracle_summaries: dict[str, list] = {variant_name(c, t): [] for c, t in VARIANTS}
+            gen_rows: dict[str, list] = {variant_name(c, t): [] for c, t in VARIANTS}
 
             sample_fp = (per_sample_dir / f"{task}.jsonl").open(
                 "w", encoding="utf-8", buffering=1
@@ -334,58 +345,67 @@ def main() -> None:
             for sample_idx, sample in enumerate(
                 tqdm(samples, desc=f"  {task}"), start=1
             ):
-                # --- Haar run ---
-                _dct_page_cfg.compression_method = "haar"
-                haar_gen, haar_traces = generate_with_first_step_traces(
-                    model, tokenizer, sample, tokens_to_generate,
-                )
-                haar_gen_rows.append(haar_gen)
+                variant_traces: dict[str, dict] = {}
+                missing = False
 
-                # --- DCT run ---
-                _dct_page_cfg.compression_method = "dct"
-                dct_gen, dct_traces = generate_with_first_step_traces(
-                    model, tokenizer, sample, tokens_to_generate,
-                )
-                dct_gen_rows.append(dct_gen)
+                for comp_method, token_rope in VARIANTS:
+                    name = variant_name(comp_method, token_rope)
+                    _dct_page_cfg.compression_method = comp_method
+                    _dct_page_cfg.compressed_token_rope = token_rope
+                    gen_row, traces = generate_with_first_step_traces(
+                        model, tokenizer, sample, tokens_to_generate,
+                    )
+                    gen_rows[name].append(gen_row)
+                    if not traces:
+                        missing = True
+                        break
+                    variant_traces[name] = max(traces, key=lambda t: t["layer_idx"])
 
-                if not haar_traces or not dct_traces:
+                if missing:
                     print(f"  WARNING: no traces for sample {sample['index']}, skipping")
                     continue
 
-                # Last-layer traces
-                haar_last = max(haar_traces, key=lambda t: t["layer_idx"])
-                dct_last = max(dct_traces, key=lambda t: t["layer_idx"])
+                # Proxy-vs-oracle overlap per variant
+                variant_oracle_summary: dict[str, dict] = {}
+                for name, last_trace in variant_traces.items():
+                    s = summarize_last_layer(last_trace)
+                    oracle_summaries[name].append(s)
+                    variant_oracle_summary[name] = s
 
-                # Proxy-vs-oracle overlap
-                haar_summary = summarize_last_layer(haar_last)
-                dct_summary = summarize_last_layer(dct_last)
-                haar_oracle_summaries.append(haar_summary)
-                dct_oracle_summaries.append(dct_summary)
-
-                # Haar-vs-DCT direct overlap
-                cross = compute_cross_overlap(haar_last, dct_last)
-                cross_summaries.append(cross)
+                # Pairwise cross-overlap between variants
+                variant_names = list(variant_traces.keys())
+                cross_overlaps: dict[str, dict] = {}
+                for i in range(len(variant_names)):
+                    for j in range(i + 1, len(variant_names)):
+                        a = variant_names[i]
+                        b = variant_names[j]
+                        cross_overlaps[f"{a}__vs__{b}"] = compute_cross_overlap(
+                            variant_traces[a], variant_traces[b]
+                        )
 
                 # Write per-sample detail (without bulky head_rows)
                 sample_record = {
                     "sample_index": sample["index"],
-                    "haar_vs_oracle": {
-                        "mean_overlap_rate": haar_summary["mean_overlap_rate"],
-                        "median_overlap_rate": haar_summary["median_overlap_rate"],
-                        "exact_set_match_heads": haar_summary["heads_with_exact_set_match"],
+                    "vs_oracle": {
+                        name: {
+                            "mean_overlap_rate": s["mean_overlap_rate"],
+                            "median_overlap_rate": s["median_overlap_rate"],
+                            "exact_set_match_heads": s["heads_with_exact_set_match"],
+                        }
+                        for name, s in variant_oracle_summary.items()
                     },
-                    "dct_vs_oracle": {
-                        "mean_overlap_rate": dct_summary["mean_overlap_rate"],
-                        "median_overlap_rate": dct_summary["median_overlap_rate"],
-                        "exact_set_match_heads": dct_summary["heads_with_exact_set_match"],
+                    "cross_overlap": {
+                        key: {
+                            "mean_overlap_rate": c["mean_overlap_rate"],
+                            "median_overlap_rate": c["median_overlap_rate"],
+                            "exact_set_match_heads": c["heads_with_exact_set_match"],
+                        }
+                        for key, c in cross_overlaps.items()
                     },
-                    "haar_vs_dct": {
-                        "mean_overlap_rate": cross["mean_overlap_rate"],
-                        "median_overlap_rate": cross["median_overlap_rate"],
-                        "exact_set_match_heads": cross["heads_with_exact_set_match"],
+                    "preds": {
+                        name: gen_rows[name][-1]["text"]
+                        for name in variant_names
                     },
-                    "haar_pred": haar_gen["text"],
-                    "dct_pred": dct_gen["text"],
                     "gold": sample["outputs"],
                 }
                 sample_fp.write(
@@ -393,55 +413,56 @@ def main() -> None:
                 )
 
                 if sample_idx % 5 == 0 or sample_idx == len(samples):
-                    print(
-                        f"  [{sample_idx}/{len(samples)}] "
-                        f"haar-oracle={haar_summary['mean_overlap_rate']:.3f} "
-                        f"dct-oracle={dct_summary['mean_overlap_rate']:.3f} "
-                        f"haar-dct={cross['mean_overlap_rate']:.3f}"
+                    summary_str = " ".join(
+                        f"{name}={variant_oracle_summary[name]['mean_overlap_rate']:.3f}"
+                        for name in variant_names
                     )
+                    print(f"  [{sample_idx}/{len(samples)}] {summary_str}")
 
             sample_fp.close()
 
-            # Task accuracy
-            haar_score = score_predictions(metric_fn, haar_gen_rows) if haar_gen_rows else 0.0
-            dct_score = score_predictions(metric_fn, dct_gen_rows) if dct_gen_rows else 0.0
+            # Task accuracy per variant
+            task_accuracy = {
+                name: round(score_predictions(metric_fn, gen_rows[name]), 2)
+                if gen_rows[name] else 0.0
+                for name in oracle_summaries
+            }
 
             task_result = {
-                "num_samples": len(haar_oracle_summaries),
-                "haar_vs_oracle": aggregate_summaries(haar_oracle_summaries),
-                "dct_vs_oracle": aggregate_summaries(dct_oracle_summaries),
-                "haar_vs_dct": aggregate_cross_summaries(cross_summaries),
-                "task_accuracy": {"haar": round(haar_score, 2), "dct": round(dct_score, 2)},
+                "num_samples": len(next(iter(oracle_summaries.values()))),
+                "vs_oracle": {
+                    name: aggregate_summaries(summaries)
+                    for name, summaries in oracle_summaries.items()
+                },
+                "task_accuracy": task_accuracy,
             }
             per_task_results[task] = task_result
 
-            print(f"  Task accuracy: haar={haar_score:.2f}, dct={dct_score:.2f}")
+            print(f"  Task accuracy: " + ", ".join(f"{n}={s:.2f}" for n, s in task_accuracy.items()))
             print(
-                f"  Overlap (avg): "
-                f"haar-oracle={task_result['haar_vs_oracle'].get('mean_overlap_rate', 0):.3f} "
-                f"dct-oracle={task_result['dct_vs_oracle'].get('mean_overlap_rate', 0):.3f} "
-                f"haar-dct={task_result['haar_vs_dct'].get('mean_overlap_rate', 0):.3f}"
+                "  Overlap (avg): "
+                + " ".join(
+                    f"{name}={task_result['vs_oracle'][name].get('mean_overlap_rate', 0):.3f}"
+                    for name in task_result['vs_oracle']
+                )
             )
 
-        # Overall summary
-        all_haar = [r["haar_vs_oracle"]["mean_overlap_rate"]
-                     for r in per_task_results.values() if r["haar_vs_oracle"]]
-        all_dct = [r["dct_vs_oracle"]["mean_overlap_rate"]
-                    for r in per_task_results.values() if r["dct_vs_oracle"]]
-        all_cross = [r["haar_vs_dct"]["mean_overlap_rate"]
-                      for r in per_task_results.values() if r["haar_vs_dct"]]
-        all_haar_acc = [r["task_accuracy"]["haar"]
-                         for r in per_task_results.values()]
-        all_dct_acc = [r["task_accuracy"]["dct"]
-                        for r in per_task_results.values()]
-
-        overall = {
-            "haar_vs_oracle_mean_overlap": sum(all_haar) / len(all_haar) if all_haar else 0,
-            "dct_vs_oracle_mean_overlap": sum(all_dct) / len(all_dct) if all_dct else 0,
-            "haar_vs_dct_mean_overlap": sum(all_cross) / len(all_cross) if all_cross else 0,
-            "haar_accuracy_avg": sum(all_haar_acc) / len(all_haar_acc) if all_haar_acc else 0,
-            "dct_accuracy_avg": sum(all_dct_acc) / len(all_dct_acc) if all_dct_acc else 0,
-        }
+        # Overall summary across tasks (per variant)
+        variant_names = ["haar_mixed", "haar_block_center", "dct_mixed", "dct_block_center"]
+        overall = {}
+        for name in variant_names:
+            overlap_vals = [r["vs_oracle"][name]["mean_overlap_rate"]
+                             for r in per_task_results.values()
+                             if name in r["vs_oracle"] and r["vs_oracle"][name]]
+            acc_vals = [r["task_accuracy"][name]
+                         for r in per_task_results.values()
+                         if name in r["task_accuracy"]]
+            overall[f"{name}_vs_oracle_mean_overlap"] = (
+                sum(overlap_vals) / len(overlap_vals) if overlap_vals else 0
+            )
+            overall[f"{name}_accuracy_avg"] = (
+                sum(acc_vals) / len(acc_vals) if acc_vals else 0
+            )
 
         summary = {
             "overall": overall,
@@ -469,11 +490,9 @@ def main() -> None:
         print(f"\n{'=' * 60}")
         print("OVERALL RESULTS")
         print("=" * 60)
-        print(f"  Haar-vs-Oracle mean overlap: {overall['haar_vs_oracle_mean_overlap']:.3f}")
-        print(f"  DCT-vs-Oracle  mean overlap: {overall['dct_vs_oracle_mean_overlap']:.3f}")
-        print(f"  Haar-vs-DCT    mean overlap: {overall['haar_vs_dct_mean_overlap']:.3f}")
-        print(f"  Haar accuracy avg: {overall['haar_accuracy_avg']:.2f}")
-        print(f"  DCT  accuracy avg: {overall['dct_accuracy_avg']:.2f}")
+        for name in variant_names:
+            print(f"  {name:24s}  vs-oracle={overall[f'{name}_vs_oracle_mean_overlap']:.3f}  "
+                  f"accuracy={overall[f'{name}_accuracy_avg']:.2f}")
         print(f"\n  Results saved to: {run_dir}")
         print(f"  Total time: {elapsed:.1f} minutes")
 

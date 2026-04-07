@@ -125,6 +125,7 @@ def parse_args() -> argparse.Namespace:
         choices=["drop", "compressed"],
     )
     parser.add_argument("--dct_compression_method", type=str, default="haar", choices=["haar", "dct"])
+    parser.add_argument("--dct_compressed_token_rope", type=str, default="mixed", choices=["mixed", "block_center"])
     parser.add_argument("--dct_score_use_direct_spectral_proxy", action="store_true")
     parser.add_argument(
         "--dct_score_use_haar_proxy",
