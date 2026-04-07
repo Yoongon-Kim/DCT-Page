@@ -9,7 +9,7 @@ BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-8B}"
 MODEL_TEMPLATE="${MODEL_TEMPLATE:-qwen-3}"
 TOKENIZER_FAMILY="${TOKENIZER_FAMILY:-qwen3}"
 NUM_SAMPLES="${NUM_SAMPLES:-25}"
-OUTPUT_DIR="${OUTPUT_DIR:-results_ruler/haar_page_attention}"
+OUTPUT_DIR="${OUTPUT_DIR:-results_ruler/page_attention}"
 
 # Sequence lengths to evaluate
 SEQ_LENGTHS="${SEQ_LENGTHS:-32768}" #"${SEQ_LENGTHS:-4096 8192 16384 32768 65536 131072}"
@@ -26,7 +26,7 @@ RECENT_SIZE=128
 SCORING_METHOD="max"
 GROUP_AGG_METHOD="mean"
 # ---- Sweep (page_size, top_k) x compress_ratio x mode x compression_method ----
-for PS_TK in "32,64"; do
+for PS_TK in "32,128"; do
     IFS=',' read -r PAGE_SIZE TOP_K <<< "$PS_TK"
     for COMPRESS_RATIO in 0.125; do
       for MODE in compressed drop; do
