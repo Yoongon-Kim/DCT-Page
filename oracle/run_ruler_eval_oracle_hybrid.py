@@ -75,7 +75,7 @@ def make_run_root(output_root: Path, page_size: int, top_k: int, compress_ratio:
 
 
 def build_run_cmd(
-    repo_root: Path,
+    script_path: Path,
     model_name_or_path: str,
     run_dir: Path,
     context_len: int,
@@ -90,7 +90,7 @@ def build_run_cmd(
 ) -> list[str]:
     cmd = [
         sys.executable,
-        str(repo_root / "run_ruler_eval.py"),
+        str(script_path),
         "--mode",
         "page_attention",
         "--run_dir",
@@ -199,7 +199,11 @@ def write_summary_files(run_root: Path, rows: list[dict]) -> None:
 
 def main() -> None:
     args = parse_args()
-    repo_root = Path(__file__).resolve().parent
+    # Sibling script lives next to us in oracle/, but the child run_ruler_eval.py
+    # expects to be invoked with cwd at the project root so its relative data
+    # paths resolve correctly.
+    script_path = Path(__file__).resolve().parent / "run_ruler_eval.py"
+    repo_root = Path(__file__).resolve().parent.parent
     page_sizes = parse_csv_ints(args.page_sizes)
     tasks = resolve_tasks(args.tasks)
 
@@ -233,7 +237,7 @@ def main() -> None:
         )
 
         cmd = build_run_cmd(
-            repo_root=repo_root,
+            script_path=script_path,
             model_name_or_path=args.model_name_or_path,
             run_dir=run_root,
             context_len=args.context_len,

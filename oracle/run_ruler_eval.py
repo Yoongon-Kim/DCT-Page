@@ -7,21 +7,161 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
+import importlib
 import json
 import shlex
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
-from compare_baseline_dct import (
-    RunLogger,
-    apply_dct_patch,
-    cleanup_model,
-    generate_one,
-    load_metric_fn,
-    load_model,
-    load_samples,
-)
+# Bootstrap sys.path so this script runs from any cwd. The project root holds
+# `dct_page_attention.py`, which `apply_dct_patch` imports lazily below.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+import torch
+import yaml
+from transformers import AutoModelForCausalLM
+
+
+# ---------------------------------------------------------------------------
+# Helpers (originally lived in the deleted compare_baseline_dct.py)
+# ---------------------------------------------------------------------------
+class RunLogger:
+    def __init__(self, log_path: Path):
+        self._fp = log_path.open("a", encoding="utf-8", buffering=1)
+
+    def log(self, message: str) -> None:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{timestamp}] {message}"
+        print(line, flush=True)
+        self._fp.write(line + "\n")
+        self._fp.flush()
+
+    def close(self) -> None:
+        self._fp.close()
+
+
+def load_samples(path: Path, num_samples: int) -> list[dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as fp:
+        rows = [json.loads(line) for line in fp if line.strip()]
+    return rows[:num_samples]
+
+
+def load_metric_fn(benchmark: str, task_name: str):
+    eval_root = _REPO_ROOT / "benchmark" / "eval_ruler" / "eval"
+    if str(eval_root) not in sys.path:
+        sys.path.insert(0, str(eval_root))
+    module = importlib.import_module(f"{benchmark}.constants")
+    tasks_base = module.TASKS
+    with (eval_root.parent / f"{benchmark}.yaml").open("r", encoding="utf-8") as fp:
+        tasks_customized = yaml.safe_load(fp)
+    task_config = tasks_customized[task_name]
+    task_config.update(tasks_base[task_config["task"]])
+    return task_config["metric_fn"], task_config
+
+
+def cleanup_model(model=None) -> None:
+    if model is not None:
+        del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+def load_model(args: argparse.Namespace):
+    yarn_kwargs = {}
+    if "qwen3" in args.model_name_or_path.lower():
+        yarn_kwargs = {
+            "rope_parameters": {
+                "rope_type": "yarn",
+                "rope_theta": 1000000.0,
+                "factor": 4.0,
+                "original_max_position_embeddings": 32768,
+            },
+            "max_position_embeddings": 131072,
+        }
+    return AutoModelForCausalLM.from_pretrained(
+        args.model_name_or_path,
+        torch_dtype=torch.bfloat16,
+        device_map={"": args.cuda_device},
+        attn_implementation="sdpa",
+        local_files_only=args.local_files_only,
+        **yarn_kwargs,
+    ).eval()
+
+
+def generate_one(
+    model,
+    tokenizer,
+    sample: dict[str, Any],
+    max_new_tokens: int,
+) -> dict[str, Any]:
+    device = next(model.parameters()).device
+    encoded = tokenizer(sample["input"], return_tensors="pt")
+    input_ids = encoded.input_ids.to(device)
+    attention_mask = encoded.attention_mask.to(device)
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+
+    generated_ids = output_ids[0, input_ids.shape[1] :].cpu()
+    return {
+        "index": sample["index"],
+        "input_len": int(input_ids.shape[1]),
+        "gen_ids": generated_ids.tolist(),
+        "text": tokenizer.decode(generated_ids, skip_special_tokens=True),
+        "gold": sample["outputs"],
+    }
+
+
+def apply_dct_patch(args: argparse.Namespace) -> None:
+    model_name = args.model_name_or_path.lower()
+    common_kwargs = dict(
+        page_size=args.dct_page_size,
+        top_k=args.dct_top_k,
+        sink_size=args.dct_sink_size,
+        recent_size=args.dct_recent_size,
+        compress_ratio=args.dct_compress_ratio,
+        proxy_frequency_layout=args.dct_proxy_frequency_layout,
+        scoring_method=args.dct_scoring_method,
+        group_agg_method=args.dct_group_agg_method,
+        unselected_mode=args.dct_unselected_mode,
+        compression_method=args.dct_compression_method,
+        compressed_token_rope=args.dct_compressed_token_rope,
+        continuous_rope=args.dct_continuous_rope,
+        score_use_direct_spectral_proxy=args.dct_score_use_direct_spectral_proxy,
+        score_use_haar_proxy=args.dct_score_use_haar_proxy,
+        score_use_haar_mixed_proxy=args.dct_score_use_haar_mixed_proxy,
+        score_use_hadamard_proxy=args.dct_score_use_hadamard_proxy,
+        select_with_oracle_page_scores=args.dct_select_with_oracle_page_scores,
+        use_triton=not args.dct_no_triton,
+    )
+    if "llama" in model_name:
+        from dct_page_attention import replace_llama_attn
+
+        replace_llama_attn(**common_kwargs)
+    elif "qwen3" in model_name:
+        from dct_page_attention import replace_qwen3_attn
+
+        replace_qwen3_attn(**common_kwargs)
+    elif "qwen" in model_name:
+        from dct_page_attention import replace_qwen2_attn
+
+        replace_qwen2_attn(**common_kwargs)
+    else:
+        raise ValueError(f"Unsupported model for DCT patch: {args.model_name_or_path}")
 
 
 TASKS = [

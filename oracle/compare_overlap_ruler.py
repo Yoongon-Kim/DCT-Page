@@ -34,20 +34,136 @@ import time
 from pathlib import Path
 from typing import Any
 
+# Bootstrap sys.path so this script runs from any cwd. The project root holds
+# `dct_page_attention.py`, which `apply_monkey_patch` imports lazily.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 import torch
 import yaml
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # ---------------------------------------------------------------------------
-# Reuse from existing analysis scripts
+# Helpers (originally lived in the deleted analyze_selection_oracle_overlap.py)
 # ---------------------------------------------------------------------------
-from analyze_selection_oracle_overlap import (
-    FirstStepRecorder,
-    generate_with_first_step_traces,
-    oracle_topk_from_scores,
-    summarize_last_layer,
-)
+class FirstStepRecorder:
+    def __init__(self):
+        self.records: list[dict[str, Any]] = []
+        self._step_by_layer: dict[int, int] = {}
+
+    def __call__(self, payload: dict[str, Any]) -> None:
+        layer_idx = int(payload["layer_idx"])
+        decode_step = self._step_by_layer.get(layer_idx, 0)
+        self._step_by_layer[layer_idx] = decode_step + 1
+        if decode_step != 0:
+            return
+
+        self.records.append(
+            {
+                "layer_idx": layer_idx,
+                "decode_step": decode_step,
+                "kv_len": int(payload["kv_len"]),
+                "num_pages": int(payload["num_pages"]),
+                "actual_top_k": int(payload["actual_top_k"]),
+                "page_size": int(payload["page_size"]),
+                "sink_size": int(payload["sink_size"]),
+                "recent_size": int(payload["recent_size"]),
+                "page_scores": payload["page_scores"].tolist(),
+                "oracle_page_scores": payload["oracle_page_scores"].tolist(),
+                "selected_indices": payload["selected_indices"].tolist(),
+            }
+        )
+
+
+def generate_with_first_step_traces(model, tokenizer, sample: dict[str, Any], max_new_tokens: int):
+    from dct_page_attention import set_dct_page_debug_hook
+
+    device = next(model.parameters()).device
+    encoded = tokenizer(sample["input"], return_tensors="pt")
+    input_ids = encoded.input_ids.to(device)
+    attention_mask = encoded.attention_mask.to(device)
+
+    recorder = FirstStepRecorder()
+    set_dct_page_debug_hook(recorder)
+    try:
+        with torch.no_grad():
+            output_ids = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                use_cache=True,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+    finally:
+        set_dct_page_debug_hook(None)
+
+    generated_ids = output_ids[0, input_ids.shape[1] :].cpu()
+    return {
+        "index": sample["index"],
+        "input_len": int(input_ids.shape[1]),
+        "gen_ids": generated_ids.tolist(),
+        "text": tokenizer.decode(generated_ids, skip_special_tokens=True),
+        "gold": sample["outputs"],
+    }, recorder.records
+
+
+def oracle_topk_from_scores(head_scores: list[float], top_k: int) -> list[int]:
+    ranked = sorted(range(len(head_scores)), key=lambda idx: head_scores[idx], reverse=True)
+    return sorted(ranked[:top_k])
+
+
+def summarize_last_layer(record: dict[str, Any]) -> dict[str, Any]:
+    page_scores = record["page_scores"][0]
+    oracle_scores = record["oracle_page_scores"][0]
+    selected_indices = record["selected_indices"][0]
+    actual_top_k = int(record["actual_top_k"])
+
+    head_rows = []
+    for head_idx, (proxy_head_scores, oracle_head_scores) in enumerate(zip(page_scores, oracle_scores)):
+        proxy_selected = sorted(int(x) for x in selected_indices[head_idx])
+        oracle_selected = oracle_topk_from_scores(oracle_head_scores, actual_top_k)
+        overlap = len(set(proxy_selected).intersection(oracle_selected))
+        head_rows.append(
+            {
+                "kv_head": head_idx,
+                "proxy_selected": proxy_selected,
+                "oracle_selected": oracle_selected,
+                "overlap_count": overlap,
+                "overlap_rate": overlap / actual_top_k if actual_top_k else 0.0,
+                "exact_set_match": proxy_selected == oracle_selected,
+                "oracle_only_pages": sorted(set(oracle_selected) - set(proxy_selected)),
+                "proxy_only_pages": sorted(set(proxy_selected) - set(oracle_selected)),
+                "oracle_top1_page": int(max(range(len(oracle_head_scores)), key=lambda idx: oracle_head_scores[idx])),
+                "oracle_top1_proxy_rank": sorted(
+                    range(len(proxy_head_scores)),
+                    key=lambda idx: proxy_head_scores[idx],
+                    reverse=True,
+                ).index(
+                    max(range(len(oracle_head_scores)), key=lambda idx: oracle_head_scores[idx])
+                )
+                + 1,
+            }
+        )
+
+    overlap_rates = [row["overlap_rate"] for row in head_rows]
+    overlap_counts = [row["overlap_count"] for row in head_rows]
+    oracle_top1_ranks = [row["oracle_top1_proxy_rank"] for row in head_rows]
+    return {
+        "layer_idx": record["layer_idx"],
+        "actual_top_k": actual_top_k,
+        "num_heads": len(head_rows),
+        "mean_overlap_rate": sum(overlap_rates) / len(overlap_rates),
+        "median_overlap_rate": statistics.median(overlap_rates),
+        "mean_overlap_count": sum(overlap_counts) / len(overlap_counts),
+        "heads_with_exact_set_match": sum(1 for row in head_rows if row["exact_set_match"]),
+        "heads_with_full_overlap": sum(1 for row in head_rows if row["overlap_count"] == actual_top_k),
+        "mean_oracle_top1_proxy_rank": sum(oracle_top1_ranks) / len(oracle_top1_ranks),
+        "median_oracle_top1_proxy_rank": statistics.median(oracle_top1_ranks),
+        "head_rows": head_rows,
+    }
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -102,7 +218,7 @@ def parse_args() -> argparse.Namespace:
 # Task config loading (merges data + eval constants, adapted from eval_ruler.py)
 # ---------------------------------------------------------------------------
 def load_task_configs() -> dict[str, dict]:
-    ruler_dir = str(Path(__file__).resolve().parent / "eval_ruler")
+    ruler_dir = str(_REPO_ROOT / "benchmark" / "eval_ruler")
     # Data constants (tokens_to_generate, template, etc.)
     sys.path.insert(0, os.path.join(ruler_dir, "data"))
     data_constants = importlib.import_module("synthetic.constants")
