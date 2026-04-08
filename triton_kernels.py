@@ -1000,6 +1000,8 @@ def _copy_unselected_pages_kernel(
     cos_ptr, sin_ptr,
     # --- selected indices [bsz, kv_heads, top_k] (sorted) ---
     sel_indices_ptr,
+    # --- population bias output [bsz, kv_heads, total_len] (dummy if WRITE_BIAS=0) ---
+    bias_out_ptr,
     # --- strides for comp [bsz, kv_heads, num_pages, comp_size, head_dim] ---
     comp_stride_b, comp_stride_h, comp_stride_p, comp_stride_t,
     # --- strides for output [bsz, kv_heads, total_len, head_dim] ---
@@ -1008,6 +1010,8 @@ def _copy_unselected_pages_kernel(
     rope_stride_t,
     # --- strides for sel_indices [bsz, kv_heads, top_k] ---
     sel_stride_b, sel_stride_h,
+    # --- strides for bias_out [bsz, kv_heads, total_len] ---
+    bias_stride_b, bias_stride_h, bias_stride_t,
     # --- runtime dims ---
     num_kv_heads, num_pages, head_dim, sink_len, num_groups,
     # --- compile-time constants ---
@@ -1019,6 +1023,8 @@ def _copy_unselected_pages_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_T: tl.constexpr,
     APPLY_ROPE: tl.constexpr,
+    WRITE_BIAS: tl.constexpr,
+    LOG_POP_WEIGHT: tl.constexpr,
 ):
     """Copy unselected compressed pages to output with optional K-RoPE.
     Grid: (bsz * kv_heads * num_groups,)  where num_groups = ceil(num_pages / PAGES_PER_PROG).
@@ -1047,6 +1053,9 @@ def _copy_unselected_pages_kernel(
     k_dst = out_k_ptr + b * out_stride_b + h * out_stride_h
     v_dst = out_v_ptr + b * out_stride_b + h * out_stride_h
     src_base = b * comp_stride_b + h * comp_stride_h
+    if WRITE_BIAS == 1:
+        bias_dst = bias_out_ptr + b * bias_stride_b + h * bias_stride_h
+        bias_t_mask = t_idx < COMP_SIZE
 
     if APPLY_ROPE == 1:
         half_d = head_dim // 2
@@ -1086,6 +1095,11 @@ def _copy_unselected_pages_kernel(
                 tl.store(k_dst + dst_offsets, k_vals, mask=mask)
                 tl.store(v_dst + dst_offsets, v_vals, mask=mask)
 
+                if WRITE_BIAS == 1:
+                    bias_offsets = (write_start + t_safe) * bias_stride_t
+                    bias_vals = tl.full([BLOCK_T], LOG_POP_WEIGHT, dtype=tl.float32)
+                    tl.store(bias_dst + bias_offsets, bias_vals, mask=bias_t_mask)
+
 
 # ---------------------------------------------------------------------------
 # Wrapper: Split assemble (2 pure-Triton kernels, no PyTorch/Triton mixing)
@@ -1111,6 +1125,8 @@ def assemble_kv_split_triton(
     q_rope_buf: torch.Tensor = None,
     cached_params: dict = None,
     stride_cache: dict = None,
+    bias_out: torch.Tensor = None,
+    log_pop_weight: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Assemble KV using split kernels. Same API as assemble_kv_full_triton.
 
@@ -1136,6 +1152,7 @@ def assemble_kv_split_triton(
             selected_indices, cos_table, sin_table,
             out_k, out_v, query_states, q_rope_cos, q_rope_sin, q_rope_buf,
             cached_params,
+            bias_out=bias_out, log_pop_weight=log_pop_weight,
         )
 
     if stride_cache is not None:
@@ -1145,6 +1162,7 @@ def assemble_kv_split_triton(
             selected_indices, cos_table, sin_table,
             out_k, out_v, query_states, q_rope_cos, q_rope_sin, q_rope_buf,
             stride_cache,
+            bias_out=bias_out, log_pop_weight=log_pop_weight,
         )
 
     bsz, num_kv_heads, num_pages, page_size, head_dim = paged_k.shape
@@ -1254,20 +1272,35 @@ def assemble_kv_split_triton(
             PAGES_PER_PROG = 16
             num_groups = (num_pages + PAGES_PER_PROG - 1) // PAGES_PER_PROG
             grid_comp = (bsz * num_kv_heads * num_groups,)
+            write_bias = 1 if bias_out is not None else 0
+            if write_bias == 1:
+                bias_b_stride = bias_out.stride(0)
+                bias_h_stride = bias_out.stride(1)
+                bias_t_stride = bias_out.stride(2)
+                bias_ptr = bias_out
+            else:
+                bias_b_stride = 0
+                bias_h_stride = 0
+                bias_t_stride = 0
+                bias_ptr = final_k  # dummy, not accessed when WRITE_BIAS=0
             _copy_unselected_pages_kernel[grid_comp](
                 comp_k, comp_v, final_k, final_v,
                 cos_ptr, sin_ptr,
                 sel_idx,
+                bias_ptr,
                 comp_k.stride(0), comp_k.stride(1), comp_k.stride(2), comp_k.stride(3),
                 final_k.stride(0), final_k.stride(1), final_k.stride(2),
                 rope_stride_t,
                 sel_idx.stride(0), sel_idx.stride(1),
+                bias_b_stride, bias_h_stride, bias_t_stride,
                 num_kv_heads, num_pages, head_dim, sink_len, num_groups,
                 COMP_SIZE=comp_size, PAGE_SIZE=page_size, TOP_K=top_k,
                 BLOCK_K=triton.next_power_of_2(top_k),
                 PAGES_PER_PROG=PAGES_PER_PROG,
                 BLOCK_D=BLOCK_D, BLOCK_T=BLOCK_T_COMP,
                 APPLY_ROPE=1 if apply_rope else 0,
+                WRITE_BIAS=write_bias,
+                LOG_POP_WEIGHT=float(log_pop_weight),
             )
 
     if fuse_q_rope:
@@ -1278,6 +1311,7 @@ def assemble_kv_split_triton(
 def build_assemble_stride_cache(
     paged_k, comp_k, sink_k, recent_k, selected_indices=None,
     cos_table=None, out_k=None, query_states=None,
+    bias_out=None,
 ):
     """Precompute tensor strides and fixed constants only.
 
@@ -1320,6 +1354,8 @@ def build_assemble_stride_cache(
         'sel_strides': (selected_indices.stride(0), selected_indices.stride(1)) if selected_indices is not None else (0, 0),
         'rope_stride_t': rope_stride_t,
         'q_stride_h': q_stride_h,
+        # Bias output strides (only meaningful when caller passes bias_out at call time)
+        'bias_strides': (bias_out.stride(0), bias_out.stride(1), bias_out.stride(2)) if bias_out is not None else (0, 0, 0),
         # Fixed constexprs
         'BLOCK_D': BLOCK_D, 'BLOCK_T_FULL': BLOCK_T_FULL,
         'BLOCK_T_COMP': BLOCK_T_COMP, 'PAGES_PER_PROG': PAGES_PER_PROG,
@@ -1339,6 +1375,7 @@ def _assemble_kv_split_stride_cached(
     selected_indices, cos_table, sin_table,
     out_k, out_v, query_states, q_rope_cos, q_rope_sin, q_rope_buf,
     c,
+    bias_out=None, log_pop_weight=0.0,
 ):
     """Fast path using cached strides. Recomputes shape-dependent values each call."""
     head_dim = c['head_dim']
@@ -1408,20 +1445,31 @@ def _assemble_kv_split_stride_cached(
 
         if num_unselected > 0:
             grid_comp = (c['bsz'] * c['num_kv_heads'] * num_groups,)
+            write_bias = 1 if bias_out is not None else 0
+            if write_bias == 1:
+                bs = c.get('bias_strides', (bias_out.stride(0), bias_out.stride(1), bias_out.stride(2)))
+                bias_ptr = bias_out
+            else:
+                bs = (0, 0, 0)
+                bias_ptr = final_k  # dummy, not accessed
             _copy_unselected_pages_kernel[grid_comp](
                 comp_k, comp_v, final_k, final_v,
                 cos_ptr, sin_ptr,
                 sel_idx,
+                bias_ptr,
                 cs[0], cs[1], cs[2], cs[3],
                 os[0], os[1], os[2],
                 c['rope_stride_t'],
                 si[0], si[1],
+                bs[0], bs[1], bs[2],
                 c['num_kv_heads'], num_pages, head_dim, c['sink_len'], num_groups,
                 COMP_SIZE=c['comp_size'], PAGE_SIZE=c['page_size'], TOP_K=top_k,
                 BLOCK_K=triton.next_power_of_2(top_k),
                 PAGES_PER_PROG=c['PAGES_PER_PROG'],
                 BLOCK_D=c['BLOCK_D'], BLOCK_T=c['BLOCK_T_COMP'],
                 APPLY_ROPE=c['APPLY_ROPE'],
+                WRITE_BIAS=write_bias,
+                LOG_POP_WEIGHT=float(log_pop_weight),
             )
 
     if c['fuse_q_rope']:
@@ -1502,6 +1550,7 @@ def _assemble_kv_split_cached(
     selected_indices, cos_table, sin_table,
     out_k, out_v, query_states, q_rope_cos, q_rope_sin, q_rope_buf,
     c,
+    bias_out=None, log_pop_weight=0.0,
 ):
     """Fast path: launch kernels using precomputed params. Minimal Python overhead."""
     total_len = c['total_len']
@@ -1559,20 +1608,31 @@ def _assemble_kv_split_cached(
 
         # Kernel B
         if c['num_unselected'] > 0:
+            write_bias = 1 if bias_out is not None else 0
+            if write_bias == 1:
+                bs = c.get('bias_strides', (bias_out.stride(0), bias_out.stride(1), bias_out.stride(2)))
+                bias_ptr = bias_out
+            else:
+                bs = (0, 0, 0)
+                bias_ptr = final_k  # dummy, not accessed
             _copy_unselected_pages_kernel[c['grid_comp']](
                 comp_k, comp_v, final_k, final_v,
                 cos_ptr, sin_ptr,
                 sel_idx,
+                bias_ptr,
                 cs[0], cs[1], cs[2], cs[3],
                 os[0], os[1], os[2],
                 c['rope_stride_t'],
                 si[0], si[1],
+                bs[0], bs[1], bs[2],
                 c['num_kv_heads'], c['num_pages'], head_dim, c['sink_len'], c['num_groups'],
                 COMP_SIZE=c['comp_size'], PAGE_SIZE=c['page_size'], TOP_K=c['top_k'],
                 BLOCK_K=triton.next_power_of_2(c['top_k']),
                 PAGES_PER_PROG=c['PAGES_PER_PROG'],
                 BLOCK_D=c['BLOCK_D'], BLOCK_T=c['BLOCK_T_COMP'],
                 APPLY_ROPE=c['APPLY_ROPE'],
+                WRITE_BIAS=write_bias,
+                LOG_POP_WEIGHT=float(log_pop_weight),
             )
 
     if c['fuse_q_rope']:

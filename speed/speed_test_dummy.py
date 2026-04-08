@@ -90,6 +90,7 @@ def apply_dct_patch(args, model=None):
         compressed_token_rope=args.compressed_token_rope,
         continuous_rope=args.continuous_rope,
         use_triton=not getattr(args, 'no_triton', False),
+        weight_compressed_by_population=getattr(args, 'weight_compressed_by_population', False),
     )
     if "llama" in args.model.lower():
         import transformers
@@ -327,6 +328,8 @@ def parse_args():
     dct.add_argument("--compressed_token_rope", default="mixed", choices=["mixed", "block_center"])
     dct.add_argument("--continuous_rope", action="store_true",
                      help="Temporarily disabled — raises error if used")
+    dct.add_argument("--weight_compressed_by_population", action="store_true",
+                     help="Multipole-style population weighting in compressed mode (no-op for drop mode).")
     dct.add_argument("--no_triton", action="store_true",
                      help="Disable Triton kernels (use pure PyTorch for comparison)")
 

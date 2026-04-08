@@ -1023,6 +1023,7 @@ _DCT_RUNTIME_STATE_ATTRS = (
     "_assemble_drop_stride_cache",
     "_final_k_buf",
     "_final_v_buf",
+    "_final_bias_buf",
     "_sel_idx_buf",
     "_assemble_buf_len",
     "_orig_pos_rope_cos_2d",
@@ -1259,6 +1260,8 @@ def dct_page_attention_forward(
     # Step 6b: Assemble KV for attention.
     # With continuous_rope=False, all keys already have RoPE baked in.
     # No additional RoPE needed during assembly.
+    bias_out_arg = None  # Set in compressed branch when weight_compressed_by_population is on
+
     if cfg.unselected_mode == "drop":
         assembled_len = cfg.sink_size + actual_top_k * cfg.page_size + actual_recent
 
@@ -1292,6 +1295,21 @@ def dct_page_attention_forward(
         middle_len = actual_top_k * cfg.page_size + num_unselected * comp_size
         assembled_len = cfg.sink_size + middle_len + actual_recent
 
+        # Population weighting: when enabled (and not in direct-spectral-proxy mode),
+        # we add log(page_size/comp_size) to the QK logits at unselected-rep
+        # positions via SDPA's attn_mask. This makes each rep contribute to the
+        # softmax as if it were page_size/comp_size real tokens (multipole-style).
+        weight_pop = (
+            cfg.weight_compressed_by_population
+            and not cfg.score_use_direct_spectral_proxy
+            and num_unselected > 0
+            and comp_size < cfg.page_size
+        )
+        if weight_pop:
+            log_pop_weight = math.log(cfg.page_size / comp_size)
+        else:
+            log_pop_weight = 0.0
+
         # Pre-allocate or expand output buffers
         _buf_len = getattr(self, '_assemble_buf_len', 0)
         _buf_grew = False
@@ -1305,19 +1323,50 @@ def dct_page_attention_forward(
             self._sel_idx_buf = torch.empty(
                 bsz, _nkv, actual_top_k, dtype=torch.int32, device=paged_k.device
             )
+            # Bias buffer is float32 (SDPA upcasts mask to compute dtype anyway).
+            # Allocated lazily so the drop path and the flag-off compressed path
+            # never pay the memory cost.
+            self._final_bias_buf = None
             self._assemble_buf_len = _max_len
             _buf_grew = True
+
+        if weight_pop and (
+            getattr(self, '_final_bias_buf', None) is None
+            or self._final_bias_buf.shape[2] < self._assemble_buf_len
+        ):
+            self._final_bias_buf = torch.zeros(
+                bsz, _num_kv_heads, self._assemble_buf_len,
+                dtype=torch.float32, device=paged_k.device,
+            )
+
+        if weight_pop:
+            # Zero only the slice we are about to (re)write — the kernel writes
+            # log_pop_weight at unselected-rep slots only, so leftover values
+            # at sink/selected/recent slots from prior steps must be cleared.
+            self._final_bias_buf[:, :, :assembled_len].zero_()
+            bias_out_arg = self._final_bias_buf
+        else:
+            bias_out_arg = None
 
         # Build stride cache on first call; rebuild when strides change.
         # Must also rebuild when _final_k_buf is reallocated, because the buffer's
         # dim-0/dim-1 strides depend on max_len (which changes on reallocation).
+        # Also rebuild when the bias buffer's strides change (allocation, regrow,
+        # or weight_pop flag flipped on/off between calls).
         _cur_paged_strides = (paged_k.stride(0), paged_k.stride(1), paged_k.stride(2), paged_k.stride(3))
+        _cur_bias_strides = (
+            (self._final_bias_buf.stride(0), self._final_bias_buf.stride(1), self._final_bias_buf.stride(2))
+            if weight_pop else (0, 0, 0)
+        )
+        _cached = getattr(self, '_assemble_stride_cache', None)
         if (_buf_grew
-                or not hasattr(self, '_assemble_stride_cache')
-                or self._assemble_stride_cache['paged_strides'] != _cur_paged_strides):
+                or _cached is None
+                or _cached['paged_strides'] != _cur_paged_strides
+                or _cached.get('bias_strides', (0, 0, 0)) != _cur_bias_strides):
             self._assemble_stride_cache = build_assemble_stride_cache(
                 paged_k, comp_k, sink_k, recent_k, selected_indices,
                 None, self._final_k_buf,
+                bias_out=self._final_bias_buf if weight_pop else None,
             )
 
         final_k, final_v = assemble_kv_split_triton(
@@ -1328,14 +1377,33 @@ def dct_page_attention_forward(
             out_k=self._final_k_buf,
             out_v=self._final_v_buf,
             stride_cache=self._assemble_stride_cache,
+            bias_out=bias_out_arg,
+            log_pop_weight=log_pop_weight,
         )
 
     else:
         raise ValueError(f"Unsupported unselected_mode: {cfg.unselected_mode}")
 
-    # Step 7a: Compute attention (no causal mask needed for q_len=1)
+    # Step 7a: Compute attention (no causal mask needed for q_len=1).
+    # In compressed mode with population weighting, pass the per-position bias
+    # built by the assembly kernel as an additive attn_mask. SDPA adds it to
+    # the QK logits before softmax, which (via the log(n) bias trick) makes
+    # each unselected-page rep contribute as if it were page_size/comp_size
+    # real tokens — analogous to multipole_attn's `p * nkeys` weighting.
+    if cfg.unselected_mode == "compressed" and bias_out_arg is not None:
+        # bias_out_arg: [bsz, num_kv_heads, max_len]. SDPA with enable_gqa
+        # internally repeats K/V to num_q_heads, so attn_mask must also be at
+        # the query-head granularity (or broadcastable to it). The bias layout
+        # is per-kv-head because selected_indices differs per kv-head, so we
+        # repeat_interleave by num_key_value_groups along the head dim.
+        kv_bias = bias_out_arg[:, :, :final_k.shape[2]]
+        attn_bias = kv_bias.repeat_interleave(self.num_key_value_groups, dim=1).unsqueeze(2)
+    else:
+        attn_bias = None
+
     attn_output = F.scaled_dot_product_attention(
         query_states, final_k, final_v,
+        attn_mask=attn_bias,
         is_causal=False,
         enable_gqa=True,
     )
@@ -1370,6 +1438,7 @@ def replace_qwen2_attn(
     score_use_hadamard_proxy=False,
     select_with_oracle_page_scores=False,
     use_triton=True,
+    weight_compressed_by_population=False,
 ):
     """
     Replace Qwen2Attention.forward with DCT Page Attention.
@@ -1397,6 +1466,7 @@ def replace_qwen2_attn(
         score_use_hadamard_proxy=score_use_hadamard_proxy,
         select_with_oracle_page_scores=select_with_oracle_page_scores,
         use_triton=use_triton,
+        weight_compressed_by_population=weight_compressed_by_population,
     )
 
     comp_size = max(1, int(page_size * compress_ratio))
@@ -1414,7 +1484,8 @@ def replace_qwen2_attn(
         f"score_use_haar_mixed_proxy={score_use_haar_mixed_proxy}, "
         f"score_use_hadamard_proxy={score_use_hadamard_proxy}, "
         f"select_with_oracle_page_scores={select_with_oracle_page_scores}, "
-        f"use_triton={use_triton}"
+        f"use_triton={use_triton}, "
+        f"weight_compressed_by_population={weight_compressed_by_population}"
     )
     print(f"  Page attention active during decode only (prefill uses full attention)")
 
@@ -1441,6 +1512,7 @@ def replace_qwen3_attn(
     score_use_hadamard_proxy=False,
     select_with_oracle_page_scores=False,
     use_triton=True,
+    weight_compressed_by_population=False,
 ):
     """
     Replace Qwen3Attention.forward with DCT Page Attention.
@@ -1470,6 +1542,7 @@ def replace_qwen3_attn(
         score_use_hadamard_proxy=score_use_hadamard_proxy,
         select_with_oracle_page_scores=select_with_oracle_page_scores,
         use_triton=use_triton,
+        weight_compressed_by_population=weight_compressed_by_population,
     )
 
     comp_size = max(1, int(page_size * compress_ratio))
@@ -1487,7 +1560,8 @@ def replace_qwen3_attn(
         f"score_use_haar_mixed_proxy={score_use_haar_mixed_proxy}, "
         f"score_use_hadamard_proxy={score_use_hadamard_proxy}, "
         f"select_with_oracle_page_scores={select_with_oracle_page_scores}, "
-        f"use_triton={use_triton}"
+        f"use_triton={use_triton}, "
+        f"weight_compressed_by_population={weight_compressed_by_population}"
     )
     print(f"  Page attention active during decode only (prefill uses full attention)")
 
@@ -1514,6 +1588,7 @@ def replace_llama_attn(
     score_use_hadamard_proxy=False,
     select_with_oracle_page_scores=False,
     use_triton=True,
+    weight_compressed_by_population=False,
 ):
     """
     Replace LlamaAttention.forward with DCT Page Attention.
@@ -1543,6 +1618,7 @@ def replace_llama_attn(
         score_use_hadamard_proxy=score_use_hadamard_proxy,
         select_with_oracle_page_scores=select_with_oracle_page_scores,
         use_triton=use_triton,
+        weight_compressed_by_population=weight_compressed_by_population,
     )
 
     comp_size = max(1, int(page_size * compress_ratio))
@@ -1560,7 +1636,8 @@ def replace_llama_attn(
         f"score_use_haar_mixed_proxy={score_use_haar_mixed_proxy}, "
         f"score_use_hadamard_proxy={score_use_hadamard_proxy}, "
         f"select_with_oracle_page_scores={select_with_oracle_page_scores}, "
-        f"use_triton={use_triton}"
+        f"use_triton={use_triton}, "
+        f"weight_compressed_by_population={weight_compressed_by_population}"
     )
     print(f"  Page attention active during decode only (prefill uses full attention)")
 

@@ -147,6 +147,7 @@ def apply_dct_patch(args: argparse.Namespace) -> None:
         score_use_hadamard_proxy=args.dct_score_use_hadamard_proxy,
         select_with_oracle_page_scores=args.dct_select_with_oracle_page_scores,
         use_triton=not args.dct_no_triton,
+        weight_compressed_by_population=args.dct_weight_compressed_by_population,
     )
     if "llama" in model_name:
         from dct_page_attention import replace_llama_attn
@@ -186,8 +187,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", choices=["baseline", "page_attention"], required=True)
     p.add_argument("--model_name_or_path", default="Qwen/Qwen3-8B")
     p.add_argument("--context_len", type=int, required=True)
-    p.add_argument("--data_root", type=Path, default=Path("ruler_data"))
-    p.add_argument("--output_root", type=Path, default=Path("results_ruler_oracle/ruler_runs"))
+    p.add_argument("--data_root", type=Path, default=Path("benchmark/data/ruler_data"))
+    p.add_argument("--output_root", type=Path, default=Path("results/results_ruler_oracle"))
     p.add_argument("--tag", default="ruler_run")
     p.add_argument("--run_dir", type=Path, default=None)
     p.add_argument("--benchmark", default="synthetic")
@@ -197,11 +198,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cuda_device", type=int, default=0)
     p.add_argument("--local_files_only", action="store_true")
 
-    p.add_argument("--dct_page_size", type=int, default=32)
-    p.add_argument("--dct_top_k", type=int, default=64)
+    p.add_argument("--dct_page_size", type=int, default=16)
+    p.add_argument("--dct_top_k", type=int, default=128)
     p.add_argument("--dct_sink_size", type=int, default=4)
     p.add_argument("--dct_recent_size", type=int, default=128)
-    p.add_argument("--dct_compress_ratio", type=float, default=0.03125)
+    p.add_argument("--dct_compress_ratio", type=float, default=0.125)
     p.add_argument(
         "--dct_proxy_frequency_layout",
         type=str,
@@ -241,6 +242,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dct_select_with_oracle_page_scores", action="store_true")
     p.add_argument("--dct_continuous_rope", action="store_true",
                    help="Temporarily disabled — raises error if used")
+    p.add_argument("--dct_weight_compressed_by_population", action="store_true",
+                   help="In compressed mode, scale each unselected-page rep's softmax mass "
+                        "by page_size/comp_size via a log(n) bias on QK logits "
+                        "(multipole-style population weighting). No-op for drop mode.")
     p.add_argument("--dct_no_triton", action="store_true")
     p.set_defaults(dct_score_use_haar_proxy=True)
     return p.parse_args()
@@ -363,6 +368,7 @@ def main() -> None:
             "score_use_hadamard_proxy": args.dct_score_use_hadamard_proxy,
             "select_with_oracle_page_scores": args.dct_select_with_oracle_page_scores,
             "use_triton": not args.dct_no_triton,
+            "weight_compressed_by_population": args.dct_weight_compressed_by_population,
         },
     }
     (run_dir / "manifest.json").write_text(

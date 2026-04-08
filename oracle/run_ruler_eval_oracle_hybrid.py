@@ -39,12 +39,21 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run RULER oracle+hybrid sweeps")
     p.add_argument("--model_name_or_path", default="Qwen/Qwen3-8B")
     p.add_argument("--context_len", type=int, default=32768)
-    p.add_argument("--data_root", type=Path, default=Path("results_ruler/data/synthetic"))
-    p.add_argument("--output_root", type=Path, default=Path("results_ruler/oracle_hybrid"))
+    p.add_argument("--data_root", type=Path, default=Path("benchmark/data/ruler_data"),
+                   help="Root dir containing <model_family>/<context_len>/<task>/validation.jsonl. "
+                        "Forwarded to run_ruler_eval.py as --data_root.")
+    p.add_argument("--output_root", type=Path, default=Path("results/results_ruler/oracle_hybrid"))
     p.add_argument("--tag", default="oracle_hybrid")
-    p.add_argument("--page_sizes", default="32,64,128")
-    p.add_argument("--selected_token_budget", type=int, default=2048)
+    p.add_argument("--page_sizes", default="32")
+    p.add_argument("--top_k", type=int, default=64,
+                   help="Number of pages selected per query (applied to every page_size in the sweep).")
     p.add_argument("--compress_ratio", type=float, default=0.125)
+    p.add_argument(
+        "--weight_pop",
+        default="0,1",
+        help="Comma-separated 0/1 values to sweep --dct_weight_compressed_by_population. "
+             "E.g. '0', '1', or '0,1' to run both.",
+    )
     p.add_argument("--num_samples", type=int, default=25)
     p.add_argument("--max_new_tokens", type=int, default=128)
     p.add_argument("--tasks", default="all", help="'all' or comma-separated task names")
@@ -58,6 +67,20 @@ def parse_csv_ints(value: str) -> list[int]:
     return [int(x.strip()) for x in value.split(",") if x.strip()]
 
 
+def parse_weight_pop(value: str) -> list[bool]:
+    out = []
+    for x in value.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        if x not in ("0", "1"):
+            raise ValueError(f"--weight_pop entries must be 0 or 1, got {x!r}")
+        out.append(x == "1")
+    if not out:
+        raise ValueError("--weight_pop must contain at least one of 0,1")
+    return out
+
+
 def resolve_tasks(value: str) -> list[str]:
     if value == "all":
         return list(TASKS)
@@ -68,8 +91,15 @@ def resolve_tasks(value: str) -> list[str]:
     return requested
 
 
-def make_run_root(output_root: Path, page_size: int, top_k: int, compress_ratio: float) -> Path:
-    run_root = output_root / f"ps{page_size}_topk{top_k}_cr{compress_ratio}"
+def make_run_root(
+    output_root: Path,
+    page_size: int,
+    top_k: int,
+    compress_ratio: float,
+    weight_pop: bool,
+) -> Path:
+    pop_tag = "popw" if weight_pop else "nopopw"
+    run_root = output_root / f"ps{page_size}_topk{top_k}_cr{compress_ratio}_{pop_tag}"
     run_root.mkdir(parents=True, exist_ok=True)
     return run_root
 
@@ -83,6 +113,8 @@ def build_run_cmd(
     page_size: int,
     top_k: int,
     compress_ratio: float,
+    weight_pop: bool,
+    data_root: Path,
     num_samples: int,
     max_new_tokens: int,
     cuda_device: int,
@@ -95,6 +127,8 @@ def build_run_cmd(
         "page_attention",
         "--run_dir",
         str(run_dir),
+        "--data_root",
+        str(data_root),
         "--model_name_or_path",
         model_name_or_path,
         "--context_len",
@@ -125,6 +159,8 @@ def build_run_cmd(
         "compressed",
         "--dct_select_with_oracle_page_scores",
     ]
+    if weight_pop:
+        cmd.append("--dct_weight_compressed_by_population")
     if local_files_only:
         cmd.append("--local_files_only")
     return cmd
@@ -205,64 +241,72 @@ def main() -> None:
     script_path = Path(__file__).resolve().parent / "run_ruler_eval.py"
     repo_root = Path(__file__).resolve().parent.parent
     page_sizes = parse_csv_ints(args.page_sizes)
+    weight_pops = parse_weight_pop(args.weight_pop)
     tasks = resolve_tasks(args.tasks)
 
-    for page_size in page_sizes:
-        if args.selected_token_budget % page_size != 0:
-            raise ValueError(
-                f"selected_token_budget={args.selected_token_budget} must be divisible by page_size={page_size}"
+    for weight_pop in weight_pops:
+        for page_size in page_sizes:
+            top_k = args.top_k
+            run_root = make_run_root(
+                args.output_root, page_size, top_k, args.compress_ratio, weight_pop
             )
-        top_k = args.selected_token_budget // page_size
-        run_root = make_run_root(args.output_root, page_size, top_k, args.compress_ratio)
 
-        manifest = {
-            "model_name_or_path": args.model_name_or_path,
-            "context_len": args.context_len,
-            "page_size": page_size,
-            "top_k": top_k,
-            "selected_token_budget": args.selected_token_budget,
-            "compress_ratio": args.compress_ratio,
-            "unselected_mode": "compressed",
-            "select_with_oracle_page_scores": True,
-            "num_samples": args.num_samples,
-            "max_new_tokens": args.max_new_tokens,
-            "cuda_device": args.cuda_device,
-            "tasks": tasks,
-            "assumption": "Oracle page selection + hybrid mode: selected pages use full tokens, "
-            "unselected pages use Haar lowpass proxy KV cache.",
-        }
-        (run_root / "manifest.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+            manifest = {
+                "model_name_or_path": args.model_name_or_path,
+                "context_len": args.context_len,
+                "page_size": page_size,
+                "top_k": top_k,
+                "compress_ratio": args.compress_ratio,
+                "weight_compressed_by_population": weight_pop,
+                "unselected_mode": "compressed",
+                "select_with_oracle_page_scores": True,
+                "num_samples": args.num_samples,
+                "max_new_tokens": args.max_new_tokens,
+                "cuda_device": args.cuda_device,
+                "tasks": tasks,
+                "assumption": "Oracle page selection + hybrid mode: selected pages use full tokens, "
+                "unselected pages use Haar lowpass proxy KV cache.",
+            }
+            (run_root / "manifest.json").write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
 
-        cmd = build_run_cmd(
-            script_path=script_path,
-            model_name_or_path=args.model_name_or_path,
-            run_dir=run_root,
-            context_len=args.context_len,
-            tasks=tasks,
-            page_size=page_size,
-            top_k=top_k,
-            compress_ratio=args.compress_ratio,
-            num_samples=args.num_samples,
-            max_new_tokens=args.max_new_tokens,
-            cuda_device=args.cuda_device,
-            local_files_only=args.local_files_only,
-        )
-        (run_root / "command.sh").write_text(
-            "#!/usr/bin/env bash\nset -euo pipefail\n\n"
-            + " ".join(shlex.quote(part) for part in cmd)
-            + "\n",
-            encoding="utf-8",
-        )
-        if args.dry_run:
-            print(f"Dry run: {run_root}")
-            continue
-        subprocess.run(cmd, cwd=repo_root, check=True)
-        rows = collect_page_summary(page_size, top_k, run_root)
-        write_summary_files(run_root, rows)
-        print(f"Results written to: {run_root}")
+            cmd = build_run_cmd(
+                script_path=script_path,
+                model_name_or_path=args.model_name_or_path,
+                run_dir=run_root,
+                context_len=args.context_len,
+                tasks=tasks,
+                page_size=page_size,
+                top_k=top_k,
+                compress_ratio=args.compress_ratio,
+                weight_pop=weight_pop,
+                data_root=args.data_root,
+                num_samples=args.num_samples,
+                max_new_tokens=args.max_new_tokens,
+                cuda_device=args.cuda_device,
+                local_files_only=args.local_files_only,
+            )
+            (run_root / "command.sh").write_text(
+                "#!/usr/bin/env bash\nset -euo pipefail\n\n"
+                + " ".join(shlex.quote(part) for part in cmd)
+                + "\n",
+                encoding="utf-8",
+            )
+            print(
+                f"\n[oracle_hybrid] page_size={page_size} top_k={top_k} "
+                f"cr={args.compress_ratio} weight_pop={int(weight_pop)} -> {run_root}",
+                flush=True,
+            )
+            print("  cmd: " + " ".join(shlex.quote(part) for part in cmd), flush=True)
+            if args.dry_run:
+                print(f"Dry run: {run_root}", flush=True)
+                continue
+            subprocess.run(cmd, cwd=repo_root, check=True)
+            rows = collect_page_summary(page_size, top_k, run_root)
+            write_summary_files(run_root, rows)
+            print(f"Results written to: {run_root}")
 
 
 if __name__ == "__main__":

@@ -56,6 +56,8 @@ def parse_args():
     parser.add_argument("--dct_compressed_token_rope", type=str, default="mixed", choices=["mixed", "block_center"])
     parser.add_argument("--dct_continuous_rope", action="store_true",
                         help="Temporarily disabled — raises error if used")
+    parser.add_argument("--dct_weight_compressed_by_population", action="store_true",
+                        help="Multipole-style population weighting in compressed mode (no-op for drop mode).")
     parser.add_argument("--dct_no_triton", action="store_true")
 
     return parser.parse_args()
@@ -102,6 +104,7 @@ def main():
             compressed_token_rope=args.dct_compressed_token_rope,
             continuous_rope=args.dct_continuous_rope,
             use_triton=not args.dct_no_triton,
+            weight_compressed_by_population=args.dct_weight_compressed_by_population,
         )
     else:
         from dct_page_attention import replace_qwen2_attn
@@ -118,6 +121,7 @@ def main():
             compressed_token_rope=args.dct_compressed_token_rope,
             continuous_rope=args.dct_continuous_rope,
             use_triton=not args.dct_no_triton,
+            weight_compressed_by_population=args.dct_weight_compressed_by_population,
         )
 
     # Load model directly (same pattern as eval_longbench_v1.py)

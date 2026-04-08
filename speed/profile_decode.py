@@ -57,6 +57,7 @@ def apply_dct_patch(args, model=None):
         compressed_token_rope=getattr(args, 'compressed_token_rope', 'mixed'),
         continuous_rope=args.continuous_rope,
         use_triton=not getattr(args, 'no_triton', False),
+        weight_compressed_by_population=getattr(args, 'weight_compressed_by_population', False),
     )
     if "llama" in args.model.lower():
         from dct_page_attention import replace_llama_attn, dct_page_attention_forward
@@ -655,6 +656,8 @@ def parse_args():
     p.add_argument("--compressed_token_rope", default="mixed", choices=["mixed", "block_center"])
     p.add_argument("--continuous_rope", action="store_true",
                    help="Temporarily disabled — raises error if used")
+    p.add_argument("--weight_compressed_by_population", action="store_true",
+                   help="Multipole-style population weighting in compressed mode (no-op for drop mode).")
     p.add_argument("--no_triton", action="store_true",
                    help="Disable Triton kernels (use pure PyTorch for comparison)")
     p.add_argument("--sync", action="store_true",

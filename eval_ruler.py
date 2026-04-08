@@ -44,7 +44,8 @@ ALL_TASKS = [
 
 DEFAULT_SEQ_LENGTHS = [32768] #[4096, 8192, 16384, 32768, 65536, 131072]
 
-RULER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval_ruler")
+RULER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark", "eval_ruler")
+RULER_DATA_DIR = Path(os.path.dirname(os.path.abspath(__file__))) / "benchmark" / "data" / "ruler_data"
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +104,10 @@ def parse_args():
                              "'block_center': invert RoPE, compress raw keys, re-rotate at block-center positions.")
     parser.add_argument("--continuous_rope", action="store_true",
                         help="Temporarily disabled — raises error if used")
+    parser.add_argument("--weight_compressed_by_population", action="store_true",
+                        help="In compressed mode, scale each unselected-page rep's softmax mass "
+                             "by page_size/comp_size via a log(n) bias on QK logits "
+                             "(multipole-style population weighting). No-op for drop mode.")
     parser.add_argument("--no_triton", action="store_true")
     parser.add_argument("--skip_existing", action="store_true",
                         help="Skip run if summary.json already exists in output dir")
@@ -172,13 +177,13 @@ def prepare_data(args):
 
     for seq_len in args.seq_lengths:
         for task in args.tasks:
-            data_file = Path("ruler_data") / model_family / str(seq_len) / task / "validation.jsonl"
+            data_file = RULER_DATA_DIR / model_family / str(seq_len) / task / "validation.jsonl"
             if data_file.exists():
                 print(f"  Data exists, skipping: {data_file}")
                 continue
 
             data_file.parent.mkdir(parents=True, exist_ok=True)
-            save_dir = str(Path("ruler_data").resolve() / model_family / str(seq_len))
+            save_dir = str(RULER_DATA_DIR / model_family / str(seq_len))
 
             cmd = [
                 sys.executable, prepare_script,
@@ -221,6 +226,7 @@ def apply_monkey_patch(args):
                 compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
+                weight_compressed_by_population=args.weight_compressed_by_population,
             )
         elif "qwen3" in model_name_lower:
             from dct_page_attention import replace_qwen3_attn
@@ -237,6 +243,7 @@ def apply_monkey_patch(args):
                 compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
+                weight_compressed_by_population=args.weight_compressed_by_population,
             )
         else:
             from dct_page_attention import replace_qwen2_attn
@@ -253,6 +260,7 @@ def apply_monkey_patch(args):
                 compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
+                weight_compressed_by_population=args.weight_compressed_by_population,
             )
     elif args.mode == "multipole_attention":
         from multipole_attn import replace_attn_multipole
@@ -490,7 +498,7 @@ def main():
         print(f"SEQUENCE LENGTH: {seq_len}")
         print("=" * 60)
 
-        data_dir = Path("ruler_data") / model_family / str(seq_len)
+        data_dir = RULER_DATA_DIR / model_family / str(seq_len)
         pred_dir = Path(args.output_dir) / args.run_name / "synthetic" / str(seq_len) / "pred"
         pred_dir.mkdir(parents=True, exist_ok=True)
 

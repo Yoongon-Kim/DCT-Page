@@ -462,6 +462,10 @@ def parse_args():
                         help="RoPE handling for compressed tokens")
     parser.add_argument("--continuous_rope", action="store_true",
                         help="Temporarily disabled — raises error if used")
+    parser.add_argument("--weight_compressed_by_population", action="store_true",
+                        help="In compressed mode, scale each unselected-page rep's softmax mass "
+                             "by page_size/comp_size via a log(n) bias on QK logits "
+                             "(multipole-style population weighting). No-op for drop mode.")
     parser.add_argument("--no_triton", action="store_true",
                         help="Disable Triton kernels (use pure PyTorch for comparison)")
 
@@ -713,6 +717,7 @@ def main():
                 compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
+                weight_compressed_by_population=args.weight_compressed_by_population,
             )
         elif "qwen3" in model_name_lower:
             from dct_page_attention import replace_qwen3_attn
@@ -729,6 +734,7 @@ def main():
                 compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
+                weight_compressed_by_population=args.weight_compressed_by_population,
             )
         else:
             from dct_page_attention import replace_qwen2_attn
@@ -745,6 +751,7 @@ def main():
                 compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
+                weight_compressed_by_population=args.weight_compressed_by_population,
             )
     elif args.mode == "multipole_attention":
         from multipole_attn import replace_attn_multipole
