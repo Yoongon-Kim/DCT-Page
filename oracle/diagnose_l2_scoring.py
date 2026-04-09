@@ -263,6 +263,48 @@ def compute_proxy_scores(
     return result
 
 
+def _log_spread_ac(page_size: int, n_ac: int) -> list[int]:
+    """Doubling-gap AC indices from low end: [1, 3, 7, 15, ...] = 2^(k+1)-1.
+
+    Falls back to scaled indices when doubling overshoots page_size.
+    """
+    if n_ac == 0:
+        return []
+    max_idx = page_size - 1
+    raw = [2 ** (k + 1) - 1 for k in range(n_ac)]
+    if raw[-1] <= max_idx:
+        return raw
+    # Scale to fit, push collisions forward to keep uniqueness
+    scale = max_idx / raw[-1]
+    scaled = [max(1, round(x * scale)) for x in raw]
+    result: list[int] = []
+    for s in scaled:
+        if result and s <= result[-1]:
+            s = result[-1] + 1
+        if s <= max_idx:
+            result.append(s)
+    return result
+
+
+def _reverse_log_spread_ac(page_size: int, n_ac: int) -> list[int]:
+    """Doubling-gap AC indices from high end: [8, 12, 14] style (mirror of log)."""
+    if n_ac == 0:
+        return []
+    max_idx = page_size - 1
+    # Offsets from max_idx: 1, 3, 7, 15, ...
+    offsets = [2 ** (k + 1) - 1 for k in range(n_ac)]
+    if offsets[-1] > max_idx - 1:  # must keep idx >= 1
+        scale = (max_idx - 1) / offsets[-1]
+        offsets = [max(1, round(o * scale)) for o in offsets]
+        deduped: list[int] = []
+        for o in offsets:
+            if deduped and o <= deduped[-1]:
+                o = deduped[-1] + 1
+            deduped.append(o)
+        offsets = deduped
+    return sorted(max_idx - o for o in offsets)
+
+
 def compute_all_scores(
     per_token_scores: torch.Tensor,  # [bsz, kv_heads, num_pages, page_size]
     proxy_scores: dict[str, torch.Tensor],
@@ -279,7 +321,7 @@ def compute_all_scores(
     Returns dict of [bsz, kv_heads, num_pages] tensors.
     """
     import numpy as np
-    from dct_page_attention import dct
+    from dct_page_attention import dct, _resolve_frequency_keep_indices
 
     lambdas = lambdas or [0.5, 1.0, 2.0]
     betas = betas or [0.25, 0.5, 1.0]
@@ -309,11 +351,30 @@ def compute_all_scores(
             scores[f"proxy_dc_ac_{lam}"] = dc + lam * proxy_ac
 
         # --- Exp A: Spread Layout Oracle ---
-        # Sample AC coefficients uniformly across the spectrum instead of low-only
-        spread_ac_idx = np.linspace(1, page_size - 1, num=comp_size - 1, dtype=int).tolist()
+        # Use the same frequency indices as the spread proxy (Exp F) for a fair oracle
+        spread_freq_idx = _resolve_frequency_keep_indices(page_size, comp_size, "spread")
+        spread_ac_idx = [i for i in spread_freq_idx if i != 0]  # AC only (exclude DC)
         spread_ac = dct_scores[..., spread_ac_idx].pow(2).sum(-1).sqrt()
         for lam in lambdas:
             scores[f"spread_dc_ac_{lam}"] = dc + lam * spread_ac
+
+        # --- Exp F (from proxy): Spread Layout Proxy ---
+        for lam in lambdas:
+            scores[f"spread_proxy_dc_ac_{lam}"] = proxy_scores[f"spread_proxy_dc_ac_{lam}"]
+        scores["spread_proxy_max"] = proxy_scores["spread_proxy_max"]
+        scores["spread_proxy_mean"] = proxy_scores["spread_proxy_mean"]
+
+        # --- Exp G: Log-Spread Oracle (dense near low freqs) ---
+        log_ac_idx = _log_spread_ac(page_size, comp_size - 1)
+        log_ac = dct_scores[..., log_ac_idx].pow(2).sum(-1).sqrt()
+        for lam in lambdas:
+            scores[f"log_spread_dc_ac_{lam}"] = dc + lam * log_ac
+
+        # --- Exp H: Reverse-Log-Spread Oracle (dense near high freqs) ---
+        rlog_ac_idx = _reverse_log_spread_ac(page_size, comp_size - 1)
+        rlog_ac = dct_scores[..., rlog_ac_idx].pow(2).sum(-1).sqrt()
+        for lam in lambdas:
+            scores[f"reverse_log_spread_dc_ac_{lam}"] = dc + lam * rlog_ac
 
         # --- Exp B: Oracle Score-Space Parseval Correction ---
         # By Parseval: sum_k dct_scores[k]^2 = sum_i per_token_scores[i]^2
@@ -502,7 +563,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sink_size", type=int, default=4)
     p.add_argument("--recent_size", type=int, default=128)
     p.add_argument("--compress_ratio", type=float, default=0.125)
-    p.add_argument("--lambdas", default="0.5,1.0,1.5,2.0",
+    p.add_argument("--lambdas", default="0.25,0.5,1.0,1.5,2.0",
                    help="Comma-separated lambda values for DC+AC scoring")
     p.add_argument("--betas", default="0.25,0.5,1.0",
                    help="Comma-separated beta values for residual correction experiments")
@@ -630,6 +691,18 @@ def main() -> None:
         # Exp F: spread proxy DC+AC
         all_methods += [f"spread_proxy_dc_ac_{lam}" for lam in lambdas]
         all_methods += ["spread_proxy_max", "spread_proxy_mean"]
+        # Exp G: log-spread oracle (dense near low freqs)
+        all_methods += [f"log_spread_dc_ac_{lam}" for lam in lambdas]
+        # Exp H: reverse-log-spread oracle (dense near high freqs)
+        all_methods += [f"reverse_log_spread_dc_ac_{lam}" for lam in lambdas]
+
+    if comp_size > 1:
+        from dct_page_attention import _resolve_frequency_keep_indices
+        print(f"Frequency indices (comp_size={comp_size}, page_size={args.page_size}):")
+        print(f"  low (proxy_dc_ac):              [0] + {list(range(1, comp_size))}")
+        print(f"  spread (spread_dc_ac):          {_resolve_frequency_keep_indices(args.page_size, comp_size, 'spread')}")
+        print(f"  log_spread (log_spread_dc_ac):  [0] + {_log_spread_ac(args.page_size, comp_size - 1)}")
+        print(f"  reverse_log (rev_log_dc_ac):    [0] + {_reverse_log_spread_ac(args.page_size, comp_size - 1)}")
 
     print(f"Applying DCT page attention patch (scoring=max, group_agg=max)...")
     print(f"Ground truths: {gt_names}")
