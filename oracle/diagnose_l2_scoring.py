@@ -205,13 +205,20 @@ def compute_proxy_scores(
     paged_k: torch.Tensor,        # [bsz, kv_heads, num_pages, page_size, head_dim]
     num_kv_groups: int,
     comp_size: int,
+    lambdas: list[float] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Simulate proxy scoring with DCT compression, group_agg=max.
 
-    Returns dict with proxy_max and proxy_mean: [bsz, kv_heads, num_pages] float32.
+    Returns dict with proxy_max, proxy_mean, and spread proxy DC+AC variants.
+    All values are [bsz, kv_heads, num_pages] float32.
     """
-    from dct_page_attention import _build_dct_projection_matrix, _dct_page_cfg
+    from dct_page_attention import (
+        _build_dct_projection_matrix,
+        _build_dct_spectral_projection_matrix,
+        _dct_page_cfg,
+    )
 
+    lambdas = lambdas or [0.5, 1.0, 2.0]
     bsz, num_heads, _, head_dim = query_states.shape
     _, kv_heads, num_pages, page_size, _ = paged_k.shape
     scaling = head_dim ** -0.5
@@ -232,7 +239,28 @@ def compute_proxy_scores(
     proxy_max = dots_gagg.max(dim=-1).values
     proxy_mean = dots_gagg.mean(dim=-1)
 
-    return {"proxy_max": proxy_max, "proxy_mean": proxy_mean}
+    result = {"proxy_max": proxy_max, "proxy_mean": proxy_mean}
+
+    # --- Exp F: Spread Layout Proxy ---
+    # Build spectral projection with spread layout, compute DC+AC from those coefficients
+    if comp_size > 1:
+        M_spread = _build_dct_spectral_projection_matrix(
+            page_size, comp_size, paged_k.device, paged_k.dtype, "spread",
+        )
+        comp_k_spread = torch.einsum('cs,bhnsd->bhncd', M_spread.float(), paged_k.float())
+        dots_spread = torch.einsum('bhgd,bhncd->bhgnc', q * scaling, comp_k_spread)
+        dots_spread_gagg = dots_spread.max(dim=2).values  # [bsz, kv_heads, num_pages, comp_size]
+
+        spread_dc = dots_spread_gagg[..., 0]
+        spread_ac = dots_spread_gagg[..., 1:].pow(2).sum(-1).sqrt()
+        for lam in lambdas:
+            result[f"spread_proxy_dc_ac_{lam}"] = spread_dc + lam * spread_ac
+
+        # Also add spread proxy max/mean for reference
+        result["spread_proxy_max"] = dots_spread_gagg.max(dim=-1).values
+        result["spread_proxy_mean"] = dots_spread_gagg.mean(dim=-1)
+
+    return result
 
 
 def compute_all_scores(
@@ -241,12 +269,21 @@ def compute_all_scores(
     output_contrib: torch.Tensor | None,  # [bsz, kv_heads, num_pages] or None
     lambdas: list[float] | None = None,
     comp_size: int | None = None,
+    paged_k: torch.Tensor | None = None,        # [bsz, kv_heads, num_pages, page_size, head_dim]
+    query_states: torch.Tensor | None = None,    # [bsz, num_heads, 1, head_dim]
+    num_kv_groups: int | None = None,
+    betas: list[float] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute all page scoring variants. All use group_agg=max.
 
     Returns dict of [bsz, kv_heads, num_pages] tensors.
     """
+    import numpy as np
     from dct_page_attention import dct
+
+    lambdas = lambdas or [0.5, 1.0, 2.0]
+    betas = betas or [0.25, 0.5, 1.0]
+    page_size = per_token_scores.shape[-1]
 
     scores = {
         "oracle_max": per_token_scores.max(dim=-1).values,
@@ -261,14 +298,97 @@ def compute_all_scores(
     dct_scores = dct(per_token_scores.float())  # [bsz, kv_heads, num_pages, page_size]
     dc = dct_scores[..., 0]                          # signed
     ac = dct_scores[..., 1:].pow(2).sum(-1).sqrt()   # unsigned
-    for lam in (lambdas or [0.5, 1.0, 2.0]):
+    for lam in lambdas:
         scores[f"dc_ac_{lam}"] = dc + lam * ac
 
     # Proxy DC+AC: use only coefficients 0..comp_size-1 (what the proxy sees)
     if comp_size is not None and comp_size > 1:
-        proxy_ac = dct_scores[..., 1:comp_size].pow(2).sum(-1).sqrt()
-        for lam in (lambdas or [0.5, 1.0, 2.0]):
+        proxy_ac_sq = dct_scores[..., 1:comp_size].pow(2).sum(-1)  # keep squared for reuse
+        proxy_ac = proxy_ac_sq.sqrt()
+        for lam in lambdas:
             scores[f"proxy_dc_ac_{lam}"] = dc + lam * proxy_ac
+
+        # --- Exp A: Spread Layout Oracle ---
+        # Sample AC coefficients uniformly across the spectrum instead of low-only
+        spread_ac_idx = np.linspace(1, page_size - 1, num=comp_size - 1, dtype=int).tolist()
+        spread_ac = dct_scores[..., spread_ac_idx].pow(2).sum(-1).sqrt()
+        for lam in lambdas:
+            scores[f"spread_dc_ac_{lam}"] = dc + lam * spread_ac
+
+        # --- Exp B: Oracle Score-Space Parseval Correction ---
+        # By Parseval: sum_k dct_scores[k]^2 = sum_i per_token_scores[i]^2
+        # So exact missing AC energy = l2_energy^2 - sum_{k<c} dct_scores[k]^2
+        l2_sq = per_token_scores.pow(2).sum(dim=-1)  # [bsz, kv_heads, num_pages]
+        known_sq = dct_scores[..., :comp_size].pow(2).sum(dim=-1)
+        residual_score = (l2_sq - known_sq).clamp(min=0)
+        for lam in lambdas:
+            for beta in betas:
+                scores[f"parseval_{lam}_b{beta}"] = dc + lam * (proxy_ac_sq + beta * residual_score).sqrt()
+
+        # --- Exp C: Key-Space Cauchy-Schwarz Correction ---
+        # ||q||^2 * (||K||_F^2 - ||K_tilde[:c]||_F^2) bounds missing score energy
+        if paged_k is not None and query_states is not None and num_kv_groups is not None:
+            bsz, kv_heads = paged_k.shape[:2]
+            head_dim = paged_k.shape[-1]
+            scaling = head_dim ** -0.5
+
+            # Per-page key Frobenius norm squared: [bsz, kv_heads, num_pages]
+            page_fro_sq = paged_k.float().pow(2).sum(dim=(-2, -1))
+
+            # Retained spectral coefficient energy via DCT of keys
+            # K_tilde[k] shape: [head_dim] per page — ||K_tilde[k]||^2 summed over k<c
+            # DCT along page_size dim: transpose so page_size is last, apply dct, transpose back
+            k_float = paged_k.float()  # [bsz, kv_heads, num_pages, page_size, head_dim]
+            k_for_dct = k_float.transpose(-2, -1)  # [..., head_dim, page_size]
+            k_dct = dct(k_for_dct).transpose(-2, -1)  # [..., page_size, head_dim]
+            retained_energy = k_dct[..., :comp_size, :].pow(2).sum(dim=(-2, -1))  # [bsz, kv, pages]
+            residual_key = (page_fro_sq - retained_energy).clamp(min=0)
+
+            # q norm squared per kv_head (max across group): [bsz, kv_heads]
+            q = query_states.squeeze(2).float()  # [bsz, num_heads, head_dim]
+            q_scaled = q * scaling
+            q_norm_sq = q_scaled.pow(2).sum(-1)  # [bsz, num_heads]
+            q_norm_sq = q_norm_sq.reshape(bsz, kv_heads, num_kv_groups).max(dim=-1).values  # [bsz, kv_heads]
+
+            cs_correction = q_norm_sq.unsqueeze(-1) * residual_key  # [bsz, kv_heads, num_pages]
+            for lam in lambdas:
+                for beta in betas:
+                    scores[f"cs_key_{lam}_b{beta}"] = dc + lam * (proxy_ac_sq + beta * cs_correction).sqrt()
+
+            # --- Exp D: Diagonal Gram Proxy ---
+            # diag(K^T K) per page, then q^T diag q estimates l2_energy^2
+            diag_gram = k_float.pow(2).sum(dim=3)  # [bsz, kv_heads, num_pages, head_dim]
+            q_sq = q_scaled.pow(2).reshape(bsz, kv_heads, num_kv_groups, head_dim)
+
+            # l2_sq estimate: [bsz, kv_heads, num_kv_groups, num_pages]
+            l2_sq_est = torch.einsum('bhgd,bhnd->bhgn', q_sq, diag_gram)
+            l2_sq_est = l2_sq_est.max(dim=2).values  # group_agg=max: [bsz, kv_heads, num_pages]
+
+            # known_sq is already group-agg'd (from dct_scores which used group_agg'd per_token_scores)
+            residual_diag = (l2_sq_est - known_sq).clamp(min=0)
+            for lam in lambdas:
+                for beta in betas:
+                    scores[f"diag_gram_{lam}_b{beta}"] = dc + lam * (proxy_ac_sq + beta * residual_diag).sqrt()
+
+        # --- Exp E: Per-Frequency Discrimination Analysis ---
+        # Rank correlation of each DCT coefficient with oracle_max (stored as metadata)
+        gt_scores = per_token_scores.max(dim=-1).values  # oracle_max: [bsz, kv_heads, num_pages]
+        freq_corrs = []
+        for k in range(page_size):
+            coeff_k = dct_scores[..., k].abs()  # [bsz, kv_heads, num_pages]
+            # Spearman = Pearson on ranks; compute per head then average
+            corrs = []
+            for b in range(coeff_k.shape[0]):
+                for h in range(coeff_k.shape[1]):
+                    x = coeff_k[b, h]
+                    y = gt_scores[b, h]
+                    rx = x.argsort(descending=True).argsort().float()
+                    ry = y.argsort(descending=True).argsort().float()
+                    corr = torch.corrcoef(torch.stack([rx, ry]))[0, 1].item()
+                    corrs.append(corr)
+            freq_corrs.append(sum(corrs) / len(corrs))
+        # Store as a special entry (not a scoring method)
+        scores["_freq_discrimination"] = freq_corrs
 
     if output_contrib is not None:
         scores["output_contribution"] = output_contrib
@@ -382,8 +502,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sink_size", type=int, default=4)
     p.add_argument("--recent_size", type=int, default=128)
     p.add_argument("--compress_ratio", type=float, default=0.125)
-    p.add_argument("--lambdas", default="0.5,1.0,1.5,2.0,2.5,3.0,4.0",
+    p.add_argument("--lambdas", default="0.5,1.0,1.5,2.0",
                    help="Comma-separated lambda values for DC+AC scoring")
+    p.add_argument("--betas", default="0.25,0.5,1.0",
+                   help="Comma-separated beta values for residual correction experiments")
     return p.parse_args()
 
 
@@ -489,12 +611,25 @@ def main() -> None:
     gt_names = resolve_ground_truths(args.ground_truths)
     lambdas = [float(x.strip()) for x in args.lambdas.split(",") if x.strip()]
 
+    betas = [float(x.strip()) for x in args.betas.split(",") if x.strip()]
+
     all_methods = ["oracle_max", "oracle_mean", "proxy_max", "proxy_mean", "l2_energy",
                    "output_contribution"]
     all_methods += [f"dc_ac_{lam}" for lam in lambdas]
     comp_size = max(1, int(args.page_size * args.compress_ratio))
     if comp_size > 1:
         all_methods += [f"proxy_dc_ac_{lam}" for lam in lambdas]
+        # Exp A: spread layout oracle
+        all_methods += [f"spread_dc_ac_{lam}" for lam in lambdas]
+        # Exp B: Parseval correction
+        all_methods += [f"parseval_{lam}_b{beta}" for lam in lambdas for beta in betas]
+        # Exp C: key-space CS correction
+        all_methods += [f"cs_key_{lam}_b{beta}" for lam in lambdas for beta in betas]
+        # Exp D: diagonal Gram proxy
+        all_methods += [f"diag_gram_{lam}_b{beta}" for lam in lambdas for beta in betas]
+        # Exp F: spread proxy DC+AC
+        all_methods += [f"spread_proxy_dc_ac_{lam}" for lam in lambdas]
+        all_methods += ["spread_proxy_max", "spread_proxy_mean"]
 
     print(f"Applying DCT page attention patch (scoring=max, group_agg=max)...")
     print(f"Ground truths: {gt_names}")
@@ -574,6 +709,7 @@ def main() -> None:
                 )
                 proxy_scores = compute_proxy_scores(
                     r["query_states"], r["paged_k"], r["num_kv_groups"], comp_size,
+                    lambdas=lambdas,
                 )
 
                 # Always compute output_contribution (needed as GT or method)
@@ -587,12 +723,29 @@ def main() -> None:
                 all_scores = compute_all_scores(
                     per_token_scores, proxy_scores, output_contrib, lambdas,
                     comp_size=comp_size,
+                    paged_k=r["paged_k"],
+                    query_states=r["query_states"],
+                    num_kv_groups=r["num_kv_groups"],
+                    betas=betas,
                 )
                 scored_samples.append((sample, r["actual_top_k"], all_scores))
 
             if not scored_samples:
                 print(f"  No results for {task}")
                 continue
+
+            # --- Exp E: Print per-frequency discrimination (averaged across samples) ---
+            freq_data = [scores.get("_freq_discrimination") for _, _, scores in scored_samples
+                         if "_freq_discrimination" in scores]
+            if freq_data:
+                import numpy as _np
+                avg_corr = _np.mean(freq_data, axis=0)
+                print(f"\n  Per-frequency Spearman correlation with oracle_max (task={task}):")
+                print(f"    {'freq':>4s}  {'corr':>6s}")
+                for k, c in enumerate(avg_corr):
+                    marker = " *" if k < comp_size else ""
+                    print(f"    {k:4d}  {c:+.4f}{marker}")
+                print(f"    (* = retained by proxy with comp_size={comp_size})")
 
             # Analyze against each ground truth
             for gt_name in gt_names:
@@ -629,7 +782,7 @@ def main() -> None:
                 print(f"  Pages: {task_summary['num_pages']}, Top-k: {task_summary['actual_top_k']}")
                 for m in methods:
                     print(
-                        f"  {m:22s}  "
+                        f"  {m:30s}  "
                         f"recall={task_summary[f'{m}_recall_avg']:.3f}  "
                         f"FP={task_summary[f'{m}_false_positive_count_avg']:.1f}  "
                         f"FN={task_summary[f'{m}_false_negative_count_avg']:.1f}  "
