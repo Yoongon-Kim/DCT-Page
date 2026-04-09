@@ -346,8 +346,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output_dir", type=Path, default=Path("results/results_ruler/l2_diagnostic"))
     p.add_argument("--tasks", default="cwe", help="Comma-separated task names or 'all'")
     p.add_argument("--num_samples", type=int, default=10)
-    p.add_argument("--max_new_tokens", type=int, default=1,
-                   help="Only need 1 token to capture first decode step")
+    p.add_argument("--max_new_tokens", type=int, default=2,
+                   help="Need >=2: token 1 comes from prefill, token 2 triggers first decode step")
     p.add_argument("--cuda_device", type=int, default=0)
     p.add_argument("--local_files_only", action="store_true")
     p.add_argument(
