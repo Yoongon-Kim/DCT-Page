@@ -44,9 +44,9 @@ def parse_args() -> argparse.Namespace:
                         "Forwarded to run_ruler_eval.py as --data_root.")
     p.add_argument("--output_root", type=Path, default=Path("results/results_ruler/oracle_hybrid"))
     p.add_argument("--tag", default="oracle_hybrid")
-    p.add_argument("--page_sizes", default="32")
-    p.add_argument("--top_k", type=int, default=64,
-                   help="Number of pages selected per query (applied to every page_size in the sweep).")
+    p.add_argument("--combos", nargs="+", default=["16,128", "32,64", "64,32"],
+                   help="Space-separated page_size,top_k pairs. "
+                        "E.g. '16,128 32,64 64,32'.")
     p.add_argument("--compress_ratio", type=float, default=0.125)
     p.add_argument(
         "--weight_pop",
@@ -69,8 +69,15 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def parse_csv_ints(value: str) -> list[int]:
-    return [int(x.strip()) for x in value.split(",") if x.strip()]
+def parse_combos(values: list[str]) -> list[tuple[int, int]]:
+    """Parse 'page_size,top_k' pairs, e.g. ['16,128', '32,64', '64,32']."""
+    combos = []
+    for v in values:
+        parts = v.strip().split(",")
+        if len(parts) != 2:
+            raise ValueError(f"Each combo must be page_size,top_k — got {v!r}")
+        combos.append((int(parts[0]), int(parts[1])))
+    return combos
 
 
 def parse_weight_pop(value: str) -> list[bool]:
@@ -253,16 +260,24 @@ def main() -> None:
     # paths resolve correctly.
     script_path = Path(__file__).resolve().parent / "run_ruler_eval.py"
     repo_root = Path(__file__).resolve().parent.parent
-    page_sizes = parse_csv_ints(args.page_sizes)
+    combos = parse_combos(args.combos)
     weight_pops = parse_weight_pop(args.weight_pop)
     tasks = resolve_tasks(args.tasks)
 
     for weight_pop in weight_pops:
-        for page_size in page_sizes:
-            top_k = args.top_k
+        for page_size, top_k in combos:
             run_root = make_run_root(
                 args.output_root, page_size, top_k, args.compress_ratio, args.compression_method, weight_pop
             )
+
+            if (run_root / "summary.json").exists():
+                print(
+                    f"\n[oracle_hybrid] SKIP page_size={page_size} top_k={top_k} "
+                    f"cr={args.compress_ratio} weight_pop={int(weight_pop)} "
+                    f"— summary already exists in {run_root}",
+                    flush=True,
+                )
+                continue
 
             manifest = {
                 "model_name_or_path": args.model_name_or_path,
