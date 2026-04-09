@@ -239,11 +239,14 @@ def compute_all_scores(
     per_token_scores: torch.Tensor,  # [bsz, kv_heads, num_pages, page_size]
     proxy_scores: dict[str, torch.Tensor],
     output_contrib: torch.Tensor | None,  # [bsz, kv_heads, num_pages] or None
+    lambdas: list[float] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute all page scoring variants. All use group_agg=max.
 
     Returns dict of [bsz, kv_heads, num_pages] tensors.
     """
+    from dct_page_attention import dct
+
     scores = {
         "oracle_max": per_token_scores.max(dim=-1).values,
         "oracle_mean": per_token_scores.mean(dim=-1),
@@ -251,6 +254,15 @@ def compute_all_scores(
         "proxy_mean": proxy_scores["proxy_mean"],
         "l2_energy": per_token_scores.pow(2).sum(dim=-1).sqrt(),
     }
+
+    # Oracle DC+AC: apply DCT to per-token scores along page_size dim.
+    # By linearity: DCT(⟨q, K⟩)[k] = ⟨q, K̃[k]⟩
+    dct_scores = dct(per_token_scores.float())  # [bsz, kv_heads, num_pages, page_size]
+    dc = dct_scores[..., 0]                          # signed
+    ac = dct_scores[..., 1:].pow(2).sum(-1).sqrt()   # unsigned
+    for lam in (lambdas or [0.5, 1.0, 2.0]):
+        scores[f"dc_ac_{lam}"] = dc + lam * ac
+
     if output_contrib is not None:
         scores["output_contribution"] = output_contrib
     return scores
@@ -365,6 +377,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sink_size", type=int, default=4)
     p.add_argument("--recent_size", type=int, default=128)
     p.add_argument("--compress_ratio", type=float, default=0.125)
+    p.add_argument("--lambdas", default="0.5,1.0,2.0,2.5,3.0,4.0",
+                   help="Comma-separated lambda values for DC+AC scoring")
     return p.parse_args()
 
 
@@ -469,8 +483,10 @@ def main() -> None:
     )
 
     # Methods to compare (exclude the ground truth itself from the comparison list)
+    lambdas = [float(x.strip()) for x in args.lambdas.split(",") if x.strip()]
     all_methods = ["oracle_max", "oracle_mean", "proxy_max", "proxy_mean", "l2_energy",
                    "output_contribution"]
+    all_methods += [f"dc_ac_{lam}" for lam in lambdas]
     methods = [m for m in all_methods if m != gt_name]
 
     print(f"Applying DCT page attention patch (scoring=max, group_agg=max)...")
@@ -552,7 +568,7 @@ def main() -> None:
                     )
 
                 all_scores = compute_all_scores(
-                    per_token_scores, proxy_scores, output_contrib,
+                    per_token_scores, proxy_scores, output_contrib, lambdas,
                 )
                 analysis = analyze_one_sample(
                     all_scores, gt_name, methods, r["actual_top_k"],
