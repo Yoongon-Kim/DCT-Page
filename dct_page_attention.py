@@ -1254,6 +1254,14 @@ def dct_page_attention_forward(
                 "oracle_page_scores": oracle_page_scores.detach().float().cpu(),
                 "selection_used_oracle_page_scores": bool(cfg.select_with_oracle_page_scores),
                 "selected_indices": selected_indices.detach().cpu(),
+                "sink_k": sink_k,
+                "sink_v": sink_v,
+                "paged_k": paged_k,
+                "paged_v": paged_v,
+                "recent_k": recent_k,
+                "recent_v": recent_v,
+                "query_states": query_states,
+                "num_kv_groups": int(self.num_key_value_groups),
             }
         )
 
