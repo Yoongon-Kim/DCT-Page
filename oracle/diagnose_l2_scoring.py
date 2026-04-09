@@ -240,6 +240,7 @@ def compute_all_scores(
     proxy_scores: dict[str, torch.Tensor],
     output_contrib: torch.Tensor | None,  # [bsz, kv_heads, num_pages] or None
     lambdas: list[float] | None = None,
+    comp_size: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute all page scoring variants. All use group_agg=max.
 
@@ -262,6 +263,12 @@ def compute_all_scores(
     ac = dct_scores[..., 1:].pow(2).sum(-1).sqrt()   # unsigned
     for lam in (lambdas or [0.5, 1.0, 2.0]):
         scores[f"dc_ac_{lam}"] = dc + lam * ac
+
+    # Proxy DC+AC: use only coefficients 0..comp_size-1 (what the proxy sees)
+    if comp_size is not None and comp_size > 1:
+        proxy_ac = dct_scores[..., 1:comp_size].pow(2).sum(-1).sqrt()
+        for lam in (lambdas or [0.5, 1.0, 2.0]):
+            scores[f"proxy_dc_ac_{lam}"] = dc + lam * proxy_ac
 
     if output_contrib is not None:
         scores["output_contribution"] = output_contrib
@@ -363,12 +370,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cuda_device", type=int, default=0)
     p.add_argument("--local_files_only", action="store_true")
     p.add_argument(
-        "--ground_truth",
-        default="oracle_max",
-        choices=GROUND_TRUTHS,
-        help="Ground truth for top-k comparison: "
-             "oracle_max (max per-token QK score) or "
-             "output_contribution (per-page attention output norm)",
+        "--ground_truths",
+        default="oracle_max,output_contribution",
+        help="Comma-separated ground truths to loop over (choices: "
+             + ", ".join(GROUND_TRUTHS) + ")",
     )
 
     # DCT page config
@@ -377,7 +382,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sink_size", type=int, default=4)
     p.add_argument("--recent_size", type=int, default=128)
     p.add_argument("--compress_ratio", type=float, default=0.125)
-    p.add_argument("--lambdas", default="0.5,1.0,2.0,2.5,3.0,4.0",
+    p.add_argument("--lambdas", default="0.5,1.0,1.5,2.0,2.5,3.0,4.0",
                    help="Comma-separated lambda values for DC+AC scoring")
     return p.parse_args()
 
@@ -470,27 +475,29 @@ def cleanup_model(model=None) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def resolve_ground_truths(value: str) -> list[str]:
+    requested = [x.strip() for x in value.split(",") if x.strip()]
+    unknown = [x for x in requested if x not in GROUND_TRUTHS]
+    if unknown:
+        raise ValueError(f"Unknown ground truths: {unknown}. Choose from {GROUND_TRUTHS}")
+    return requested
+
+
 def main() -> None:
     args = parse_args()
     tasks = resolve_tasks(args.tasks)
-    gt_name = args.ground_truth
-    run_dir = args.output_dir / f"ps{args.page_size}_topk{args.top_k}_gt_{gt_name}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    (run_dir / "config.json").write_text(
-        json.dumps(vars(args), ensure_ascii=False, indent=2, default=str) + "\n",
-        encoding="utf-8",
-    )
-
-    # Methods to compare (exclude the ground truth itself from the comparison list)
+    gt_names = resolve_ground_truths(args.ground_truths)
     lambdas = [float(x.strip()) for x in args.lambdas.split(",") if x.strip()]
+
     all_methods = ["oracle_max", "oracle_mean", "proxy_max", "proxy_mean", "l2_energy",
                    "output_contribution"]
     all_methods += [f"dc_ac_{lam}" for lam in lambdas]
-    methods = [m for m in all_methods if m != gt_name]
+    comp_size = max(1, int(args.page_size * args.compress_ratio))
+    if comp_size > 1:
+        all_methods += [f"proxy_dc_ac_{lam}" for lam in lambdas]
 
     print(f"Applying DCT page attention patch (scoring=max, group_agg=max)...")
-    print(f"Ground truth: {gt_name}")
+    print(f"Ground truths: {gt_names}")
     apply_patch(args)
 
     from dct_page_attention import set_dct_page_debug_hook
@@ -505,6 +512,17 @@ def main() -> None:
     model = load_model(args)
 
     recorder = L2DiagnosticRecorder()
+
+    # Create output dirs for each ground truth
+    run_dirs = {}
+    for gt_name in gt_names:
+        run_dir = args.output_dir / f"ps{args.page_size}_topk{args.top_k}_gt_{gt_name}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "config.json").write_text(
+            json.dumps(vars(args), ensure_ascii=False, indent=2, default=str) + "\n",
+            encoding="utf-8",
+        )
+        run_dirs[gt_name] = run_dir
 
     try:
         for task in tasks:
@@ -522,7 +540,8 @@ def main() -> None:
                 samples = [json.loads(line) for line in fp if line.strip()]
             samples = samples[:args.num_samples]
 
-            sample_results = []
+            # Collect all_scores per sample (inference once, analyze per GT)
+            scored_samples = []
             for idx, sample in enumerate(tqdm(samples, desc=f"  {task}"), start=1):
                 recorder.reset()
                 set_dct_page_debug_hook(recorder)
@@ -557,78 +576,86 @@ def main() -> None:
                     r["query_states"], r["paged_k"], r["num_kv_groups"], comp_size,
                 )
 
-                # Compute output_contribution if needed (as GT or as a method to compare)
-                output_contrib = None
-                if gt_name == "output_contribution" or "output_contribution" in methods:
-                    output_contrib = compute_output_contribution(
-                        r["query_states"], r["paged_k"], r["paged_v"],
-                        r["num_kv_groups"],
-                        sink_k=r["sink_k"], sink_v=r["sink_v"],
-                        recent_k=r["recent_k"], recent_v=r["recent_v"],
-                    )
+                # Always compute output_contribution (needed as GT or method)
+                output_contrib = compute_output_contribution(
+                    r["query_states"], r["paged_k"], r["paged_v"],
+                    r["num_kv_groups"],
+                    sink_k=r["sink_k"], sink_v=r["sink_v"],
+                    recent_k=r["recent_k"], recent_v=r["recent_v"],
+                )
 
                 all_scores = compute_all_scores(
                     per_token_scores, proxy_scores, output_contrib, lambdas,
+                    comp_size=comp_size,
                 )
-                analysis = analyze_one_sample(
-                    all_scores, gt_name, methods, r["actual_top_k"],
-                )
-                analysis["sample_index"] = sample["index"]
-                sample_results.append(analysis)
+                scored_samples.append((sample, r["actual_top_k"], all_scores))
 
-                if idx % 5 == 0 or idx == len(samples):
-                    recalls = " ".join(
-                        f"{m}={analysis[f'{m}_recall_avg']:.3f}" for m in methods
-                    )
-                    print(f"  [{idx}/{len(samples)}] recall: {recalls}")
-
-            if not sample_results:
+            if not scored_samples:
                 print(f"  No results for {task}")
                 continue
 
-            # Aggregate across samples
-            n = len(sample_results)
-            task_summary = {
-                "task": task,
-                "ground_truth": gt_name,
-                "num_samples": n,
-                "num_pages": sample_results[0]["num_pages"],
-                "actual_top_k": sample_results[0]["actual_top_k"],
-            }
-            avg_keys = [k for k in sample_results[0] if k.endswith("_avg")]
-            for k in avg_keys:
-                task_summary[k] = sum(r[k] for r in sample_results) / n
+            # Analyze against each ground truth
+            for gt_name in gt_names:
+                methods = [m for m in all_methods if m != gt_name]
+                sample_results = []
 
-            print(f"\n  === {task} Summary (vs {gt_name}, group_agg=max) ===")
-            print(f"  Pages: {task_summary['num_pages']}, Top-k: {task_summary['actual_top_k']}")
-            for m in methods:
-                print(
-                    f"  {m:22s}  "
-                    f"recall={task_summary[f'{m}_recall_avg']:.3f}  "
-                    f"FP={task_summary[f'{m}_false_positive_count_avg']:.1f}  "
-                    f"FN={task_summary[f'{m}_false_negative_count_avg']:.1f}  "
-                    f"neg_gt={task_summary[f'{m}_neg_gt_in_topk_avg']:.2f}  "
-                    f"FN_rank={task_summary[f'{m}_fn_rank_mean_avg']:.1f}  "
-                    f"FN_gt_score={task_summary[f'{m}_fn_gt_score_mean_avg']:.4f}"
+                for i, (sample, actual_top_k, all_scores) in enumerate(scored_samples, start=1):
+                    analysis = analyze_one_sample(
+                        all_scores, gt_name, methods, actual_top_k,
+                    )
+                    analysis["sample_index"] = sample["index"]
+                    sample_results.append(analysis)
+
+                    if i % 5 == 0 or i == len(scored_samples):
+                        recalls = " ".join(
+                            f"{m}={analysis[f'{m}_recall_avg']:.3f}" for m in methods
+                        )
+                        print(f"  [{i}/{len(scored_samples)}] gt={gt_name} recall: {recalls}")
+
+                # Aggregate across samples
+                n = len(sample_results)
+                task_summary = {
+                    "task": task,
+                    "ground_truth": gt_name,
+                    "num_samples": n,
+                    "num_pages": sample_results[0]["num_pages"],
+                    "actual_top_k": sample_results[0]["actual_top_k"],
+                }
+                avg_keys = [k for k in sample_results[0] if k.endswith("_avg")]
+                for k in avg_keys:
+                    task_summary[k] = sum(r[k] for r in sample_results) / n
+
+                print(f"\n  === {task} Summary (vs {gt_name}, group_agg=max) ===")
+                print(f"  Pages: {task_summary['num_pages']}, Top-k: {task_summary['actual_top_k']}")
+                for m in methods:
+                    print(
+                        f"  {m:22s}  "
+                        f"recall={task_summary[f'{m}_recall_avg']:.3f}  "
+                        f"FP={task_summary[f'{m}_false_positive_count_avg']:.1f}  "
+                        f"FN={task_summary[f'{m}_false_negative_count_avg']:.1f}  "
+                        f"neg_gt={task_summary[f'{m}_neg_gt_in_topk_avg']:.2f}  "
+                        f"FN_rank={task_summary[f'{m}_fn_rank_mean_avg']:.1f}  "
+                        f"FN_gt_score={task_summary[f'{m}_fn_gt_score_mean_avg']:.4f}"
+                    )
+
+                run_dir = run_dirs[gt_name]
+                output = {
+                    "summary": task_summary,
+                    "samples": [
+                        {k: v for k, v in r.items() if k != "head_results"}
+                        for r in sample_results
+                    ],
+                }
+                (run_dir / f"{task}.json").write_text(
+                    json.dumps(output, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
                 )
-
-            output = {
-                "summary": task_summary,
-                "samples": [
-                    {k: v for k, v in r.items() if k != "head_results"}
-                    for r in sample_results
-                ],
-            }
-            (run_dir / f"{task}.json").write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            print(f"  Results saved to: {run_dir / f'{task}.json'}")
+                print(f"  Results saved to: {run_dir / f'{task}.json'}")
 
     finally:
         cleanup_model(model)
 
-    print(f"\nAll results in: {run_dir}")
+    print(f"\nAll results in: {[str(d) for d in run_dirs.values()]}")
 
 
 if __name__ == "__main__":

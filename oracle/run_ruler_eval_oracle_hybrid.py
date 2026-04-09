@@ -54,6 +54,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated 0/1 values to sweep --dct_weight_compressed_by_population. "
              "E.g. '0', '1', or '0,1' to run both.",
     )
+    p.add_argument("--compression_method", type=str, default="haar", choices=["haar", "dct"],
+                   help="Compression method for unselected pages: 'haar' (default) or 'dct'.")
+    p.add_argument("--scoring_method", type=str, default="max", choices=["mean", "max", "sum"],
+                   help="Per-page scoring aggregation: 'max' (default), 'mean', or 'sum'.")
+    p.add_argument("--group_agg_method", type=str, default="mean", choices=["mean", "max", "topp"],
+                   help="Cross-GQA-head aggregation: 'mean' (default), 'max', or 'topp'.")
     p.add_argument("--num_samples", type=int, default=25)
     p.add_argument("--max_new_tokens", type=int, default=128)
     p.add_argument("--tasks", default="all", help="'all' or comma-separated task names")
@@ -96,10 +102,11 @@ def make_run_root(
     page_size: int,
     top_k: int,
     compress_ratio: float,
+    compression_method: str,
     weight_pop: bool,
 ) -> Path:
     pop_tag = "popw" if weight_pop else "nopopw"
-    run_root = output_root / f"ps{page_size}_topk{top_k}_cr{compress_ratio}_{pop_tag}"
+    run_root = output_root / f"ps{page_size}_topk{top_k}_cr{compress_ratio}_{compression_method}_{pop_tag}"
     run_root.mkdir(parents=True, exist_ok=True)
     return run_root
 
@@ -113,6 +120,9 @@ def build_run_cmd(
     page_size: int,
     top_k: int,
     compress_ratio: float,
+    compression_method: str,
+    scoring_method: str,
+    group_agg_method: str,
     weight_pop: bool,
     data_root: Path,
     num_samples: int,
@@ -152,11 +162,14 @@ def build_run_cmd(
         "--dct_compress_ratio",
         str(compress_ratio),
         "--dct_scoring_method",
-        "max",
+        scoring_method,
         "--dct_group_agg_method",
-        "mean",
+        group_agg_method,
         "--dct_unselected_mode",
         "compressed",
+        "--dct_compression_method",
+        compression_method,
+        *(["--dct_score_use_low_proxy"] if compression_method == "dct" else []),
         "--dct_select_with_oracle_page_scores",
     ]
     if weight_pop:
@@ -248,7 +261,7 @@ def main() -> None:
         for page_size in page_sizes:
             top_k = args.top_k
             run_root = make_run_root(
-                args.output_root, page_size, top_k, args.compress_ratio, weight_pop
+                args.output_root, page_size, top_k, args.compress_ratio, args.compression_method, weight_pop
             )
 
             manifest = {
@@ -258,6 +271,9 @@ def main() -> None:
                 "top_k": top_k,
                 "compress_ratio": args.compress_ratio,
                 "weight_compressed_by_population": weight_pop,
+                "compression_method": args.compression_method,
+                "scoring_method": args.scoring_method,
+                "group_agg_method": args.group_agg_method,
                 "unselected_mode": "compressed",
                 "select_with_oracle_page_scores": True,
                 "num_samples": args.num_samples,
@@ -265,7 +281,7 @@ def main() -> None:
                 "cuda_device": args.cuda_device,
                 "tasks": tasks,
                 "assumption": "Oracle page selection + hybrid mode: selected pages use full tokens, "
-                "unselected pages use Haar lowpass proxy KV cache.",
+                f"unselected pages use {args.compression_method} compressed proxy KV cache.",
             }
             (run_root / "manifest.json").write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
@@ -281,6 +297,9 @@ def main() -> None:
                 page_size=page_size,
                 top_k=top_k,
                 compress_ratio=args.compress_ratio,
+                compression_method=args.compression_method,
+                scoring_method=args.scoring_method,
+                group_agg_method=args.group_agg_method,
                 weight_pop=weight_pop,
                 data_root=args.data_root,
                 num_samples=args.num_samples,
