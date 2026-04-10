@@ -238,12 +238,11 @@ def compute_proxy_scores(
 ) -> dict[str, torch.Tensor]:
     """Simulate proxy scoring with DCT compression, group_agg=max.
 
-    Returns dict with proxy_max, proxy_mean, and spread proxy DC+AC variants.
+    Returns dict with proxy_max and proxy_mean.
     All values are [bsz, kv_heads, num_pages] float32.
     """
     from dct_page_attention import (
         _build_dct_projection_matrix,
-        _build_dct_spectral_projection_matrix,
         _dct_page_cfg,
     )
 
@@ -268,28 +267,7 @@ def compute_proxy_scores(
     proxy_max = dots_gagg.max(dim=-1).values
     proxy_mean = dots_gagg.mean(dim=-1)
 
-    result = {"proxy_max": proxy_max, "proxy_mean": proxy_mean}
-
-    # --- Exp F: Spread Layout Proxy ---
-    # Build spectral projection with spread layout, compute DC+AC from those coefficients
-    if comp_size > 1:
-        M_spread = _build_dct_spectral_projection_matrix(
-            page_size, comp_size, paged_k.device, paged_k.dtype, "spread",
-        )
-        comp_k_spread = torch.einsum('cs,bhnsd->bhncd', M_spread.float(), paged_k.float())
-        dots_spread = torch.einsum('bhgd,bhncd->bhgnc', q * scaling, comp_k_spread)
-        dots_spread_gagg = dots_spread.max(dim=2).values  # [bsz, kv_heads, num_pages, comp_size]
-
-        spread_dc = dots_spread_gagg[..., 0]
-        spread_ac = dots_spread_gagg[..., 1:].pow(2).sum(-1).sqrt()
-        for lam in lambdas:
-            result[f"spread_proxy_dc_ac_{lam}"] = spread_dc + lam * spread_ac
-
-        # Also add spread proxy max/mean for reference
-        result["spread_proxy_max"] = dots_spread_gagg.max(dim=-1).values
-        result["spread_proxy_mean"] = dots_spread_gagg.mean(dim=-1)
-
-    return result
+    return {"proxy_max": proxy_max, "proxy_mean": proxy_mean}
 
 
 def _log_spread_ac(page_size: int, n_ac: int) -> list[int]:
@@ -404,12 +382,6 @@ def compute_all_scores(
         for lam in lambdas:
             scores[f"spread_dc_ac_{lam}"] = dc + lam * spread_ac
 
-        # --- Exp F (from proxy): Spread Layout Proxy ---
-        for lam in lambdas:
-            scores[f"spread_proxy_dc_ac_{lam}"] = proxy_scores[f"spread_proxy_dc_ac_{lam}"]
-        scores["spread_proxy_max"] = proxy_scores["spread_proxy_max"]
-        scores["spread_proxy_mean"] = proxy_scores["spread_proxy_mean"]
-
         # --- Exp G: Log-Spread Oracle (dense near low freqs) ---
         log_ac_idx = _log_spread_ac(page_size, comp_size - 1)
         log_ac = dct_scores[..., log_ac_idx].pow(2).sum(-1).sqrt()
@@ -421,16 +393,6 @@ def compute_all_scores(
         rlog_ac = dct_scores[..., rlog_ac_idx].pow(2).sum(-1).sqrt()
         for lam in lambdas:
             scores[f"reverse_log_spread_dc_ac_{lam}"] = dc + lam * rlog_ac
-
-        # --- Exp B: Oracle Score-Space Parseval Correction ---
-        # By Parseval: sum_k dct_scores[k]^2 = sum_i per_token_scores[i]^2
-        # So exact missing AC energy = l2_energy^2 - sum_{k<c} dct_scores[k]^2
-        l2_sq = per_token_scores.pow(2).sum(dim=-1)  # [bsz, kv_heads, num_pages]
-        known_sq = dct_scores[..., :comp_size].pow(2).sum(dim=-1)
-        residual_score = (l2_sq - known_sq).clamp(min=0)
-        for lam in lambdas:
-            for beta in betas:
-                scores[f"parseval_{lam}_b{beta}"] = dc + lam * (proxy_ac_sq + beta * residual_score).sqrt()
 
         # --- Exp C: Key-Space Cauchy-Schwarz Correction ---
         # ||q||^2 * (||K||_F^2 - ||K_tilde[:c]||_F^2) bounds missing score energy
@@ -471,7 +433,8 @@ def compute_all_scores(
             l2_sq_est = torch.einsum('bhgd,bhnd->bhgn', q_sq, diag_gram)
             l2_sq_est = l2_sq_est.max(dim=2).values  # group_agg=max: [bsz, kv_heads, num_pages]
 
-            # known_sq is already group-agg'd (from dct_scores which used group_agg'd per_token_scores)
+            # known_sq: energy of retained DCT score coefficients (group-agg'd via per_token_scores)
+            known_sq = dct_scores[..., :comp_size].pow(2).sum(dim=-1)  # [bsz, kv_heads, num_pages]
             residual_diag = (l2_sq_est - known_sq).clamp(min=0)
             for lam in lambdas:
                 for beta in betas:
@@ -496,6 +459,56 @@ def compute_all_scores(
             freq_corrs.append(sum(corrs) / len(corrs))
         # Store as a special entry (not a scoring method)
         scores["_freq_discrimination"] = freq_corrs
+
+        # --- Approach 3: DCT Residual Energy Profile (Query-Adaptive) ---
+        # Instead of isotropic correction (Exp C: ||q||^2 * scalar), use
+        # per-dimension missing energy: diag(C_missing)[d] = sum_{k>=c} K_tilde[k][d]^2
+        # Then: missing_AC^2 = sum_d q_d^2 * diag(C_missing)[d]  (diagonal approx of q^T C_missing q)
+        if paged_k is not None and query_states is not None and num_kv_groups is not None:
+            # k_dct already computed in Exp C: [bsz, kv_heads, num_pages, page_size, head_dim]
+            # Per-dimension residual energy from missing DCT coefficients
+            residual_diag_profile = k_dct[..., comp_size:, :].pow(2).sum(dim=-2)  # [bsz, kv, N, head_dim]
+
+            # DC scores per group head (not yet group-agg'd)
+            q_r = q_scaled.reshape(bsz, kv_heads, num_kv_groups, head_dim)
+            dc_per_group = torch.einsum('bhgd,bhnd->bhgn', q_r, k_dct[..., 0, :])  # [bsz, kv, G, N]
+
+            # Query-adaptive missing AC: sqrt(sum_d q_d^2 * residual_diag[d])
+            q_r_sq = q_r.pow(2)  # [bsz, kv, G, head_dim]
+            missing_ac_sq = torch.einsum('bhgd,bhnd->bhgn', q_r_sq, residual_diag_profile)  # [bsz, kv, G, N]
+            missing_ac = missing_ac_sq.clamp(min=0).sqrt()
+
+            for lam in lambdas:
+                scores[f"residual_profile_{lam}"] = (dc_per_group + lam * missing_ac).max(dim=2).values
+
+        # --- Approach 5: Adaptive DCT Frequency Selection Per Page ---
+        # Keep DC + the AC coefficient with the most key-space energy per page
+        if paged_k is not None and query_states is not None and num_kv_groups is not None:
+            # Per-frequency AC key energy: ||K_tilde[k]||^2 for k >= 1
+            ac_key_energies = k_dct[..., 1:, :].pow(2).sum(dim=-1)  # [bsz, kv, N, page_size-1]
+            best_ac_rel = ac_key_energies.argmax(dim=-1)  # [bsz, kv, N]
+
+            # Gather best AC key vector per page
+            # k_dct shape: [bsz, kv, N, page_size, head_dim]
+            best_ac_abs = best_ac_rel + 1  # shift to absolute frequency index
+            best_ac_idx = best_ac_abs.unsqueeze(-1).unsqueeze(-1).expand(
+                *best_ac_abs.shape, 1, head_dim
+            )  # [bsz, kv, N, 1, head_dim]
+            k_best_ac = k_dct.gather(-2, best_ac_idx).squeeze(-2)  # [bsz, kv, N, head_dim]
+
+            # q_r already computed above: [bsz, kv, G, head_dim]
+            ac_best_score = torch.einsum('bhgd,bhnd->bhgn', q_r, k_best_ac).abs()  # [bsz, kv, G, N]
+            for lam in lambdas:
+                scores[f"adaptive_freq_{lam}"] = (dc_per_group + lam * ac_best_score).max(dim=2).values
+
+        # --- Approach 6: Refined Cauchy-Schwarz Beta ---
+        # Exp C uses beta in [0.25, 0.5, 1.0], but E[(q·K_tilde[k])^2] = ||q||^2 * ||K_tilde[k]||^2 / head_dim
+        # => beta_optimal ~ 1/head_dim ~ 0.008 for head_dim=128. Current betas overestimate by 30-125x.
+        if paged_k is not None and query_states is not None and num_kv_groups is not None:
+            refined_betas = [0.004, 0.008, 0.012, 0.016, 0.023]
+            for lam in lambdas:
+                for rbeta in refined_betas:
+                    scores[f"cs_refined_{lam}_b{rbeta}"] = dc + lam * (proxy_ac_sq + rbeta * cs_correction).sqrt()
 
     if output_contrib is not None:
         scores["output_contribution"] = output_contrib
@@ -595,6 +608,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_decode_steps", type=int, default=10,
                    help="Number of decode steps to evaluate. Recall is averaged across steps.")
     p.add_argument("--cuda_device", type=int, default=0)
+    p.add_argument("--device_map", type=str, default=None,
+                   help="HF device_map string (e.g. 'auto'). Overrides --cuda_device.")
     p.add_argument("--local_files_only", action="store_true")
     p.add_argument(
         "--ground_truths",
@@ -641,10 +656,11 @@ def load_model(args: argparse.Namespace):
             },
             "max_position_embeddings": 131072,
         }
+    device_map = {"": args.cuda_device} if args.device_map is None else args.device_map
     return AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         torch_dtype=torch.bfloat16,
-        device_map={"": args.cuda_device},
+        device_map=device_map,
         attn_implementation="sdpa",
         local_files_only=args.local_files_only,
         **yarn_kwargs,
@@ -712,10 +728,18 @@ def _score_one_layer(
     if pageable_len < page_size:
         return None
 
+    # When using device_map="auto", tensors may be on different GPUs.
+    # Use the attention module's device (where q_proj lives) as the scoring device,
+    # and move all tensors there.
+    score_device = next(attn_module.parameters()).device
+    key_states = key_states.to(score_device)
+    value_states = value_states.to(score_device)
+    hidden_states = hidden_states.to(score_device)
+
     sink_k, sink_v, paged_k, paged_v, recent_k, recent_v, num_pages = \
         segment_kv_from_cache(key_states, value_states, page_size, sink_size, recent_size)
 
-    query_states = recompute_query(attn_module, hidden_states, kv_len, config, device, dtype)
+    query_states = recompute_query(attn_module, hidden_states, kv_len, config, score_device, dtype)
 
     per_token_scores = compute_per_token_scores(query_states, paged_k, num_kv_groups)
     proxy_scores = compute_proxy_scores(
@@ -752,19 +776,21 @@ def main() -> None:
         all_methods += [f"weighted_proxy_dc_ac_{lam}" for lam in lambdas]
         # Exp A: spread layout oracle
         all_methods += [f"spread_dc_ac_{lam}" for lam in lambdas]
-        # Exp B: Parseval correction
-        all_methods += [f"parseval_{lam}_b{beta}" for lam in lambdas for beta in betas]
         # Exp C: key-space CS correction
         all_methods += [f"cs_key_{lam}_b{beta}" for lam in lambdas for beta in betas]
         # Exp D: diagonal Gram proxy
         all_methods += [f"diag_gram_{lam}_b{beta}" for lam in lambdas for beta in betas]
-        # Exp F: spread proxy DC+AC
-        all_methods += [f"spread_proxy_dc_ac_{lam}" for lam in lambdas]
-        all_methods += ["spread_proxy_max", "spread_proxy_mean"]
         # Exp G: log-spread oracle (dense near low freqs)
         all_methods += [f"log_spread_dc_ac_{lam}" for lam in lambdas]
         # Exp H: reverse-log-spread oracle (dense near high freqs)
         all_methods += [f"reverse_log_spread_dc_ac_{lam}" for lam in lambdas]
+        # Approach 3: DCT Residual Energy Profile (query-adaptive)
+        all_methods += [f"residual_profile_{lam}" for lam in lambdas]
+        # Approach 5: Adaptive DCT Frequency Selection
+        all_methods += [f"adaptive_freq_{lam}" for lam in lambdas]
+        # Approach 6: Refined Cauchy-Schwarz Beta
+        refined_betas = [0.004, 0.008, 0.012, 0.016, 0.023]
+        all_methods += [f"cs_refined_{lam}_b{rbeta}" for lam in lambdas for rbeta in refined_betas]
 
     if comp_size > 1:
         from dct_page_attention import _resolve_frequency_keep_indices
@@ -866,8 +892,13 @@ def main() -> None:
                         h = model.model.layers[layer_idx].input_layernorm(h)
 
                         attn = model.model.layers[layer_idx].self_attn
-                        key_cache = past_key_values.key_cache[layer_idx]
-                        value_cache = past_key_values.value_cache[layer_idx]
+                        # Support both old (.key_cache list) and new (.layers[i].keys) cache API
+                        if hasattr(past_key_values, 'key_cache'):
+                            key_cache = past_key_values.key_cache[layer_idx]
+                            value_cache = past_key_values.value_cache[layer_idx]
+                        else:
+                            key_cache = past_key_values.layers[layer_idx].keys
+                            value_cache = past_key_values.layers[layer_idx].values
 
                         all_scores = _score_one_layer(
                             attn, h, key_cache, value_cache,
