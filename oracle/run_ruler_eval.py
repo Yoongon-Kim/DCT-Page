@@ -213,7 +213,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--dct_group_agg_method",
         type=str,
-        default="mean",
+        default="max",
         choices=["mean", "max", "topp"],
     )
     p.add_argument(

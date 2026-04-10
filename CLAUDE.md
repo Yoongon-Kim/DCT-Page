@@ -29,6 +29,7 @@ run_*.sh                Shell scripts for parametric sweeps
 baselines/              Multipole Attention and SEER Attention implementations
 benchmark/              RULER benchmark data prep and eval utilities
 oracle/                 Oracle/upper-bound evaluation and proxy diagnostics
+  diagnose_l2_scoring.py  Diagnostic tool comparing page scoring methods against ground truth
 speed/                  Decode throughput and per-layer profiling scripts
 results/                Benchmark outputs (RULER, LongBench, speed)
 ```
@@ -51,6 +52,26 @@ results/                Benchmark outputs (RULER, LongBench, speed)
 
 ### config.py
 `DCTPageConfig` dataclass. Key defaults: `page_size=32`, `top_k=64`, `sink_size=4`, `recent_size=128`, `compress_ratio=0.03125`, `scoring_method="max"`, `unselected_mode="drop"`, `score_use_haar_proxy=True`, `use_triton=True`.
+
+### oracle/diagnose_l2_scoring.py
+Systematic experiment framework for finding the best cheap proxy to approximate oracle page selection. Hooks into attention via `L2DiagnosticRecorder` to capture `paged_k`, `paged_v`, `query_states` at the first decode step of the last layer, then computes and compares many scoring strategies.
+
+**Ground truths** (`--ground_truths`):
+- `oracle_max`: full-token max Q·K score per page
+- `output_contribution`: per-page contribution to attention output `|| sum_{i in page} softmax(s_i) * v_i ||` with global softmax over all tokens (sink + paged + recent)
+
+**Scoring methods compared**:
+- Baselines: `oracle_max`, `oracle_mean`, `l2_energy`
+- Proxy (DCT-compressed): `proxy_max`, `proxy_mean`
+- DC+AC family (DCT decomposition with tunable lambda): `dc_ac`, `proxy_dc_ac`, `spread_dc_ac`, `log_spread_dc_ac`, `reverse_log_spread_dc_ac`
+- Spread proxy variants: `spread_proxy_dc_ac`, `spread_proxy_max`, `spread_proxy_mean`
+- Correction experiments:
+  - Exp B — Parseval correction (`parseval_{lam}_b{beta}`): estimates missing AC energy via Parseval's theorem
+  - Exp C — Cauchy-Schwarz key-space correction (`cs_key_{lam}_b{beta}`): bounds missing score energy from key Frobenius norms
+  - Exp D — Diagonal Gram proxy (`diag_gram_{lam}_b{beta}`): uses `diag(K^T K)` for cheaper L2 estimation
+  - Exp E — Per-frequency discrimination: Spearman correlation of each DCT coefficient with `oracle_max`
+
+**Metrics reported** per method vs ground truth: recall, false positives/negatives, negative-GT-in-topk, false-negative rank, false-negative GT score. Results saved as JSON per task.
 
 ## Setup
 
