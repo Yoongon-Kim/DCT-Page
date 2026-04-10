@@ -207,6 +207,90 @@ def _score_pages_c1_g4_kernel(
     tl.store(out_ptrs, agg_scores, mask=p_mask)
 
 
+# ---------------------------------------------------------------------------
+# Kernel 1d: DC+AC scoring (group-aggregate per coefficient, then DC + λ·AC)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _score_pages_dc_ac_kernel(
+    # --- pointers ---
+    query_ptr,         # [bsz, num_kv_heads, num_kv_groups, head_dim]
+    comp_keys_ptr,     # [bsz, num_kv_heads, num_pages, comp_size, head_dim]
+    out_scores_ptr,    # [bsz, num_kv_heads, num_pages]
+    # --- query strides ---
+    q_stride_b, q_stride_h, q_stride_g,
+    # --- comp keys strides ---
+    ck_stride_b, ck_stride_h, ck_stride_p, ck_stride_c,
+    # --- output strides ---
+    os_stride_b, os_stride_h,
+    # --- runtime dims ---
+    num_kv_heads,
+    num_pages,
+    head_dim,
+    scaling,
+    dc_ac_lambda,
+    # --- compile-time constants ---
+    NUM_KV_GROUPS: tl.constexpr,
+    COMP_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+    GROUP_AGG_METHOD: tl.constexpr,  # 0=mean, 1=max
+):
+    """DC+AC scoring: group-agg per coefficient, then score = DC + lambda * sqrt(sum(AC^2))."""
+    pid_bh = tl.program_id(0)
+    pid_pt = tl.program_id(1)
+
+    h = pid_bh % num_kv_heads
+    b = pid_bh // num_kv_heads
+
+    p_start = pid_pt * BLOCK_P
+    p_offsets = tl.arange(0, BLOCK_P)
+    p_indices = p_start + p_offsets
+    p_mask = p_indices < num_pages
+
+    d_idx = tl.arange(0, BLOCK_D)
+    d_mask = d_idx < head_dim
+
+    q_base = query_ptr + b * q_stride_b + h * q_stride_h
+    ck_base = comp_keys_ptr + b * ck_stride_b + h * ck_stride_h
+
+    g_idx = tl.arange(0, NUM_KV_GROUPS)[:, None]
+
+    dc = tl.zeros([BLOCK_P], dtype=tl.float32)
+    ac_sq = tl.zeros([BLOCK_P], dtype=tl.float32)
+
+    for c in range(COMP_SIZE):
+        k_ptrs = ck_base + p_indices[:, None] * ck_stride_p + c * ck_stride_c + d_idx[None, :]
+        mask_2d = p_mask[:, None] & d_mask[None, :]
+        k = tl.load(k_ptrs, mask=mask_2d, other=0.0).to(tl.float32)
+
+        # Compute per-group dots and group-aggregate for this coefficient
+        group_dots = tl.zeros([NUM_KV_GROUPS, BLOCK_P], dtype=tl.float32)
+        for g in range(NUM_KV_GROUPS):
+            q = tl.load(q_base + g * q_stride_g + d_idx, mask=d_mask, other=0.0).to(tl.float32)
+            q = q * scaling
+            dots = tl.sum(k * q[None, :], axis=1)
+            g_mask = (g_idx == g)
+            group_dots = tl.where(g_mask, dots[None, :], group_dots)
+
+        # Group aggregate for this coefficient
+        if GROUP_AGG_METHOD == 0:
+            coeff_score = tl.sum(group_dots, axis=0) / NUM_KV_GROUPS
+        else:
+            coeff_score = tl.max(group_dots, axis=0)
+
+        # Accumulate DC (c==0) and AC (c>0)
+        if c == 0:
+            dc = coeff_score
+        else:
+            ac_sq += coeff_score * coeff_score
+
+    ac = tl.sqrt(ac_sq)
+    agg_scores = dc + dc_ac_lambda * ac
+
+    out_ptrs = out_scores_ptr + b * os_stride_b + h * os_stride_h + p_indices
+    tl.store(out_ptrs, agg_scores, mask=p_mask)
+
+
 _SCORING_MAP = {"max": 0, "mean": 1, "sum": 2}
 _GROUP_AGG_MAP = {"mean": 0, "max": 1, "topp": 1}
 
@@ -232,6 +316,32 @@ def _score_pages_torch_fallback(
     q = query.to(torch.float32) * (head_dim ** -0.5)
     k = compressed_keys.to(torch.float32)
     group_token_scores = torch.einsum("bhgd,bhpcd->bhgpc", q, k)
+
+    # DC+AC scoring: group-aggregate per coefficient FIRST, then DC + lambda * AC
+    from dct_page_attention import _parse_dc_ac_scoring_method
+    dc_ac_parsed = _parse_dc_ac_scoring_method(scoring_method)
+    if dc_ac_parsed is not None:
+        _, dc_ac_lambda = dc_ac_parsed
+        # group_token_scores: [bsz, kv_heads, groups, pages, comp_size]
+        if group_agg_method == "mean":
+            coeff_scores = group_token_scores.mean(dim=2)
+        elif group_agg_method == "max":
+            coeff_scores = group_token_scores.max(dim=2).values
+        elif group_agg_method == "topp":
+            k_top = min(2, num_kv_groups)
+            coeff_scores = group_token_scores.topk(k_top, dim=2).values.mean(dim=2)
+        else:
+            raise ValueError(f"Unsupported group_agg_method: {group_agg_method}")
+        # coeff_scores: [bsz, kv_heads, pages, comp_size]
+        dc = coeff_scores[..., 0]
+        ac = coeff_scores[..., 1:].pow(2).sum(-1).sqrt()
+        page_scores = dc + dc_ac_lambda * ac
+
+        if out is not None:
+            out_view = out[:, :, :num_pages]
+            out_view.copy_(page_scores)
+            return out_view
+        return page_scores.contiguous()
 
     if scoring_method == "max":
         group_page_scores = group_token_scores.max(dim=-1).values
@@ -324,6 +434,32 @@ def score_pages_triton(
             num_kv_groups,
             out=out,
         )
+
+    # DC+AC scoring: dispatch to dedicated kernel
+    from dct_page_attention import _parse_dc_ac_scoring_method
+    dc_ac_parsed = _parse_dc_ac_scoring_method(scoring_method)
+    if dc_ac_parsed is not None:
+        _, dc_ac_lambda = dc_ac_parsed
+        GROUP_AGG = _GROUP_AGG_MAP[group_agg_method]
+        BLOCK_P = 32
+        num_page_tiles = (num_pages + BLOCK_P - 1) // BLOCK_P
+        grid = (bsz * num_kv_heads, num_page_tiles)
+        with torch.cuda.device(query.device):
+            _score_pages_dc_ac_kernel[grid](
+                query, compressed_keys, page_scores,
+                q_stride_0, q_stride_1, q_stride_2,
+                ck_stride_0, ck_stride_1, ck_stride_2, ck_stride_3,
+                ps_stride_0, ps_stride_bh,
+                num_kv_heads, num_pages, head_dim,
+                scaling,
+                dc_ac_lambda,
+                NUM_KV_GROUPS=num_kv_groups,
+                COMP_SIZE=comp_size,
+                BLOCK_D=BLOCK_D,
+                BLOCK_P=BLOCK_P,
+                GROUP_AGG_METHOD=GROUP_AGG,
+            )
+        return page_scores
 
     SCORING = _SCORING_MAP[scoring_method]
     GROUP_AGG = _GROUP_AGG_MAP[group_agg_method]

@@ -89,12 +89,12 @@ def parse_args():
     parser.add_argument("--recent_size", type=int, default=128)
     parser.add_argument("--compress_ratio", type=float, default=0.125)
     parser.add_argument("--scoring_method", type=str, default="max",
-                        choices=["mean", "max", "sum"])
-    parser.add_argument("--group_agg_method", type=str, default="mean",
+                        help="'mean'|'max'|'sum'|'proxy_dc_ac_{lam}'|'spread_dc_ac_{lam}'")
+    parser.add_argument("--group_agg_method", type=str, default="max",
                         choices=["mean", "max", "topp"])
     parser.add_argument("--unselected_mode", type=str, default="drop",
                         choices=["drop", "compressed"])
-    parser.add_argument("--compression_method", type=str, default="haar",
+    parser.add_argument("--compression_method", type=str, default="dct",
                         choices=["haar", "dct"],
                         help="Compression method for unselected pages (used when unselected_mode=compressed)")
     parser.add_argument("--compressed_token_rope", type=str, default="mixed",

@@ -307,6 +307,19 @@ def _resolve_frequency_keep_indices(seq_len, comp_size, layout):
     raise ValueError(f"Unsupported proxy_frequency_layout: {layout}")
 
 
+def _parse_dc_ac_scoring_method(scoring_method: str):
+    """Parse DC+AC scoring method string.
+
+    Returns (layout, lambda_val) or None if not a DC+AC method.
+      "proxy_dc_ac_0.5"   -> ("low", 0.5)
+      "spread_dc_ac_1.0"  -> ("spread", 1.0)
+    """
+    for prefix, layout in (("proxy_dc_ac_", "low"), ("spread_dc_ac_", "spread")):
+        if scoring_method.startswith(prefix):
+            return layout, float(scoring_method[len(prefix):])
+    return None
+
+
 def dct_compress_page_with_indices(x, freq_indices):
     """Compress a page by selecting specific DCT frequencies before IDCT."""
     comp_size = len(freq_indices)
@@ -890,6 +903,108 @@ def _project_pages_to_hadamard(attn_module, paged_x, comp_size):
     return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
 
 
+def _get_or_build_dc_ac_spectral_matrix(attn_module, page_size, comp_size, device, dtype, layout):
+    """Return cached DCT basis matrix for DC+AC scoring with explicit layout."""
+    M = getattr(attn_module, '_dc_ac_spectral_proj_matrix', None)
+    cached_layout = getattr(attn_module, '_dc_ac_spectral_proj_layout', None)
+    if (
+        M is None
+        or M.shape != (comp_size, page_size)
+        or M.device != device
+        or cached_layout != layout
+    ):
+        M = _build_dct_spectral_projection_matrix(page_size, comp_size, device, dtype, layout)
+        attn_module._dc_ac_spectral_proj_matrix = M
+        attn_module._dc_ac_spectral_proj_layout = layout
+    return M
+
+
+def _update_spectral_score_cache(attn_module, paged_k, num_pages, comp_size, cfg, layout):
+    """Incrementally maintain spectral (raw DCT) compressed keys for DC+AC scoring.
+
+    Like _update_comp_cache but only builds K (no V needed for scoring) and uses
+    spectral projection (raw DCT coefficients, no IDCT) with an explicit layout.
+    """
+    bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
+
+    cached_k = getattr(attn_module, '_spectral_score_k_cache', None)
+    n_cached = getattr(attn_module, '_spectral_score_n_cached', 0)
+    capacity = getattr(attn_module, '_spectral_score_capacity', 0)
+    cached_layout = getattr(attn_module, '_spectral_score_layout', None)
+
+    if (cached_k is None
+            or num_pages < n_cached
+            or cached_k.shape[0] != bsz
+            or cached_k.shape[3] != comp_size
+            or cached_layout != (layout, cfg.compressed_token_rope)):
+        attn_module._spectral_score_k_cache = None
+        attn_module._spectral_score_n_cached = 0
+        attn_module._spectral_score_capacity = 0
+        n_cached = 0
+        capacity = 0
+    attn_module._spectral_score_layout = (layout, cfg.compressed_token_rope)
+
+    n_new = num_pages - n_cached
+    if n_new > 0:
+        new_k = paged_k[:, :, n_cached:num_pages]
+
+        # Step A: optionally invert RoPE (same as _update_comp_cache)
+        if cfg.compressed_token_rope == "block_center":
+            start_pos = cfg.sink_size + n_cached * page_size
+            end_pos = cfg.sink_size + num_pages * page_size
+            positions = torch.arange(start_pos, end_pos, device=new_k.device)
+            cos, sin = _compute_rope_cos_sin(
+                positions, attn_module.config, new_k.device, new_k.dtype
+            )
+            _, attention_scaling = _get_rope_inv_freq_and_scaling(attn_module.config, new_k.device)
+            inv_factor = 1.0 / (attention_scaling * attention_scaling)
+            cos_inv = cos * inv_factor
+            sin_inv = sin * inv_factor
+            flat_k = new_k.reshape(bsz, num_kv_heads, n_new * page_size, head_dim)
+            flat_raw_k = _apply_rope(flat_k, cos_inv, -sin_inv)
+            new_k_for_compress = flat_raw_k.reshape(bsz, num_kv_heads, n_new, page_size, head_dim)
+        else:
+            new_k_for_compress = new_k
+
+        # Step B: spectral projection with explicit layout
+        M = _get_or_build_dc_ac_spectral_matrix(
+            attn_module, page_size, comp_size, new_k_for_compress.device,
+            new_k_for_compress.dtype, layout,
+        )
+        new_comp_k = torch.einsum('cs,bhnsd->bhncd', M, new_k_for_compress)
+
+        # Step C: re-apply RoPE at block-center positions
+        if cfg.compressed_token_rope == "block_center":
+            new_positions = _block_center_positions(
+                n_cached, n_new, cfg.page_size, comp_size, cfg.sink_size, new_comp_k.device,
+            ).reshape(-1)
+            cos_new, sin_new = _compute_rope_cos_sin(
+                new_positions, attn_module.config, new_comp_k.device, new_comp_k.dtype
+            )
+            flat_comp_k = new_comp_k.reshape(bsz, num_kv_heads, n_new * comp_size, head_dim)
+            flat_comp_k = _apply_rope(flat_comp_k, cos_new, sin_new)
+            new_comp_k = flat_comp_k.reshape(bsz, num_kv_heads, n_new, comp_size, head_dim)
+
+        if num_pages > capacity:
+            new_capacity = _next_page_capacity(num_pages, capacity)
+            new_k_cache = torch.empty(
+                bsz, num_kv_heads, new_capacity, comp_size, head_dim,
+                dtype=new_comp_k.dtype, device=new_comp_k.device,
+            )
+            if n_cached > 0 and attn_module._spectral_score_k_cache is not None:
+                new_k_cache[:, :, :n_cached].copy_(attn_module._spectral_score_k_cache[:, :, :n_cached])
+            attn_module._spectral_score_k_cache = new_k_cache
+            attn_module._spectral_score_capacity = new_capacity
+
+        attn_module._spectral_score_k_cache[:, :, n_cached:num_pages].copy_(new_comp_k)
+        attn_module._spectral_score_n_cached = num_pages
+
+    cache = attn_module._spectral_score_k_cache
+    if cache is None:
+        return None
+    return cache[:, :, :num_pages]
+
+
 def _block_center_positions(start_page_idx, n_pages, page_size, comp_size, sink_size, device):
     """Compute the center position of each compressed block within a page.
 
@@ -1030,6 +1145,12 @@ _DCT_RUNTIME_STATE_ATTRS = (
     "_orig_pos_rope_sin_2d",
     "_orig_pos_rope_cache_len",
     "_q_rope_buf",
+    "_spectral_score_k_cache",
+    "_spectral_score_n_cached",
+    "_spectral_score_capacity",
+    "_spectral_score_layout",
+    "_dc_ac_spectral_proj_matrix",
+    "_dc_ac_spectral_proj_layout",
 )
 
 
@@ -1199,7 +1320,14 @@ def dct_page_attention_forward(
         )
 
     score_query_states = query_states
-    score_comp_k = comp_k
+    dc_ac_parsed = _parse_dc_ac_scoring_method(cfg.scoring_method)
+    if dc_ac_parsed is not None:
+        dc_ac_layout, _ = dc_ac_parsed
+        score_comp_k = _update_spectral_score_cache(
+            self, paged_k, num_pages, comp_size, cfg, dc_ac_layout,
+        )
+    else:
+        score_comp_k = comp_k
 
     page_scores = score_pages_triton(
         score_query_states, score_comp_k, cfg.scoring_method, cfg.group_agg_method, self.num_key_value_groups,

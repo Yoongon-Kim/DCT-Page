@@ -11,6 +11,7 @@ import gc
 import importlib
 import json
 import shlex
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -186,9 +187,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run one RULER mode into a flat task-jsonl directory")
     p.add_argument("--mode", choices=["baseline", "page_attention"], required=True)
     p.add_argument("--model_name_or_path", default="Qwen/Qwen3-8B")
-    p.add_argument("--context_len", type=int, required=True)
+    p.add_argument("--context_len", type=int, default=32768)
     p.add_argument("--data_root", type=Path, default=Path("benchmark/data/ruler_data"))
-    p.add_argument("--output_root", type=Path, default=Path("results/results_ruler_oracle"))
+    p.add_argument("--output_root", type=Path, default=Path("results/results_ruler/oracle"))
     p.add_argument("--tag", default="ruler_run")
     p.add_argument("--run_dir", type=Path, default=None)
     p.add_argument("--benchmark", default="synthetic")
@@ -198,8 +199,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cuda_device", type=int, default=0)
     p.add_argument("--local_files_only", action="store_true")
 
-    p.add_argument("--dct_page_size", type=int, default=16)
-    p.add_argument("--dct_top_k", type=int, default=128)
+    p.add_argument("--dct_page_size", type=int, default=32)
+    p.add_argument("--dct_top_k", type=int, default=64)
     p.add_argument("--dct_sink_size", type=int, default=4)
     p.add_argument("--dct_recent_size", type=int, default=128)
     p.add_argument("--dct_compress_ratio", type=float, default=0.125)
@@ -209,7 +210,8 @@ def parse_args() -> argparse.Namespace:
         default="low",
         choices=["low", "low_high", "low_mid_high", "spread"],
     )
-    p.add_argument("--dct_scoring_method", type=str, default="max", choices=["mean", "max", "sum"])
+    p.add_argument("--dct_scoring_method", type=str, default="max",
+                   help="'mean'|'max'|'sum'|'proxy_dc_ac_{lam}'|'spread_dc_ac_{lam}'")
     p.add_argument(
         "--dct_group_agg_method",
         type=str,
@@ -239,7 +241,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--dct_score_use_haar_mixed_proxy", action="store_true")
     p.add_argument("--dct_score_use_hadamard_proxy", action="store_true")
-    p.add_argument("--dct_select_with_oracle_page_scores", action="store_true")
+    p.add_argument("--dct_select_with_oracle_page_scores", action="store_true", default=True)
     p.add_argument("--dct_continuous_rope", action="store_true",
                    help="Temporarily disabled — raises error if used")
     p.add_argument("--dct_weight_compressed_by_population", action="store_true",
@@ -247,6 +249,10 @@ def parse_args() -> argparse.Namespace:
                         "by page_size/comp_size via a log(n) bias on QK logits "
                         "(multipole-style population weighting). No-op for drop mode.")
     p.add_argument("--dct_no_triton", action="store_true")
+    p.add_argument("--sweep_combos", nargs="+", default=None,
+                   help="Space-separated page_size,top_k pairs to sweep. "
+                        "E.g. --sweep_combos 16,128 32,64 64,32. "
+                        "Each combo runs as a separate subprocess with its own run directory.")
     p.set_defaults(dct_score_use_haar_proxy=True)
     return p.parse_args()
 
@@ -273,6 +279,17 @@ def resolve_tasks(value: str) -> list[str]:
     if unknown:
         raise ValueError(f"Unknown tasks: {unknown}")
     return requested
+
+
+def parse_combos(values: list[str]) -> list[tuple[int, int]]:
+    """Parse 'page_size,top_k' pairs, e.g. ['16,128', '32,64', '64,32']."""
+    combos = []
+    for v in values:
+        parts = v.strip().split(",")
+        if len(parts) != 2:
+            raise ValueError(f"Each combo must be page_size,top_k — got {v!r}")
+        combos.append((int(parts[0]), int(parts[1])))
+    return combos
 
 
 def make_run_dir(output_root: Path, page_size: int, top_k: int, compress_ratio: float) -> Path:
@@ -333,8 +350,58 @@ def write_summary(run_dir: Path, manifest: dict, summary_rows: list[dict]) -> No
     )
 
 
+def sweep_main(args: argparse.Namespace) -> None:
+    """Re-invoke this script as a subprocess for each (page_size, top_k) combo."""
+    combos = parse_combos(args.sweep_combos)
+    script_path = Path(__file__).resolve()
+    repo_root = script_path.parent.parent
+
+    # Build the base argv, stripping --sweep_combos and its values,
+    # and stripping --dct_page_size / --dct_top_k (we override per combo).
+    skip_args = {"--sweep_combos", "--dct_page_size", "--dct_top_k", "--run_dir"}
+    base_argv = []
+    it = iter(sys.argv[1:])
+    for arg in it:
+        if arg in skip_args:
+            # Skip this flag and its value(s)
+            if arg == "--sweep_combos":
+                # consume all following non-flag tokens (nargs="+")
+                for remaining in it:
+                    if remaining.startswith("-"):
+                        base_argv.append(remaining)
+                        break
+            else:
+                next(it, None)  # skip the single value
+        else:
+            base_argv.append(arg)
+
+    for page_size, top_k in combos:
+        run_dir = make_run_dir(args.output_root, page_size, top_k, args.dct_compress_ratio)
+        cmd = [
+            sys.executable,
+            str(script_path),
+            *base_argv,
+            "--dct_page_size", str(page_size),
+            "--dct_top_k", str(top_k),
+            "--run_dir", str(run_dir),
+        ]
+        print(
+            f"\n[sweep] page_size={page_size} top_k={top_k} -> {run_dir}",
+            flush=True,
+        )
+        print("  cmd: " + " ".join(shlex.quote(part) for part in cmd), flush=True)
+        subprocess.run(cmd, cwd=repo_root, check=True)
+
+    print("\n[sweep] All combos finished.", flush=True)
+
+
 def main() -> None:
     args = parse_args()
+
+    if args.sweep_combos:
+        sweep_main(args)
+        return
+
     tasks = resolve_tasks(args.tasks)
     run_dir = args.run_dir if args.run_dir is not None else make_run_dir(args.output_root, args.dct_page_size, args.dct_top_k, args.dct_compress_ratio)
     if args.run_dir is not None:

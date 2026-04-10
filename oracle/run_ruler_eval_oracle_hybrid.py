@@ -44,21 +44,21 @@ def parse_args() -> argparse.Namespace:
                         "Forwarded to run_ruler_eval.py as --data_root.")
     p.add_argument("--output_root", type=Path, default=Path("results/results_ruler/oracle_hybrid"))
     p.add_argument("--tag", default="oracle_hybrid")
-    p.add_argument("--combos", nargs="+", default=["16,128", "32,64", "64,32"],
+    p.add_argument("--combos", nargs="+", default=["16,8", "32,4", "64,2"],
                    help="Space-separated page_size,top_k pairs. "
                         "E.g. '16,128 32,64 64,32'.")
-    p.add_argument("--compress_ratio", type=float, default=0.125)
+    p.add_argument("--compress_ratio", type=float, default=0.0625)
     p.add_argument(
         "--weight_pop",
         default="0,1",
         help="Comma-separated 0/1 values to sweep --dct_weight_compressed_by_population. "
              "E.g. '0', '1', or '0,1' to run both.",
     )
-    p.add_argument("--compression_method", type=str, default="haar", choices=["haar", "dct"],
+    p.add_argument("--compression_method", type=str, default="dct", choices=["haar", "dct"],
                    help="Compression method for unselected pages: 'haar' (default) or 'dct'.")
-    p.add_argument("--scoring_method", type=str, default="max", choices=["mean", "max", "sum"],
-                   help="Per-page scoring aggregation: 'max' (default), 'mean', or 'sum'.")
-    p.add_argument("--group_agg_method", type=str, default="mean", choices=["mean", "max", "topp"],
+    p.add_argument("--scoring_method", type=str, default="max",
+                   help="'mean'|'max'|'sum'|'proxy_dc_ac_{lam}'|'spread_dc_ac_{lam}'")
+    p.add_argument("--group_agg_method", type=str, default="max", choices=["mean", "max", "topp"],
                    help="Cross-GQA-head aggregation: 'mean' (default), 'max', or 'topp'.")
     p.add_argument("--num_samples", type=int, default=25)
     p.add_argument("--max_new_tokens", type=int, default=128)

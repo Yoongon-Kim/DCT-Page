@@ -448,7 +448,7 @@ def parse_args():
     parser.add_argument("--recent_size", type=int, default=128)
     parser.add_argument("--compress_ratio", type=float, default=0.03125)
     parser.add_argument("--scoring_method", type=str, default="max",
-                        choices=["mean", "max", "sum"])
+                        help="'mean'|'max'|'sum'|'proxy_dc_ac_{lam}'|'spread_dc_ac_{lam}'")
     parser.add_argument("--group_agg_method", type=str, default="mean",
                         choices=["mean", "max", "topp"],
                         help="How to aggregate per-head scores within a GQA group")

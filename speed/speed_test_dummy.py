@@ -319,7 +319,8 @@ def parse_args():
     dct.add_argument("--sink_size", type=int, default=4)
     dct.add_argument("--recent_size", type=int, default=128)
     dct.add_argument("--compress_ratio", type=float, default=0.03125)
-    dct.add_argument("--scoring_method", default="max", choices=["mean", "max"])
+    dct.add_argument("--scoring_method", default="max",
+                     help="'mean'|'max'|'sum'|'proxy_dc_ac_{lam}'|'spread_dc_ac_{lam}'")
     dct.add_argument("--group_agg_method", default="mean",
                      choices=["mean", "max", "meanmax", "top2mean", "topp"])
     dct.add_argument("--unselected_mode", default="drop",
