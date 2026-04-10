@@ -724,7 +724,7 @@ def main() -> None:
     # Create output dirs for each ground truth
     run_dirs = {}
     for gt_name in gt_names:
-        run_dir = args.output_dir / f"ps{args.page_size}_topk{args.top_k}_gt_{gt_name}"
+        run_dir = args.output_dir / f"ps{args.page_size}_topk{args.top_k}_cr{args.compress_ratio}_gt_{gt_name}"
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "config.json").write_text(
             json.dumps(vars(args), ensure_ascii=False, indent=2, default=str) + "\n",
