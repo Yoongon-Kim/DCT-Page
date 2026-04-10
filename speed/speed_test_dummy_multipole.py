@@ -194,24 +194,28 @@ def time_sample(model, input_ids, max_new_tokens, warmup_steps,
                 chunk_size=0, measure_attn=False):
     """Measure prefill time, per-step decode times, and optionally attention-only times.
 
+    The first decode step is included in prefill timing because it triggers
+    one-time initialisation (e.g. multipole clustering) via the normal model
+    forward pass.  Decode timing starts from step 1 onward.
+
     Always generates exactly max_new_tokens (no EOS stopping) for consistent
     measurement.  Returns:
-        (prefill_time_s, step_times, attn_step_times,
-         first_decode_s, first_decode_attn_ms, n_generated)
+        (prefill_time_s, step_times, attn_step_times, n_generated)
     """
     global _attn_timing_enabled
 
     device = input_ids.device
     prefill_len = input_ids.shape[1]
 
-    # --- Prefill ---
+    # --- Prefill + first decode step ---
+    # The first decode step triggers clustering init for multipole (runs
+    # naturally inside each layer's forward, no extra Python iteration).
+    # Including it in prefill keeps decode measurements clean.
     _attn_timing_enabled = False
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     with torch.no_grad():
         out = chunked_prefill_multipole(model, input_ids, chunk_size)
-    torch.cuda.synchronize()
-    prefill_time = time.perf_counter() - t0
 
     past_key_values = out.past_key_values
     next_token = out.logits[:, -1:].argmax(dim=-1)
@@ -220,14 +224,27 @@ def time_sample(model, input_ids, max_new_tokens, warmup_steps,
     extra = max_new_tokens + 16
     past_key_values = pre_allocate_cache(past_key_values, extra_tokens=extra)
 
-    # --- Decode ---
+    # First decode step — triggers clustering init for multipole.
+    cache_position = torch.tensor([prefill_len], device=device)
+    with torch.no_grad():
+        out = model(
+            next_token,
+            past_key_values=past_key_values,
+            use_cache=True,
+            cache_position=cache_position,
+        )
+    past_key_values = out.past_key_values
+    next_token = out.logits[:, -1:].argmax(dim=-1)
+
+    torch.cuda.synchronize()
+    prefill_time = time.perf_counter() - t0
+
+    # --- Decode (step 1 onwards, clustering already initialised) ---
     _reset_attn_timing()
     step_times = []
     attn_step_times = []
-    first_decode_time = None
-    first_decode_attn_ms = None
 
-    for step in range(max_new_tokens):
+    for step in range(1, max_new_tokens):
         cache_position = torch.tensor([prefill_len + step], device=device)
 
         _attn_timing_enabled = measure_attn
@@ -251,19 +268,13 @@ def time_sample(model, input_ids, max_new_tokens, warmup_steps,
         past_key_values = out.past_key_values
         next_token = out.logits[:, -1:].argmax(dim=-1)
 
-        # Record first decode step separately (includes clustering init for multipole)
-        if step == 0:
-            first_decode_time = elapsed
-            first_decode_attn_ms = attn_ms if measure_attn else None
-
         if step >= warmup_steps:
             step_times.append(elapsed)
             if measure_attn:
                 attn_step_times.append(attn_ms)
 
     _attn_timing_enabled = False
-    return (prefill_time, step_times, attn_step_times,
-            first_decode_time, first_decode_attn_ms, max_new_tokens)
+    return (prefill_time, step_times, attn_step_times, max_new_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -284,8 +295,6 @@ def benchmark_dummy(model, tokenizer, args, label, context_lengths, measure_attn
             "prefill_times": [],
             "step_times": [],
             "attn_step_times": [],
-            "first_decode_times": [],
-            "first_decode_attn_times": [],
         }
 
         # Warmup run (absorbs kernel compilation / allocator costs)
@@ -308,7 +317,6 @@ def benchmark_dummy(model, tokenizer, args, label, context_lengths, measure_attn
             )
 
             (prefill_time, step_times, attn_step_times,
-             first_decode_time, first_decode_attn_ms,
              n_generated) = time_sample(
                 model, input_ids, args.max_new_tokens, args.warmup_steps,
                 chunk_size=args.chunk_size, measure_attn=measure_attn,
@@ -317,10 +325,6 @@ def benchmark_dummy(model, tokenizer, args, label, context_lengths, measure_attn
             stats = per_length_stats[ctx_len]
             stats["prefill_times"].append(prefill_time)
             stats["step_times"].extend(step_times)
-            if first_decode_time is not None:
-                stats["first_decode_times"].append(first_decode_time)
-            if first_decode_attn_ms is not None:
-                stats["first_decode_attn_times"].append(first_decode_attn_ms)
             if attn_step_times:
                 stats["attn_step_times"].extend(attn_step_times)
 
@@ -344,11 +348,6 @@ def benchmark_dummy(model, tokenizer, args, label, context_lengths, measure_attn
                 avg_attn_ms = sum(attn_step_times) / len(attn_step_times)
                 record["avg_attn_ms_per_tok"] = round(avg_attn_ms, 3)
                 record["attn_fraction_pct"] = round(avg_attn_ms / avg_ms * 100, 1)
-
-            if first_decode_time is not None:
-                record["first_decode_ms"] = round(first_decode_time * 1000, 2)
-            if first_decode_attn_ms is not None:
-                record["first_decode_attn_ms"] = round(first_decode_attn_ms, 3)
 
             all_records.append(record)
 
@@ -401,15 +400,6 @@ def benchmark_dummy(model, tokenizer, args, label, context_lengths, measure_attn
                     avg_attn / ls["avg_decode_ms_per_tok"] * 100, 1
                 )
 
-        if s["first_decode_times"]:
-            ls["avg_first_decode_ms"] = round(
-                sum(s["first_decode_times"]) / len(s["first_decode_times"]) * 1000, 2
-            )
-        if s["first_decode_attn_times"]:
-            ls["avg_first_decode_attn_ms"] = round(
-                sum(s["first_decode_attn_times"]) / len(s["first_decode_attn_times"]), 3
-            )
-
         length_summaries[ctx_len] = ls
 
     # Overall stats
@@ -450,16 +440,16 @@ def parse_args():
 
     p.add_argument("--model", default="Qwen/Qwen3-8B")
     p.add_argument("--mode", choices=["baseline", "multipole", "both"], default="both")
-    p.add_argument("--context_lengths", type=str, default="4096,8192,16384,32768",
+    p.add_argument("--context_lengths", type=str, default= "32768", #"4096,8192,16384,32768",
                    help="Comma-separated context lengths to benchmark")
     p.add_argument("--num_repeats", type=int, default=3,
                    help="Repeats per context length for averaging")
     p.add_argument("--max_new_tokens", type=int, default=128)
-    p.add_argument("--warmup_steps", type=int, default=1)
+    p.add_argument("--warmup_steps", type=int, default=3)
     p.add_argument("--chunk_size", type=int, default=0,
                    help="Chunked prefill size (0 = single-pass). "
                         "Use e.g. 8192 to reduce peak memory for long contexts.")
-    p.add_argument("--output_dir", default="results/speed_test_dummy_multipole")
+    p.add_argument("--output_dir", default="results/results_speed/speed_test_dummy_multipole")
     p.add_argument("--run_name", default=None)
     p.add_argument("--no_measure_attn", action="store_true",
                    help="Disable attention-only timing (enabled by default)")
