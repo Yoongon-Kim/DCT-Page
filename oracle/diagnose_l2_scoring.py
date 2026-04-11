@@ -359,6 +359,23 @@ def compute_all_scores(
     for lam in lambdas:
         scores[f"weighted_dc_ac_{lam}"] = dc + lam * ac * dc
 
+    # --- L∞ aggregation of AC coefficients (oracle: all AC frequencies) ---
+    # Tests max single-frequency projection vs L2 energy. Both unscaled and
+    # spike-recovery scaled (√(M)) variants — if AC is Gaussian-like the
+    # unscaled wins, if time-sparse the scaled wins.
+    ac_all = dct_scores[..., 1:]  # [bsz, kv, num_pages, page_size - 1]
+    signed_max_ac = ac_all.max(dim=-1).values          # signed max
+    abs_max_ac = ac_all.abs().max(dim=-1).values       # magnitude max
+    relu_max_ac = signed_max_ac.clamp(min=0)           # positive-only max
+    oracle_scale = float(page_size - 1) ** 0.5         # √(N-1) spike-recovery factor
+    for lam in lambdas:
+        scores[f"signed_max_ac_{lam}"] = dc + lam * signed_max_ac
+        scores[f"relu_max_ac_{lam}"] = dc + lam * relu_max_ac
+        scores[f"abs_max_ac_{lam}"] = dc + lam * abs_max_ac
+        scores[f"signed_max_ac_scaled_{lam}"] = dc + lam * oracle_scale * signed_max_ac
+        scores[f"relu_max_ac_scaled_{lam}"] = dc + lam * oracle_scale * relu_max_ac
+        scores[f"abs_max_ac_scaled_{lam}"] = dc + lam * oracle_scale * abs_max_ac
+
     # Proxy DC+AC: use only coefficients 0..comp_size-1 (what the proxy sees)
     if comp_size is not None and comp_size > 1:
         proxy_ac_sq = dct_scores[..., 1:comp_size].pow(2).sum(-1)  # keep squared for reuse
@@ -373,6 +390,20 @@ def compute_all_scores(
         # weighted_proxy_dc_ac: proxy AC scaled by DC
         for lam in lambdas:
             scores[f"weighted_proxy_dc_ac_{lam}"] = dc + lam * proxy_ac * dc
+
+        # --- L∞ aggregation of proxy AC coefficients (comp_size-1 freqs only) ---
+        proxy_ac_all = dct_scores[..., 1:comp_size]  # [bsz, kv, N, comp_size - 1]
+        proxy_signed_max = proxy_ac_all.max(dim=-1).values
+        proxy_abs_max = proxy_ac_all.abs().max(dim=-1).values
+        proxy_relu_max = proxy_signed_max.clamp(min=0)
+        proxy_scale = float(max(comp_size - 1, 1)) ** 0.5  # √(comp_size-1)
+        for lam in lambdas:
+            scores[f"proxy_signed_max_ac_{lam}"] = dc + lam * proxy_signed_max
+            scores[f"proxy_relu_max_ac_{lam}"] = dc + lam * proxy_relu_max
+            scores[f"proxy_abs_max_ac_{lam}"] = dc + lam * proxy_abs_max
+            scores[f"proxy_signed_max_ac_scaled_{lam}"] = dc + lam * proxy_scale * proxy_signed_max
+            scores[f"proxy_relu_max_ac_scaled_{lam}"] = dc + lam * proxy_scale * proxy_relu_max
+            scores[f"proxy_abs_max_ac_scaled_{lam}"] = dc + lam * proxy_scale * proxy_abs_max
 
         # --- Exp A: Spread Layout Oracle ---
         # Use the same frequency indices as the spread proxy (Exp F) for a fair oracle
@@ -441,24 +472,17 @@ def compute_all_scores(
                     scores[f"diag_gram_{lam}_b{beta}"] = dc + lam * (proxy_ac_sq + beta * residual_diag).sqrt()
 
         # --- Exp E: Per-Frequency Discrimination Analysis ---
-        # Rank correlation of each DCT coefficient with oracle_max (stored as metadata)
-        gt_scores = per_token_scores.max(dim=-1).values  # oracle_max: [bsz, kv_heads, num_pages]
-        freq_corrs = []
-        for k in range(page_size):
-            coeff_k = dct_scores[..., k].abs()  # [bsz, kv_heads, num_pages]
-            # Spearman = Pearson on ranks; compute per head then average
-            corrs = []
-            for b in range(coeff_k.shape[0]):
-                for h in range(coeff_k.shape[1]):
-                    x = coeff_k[b, h]
-                    y = gt_scores[b, h]
-                    rx = x.argsort(descending=True).argsort().float()
-                    ry = y.argsort(descending=True).argsort().float()
-                    corr = torch.corrcoef(torch.stack([rx, ry]))[0, 1].item()
-                    corrs.append(corr)
-            freq_corrs.append(sum(corrs) / len(corrs))
-        # Store as a special entry (not a scoring method)
-        scores["_freq_discrimination"] = freq_corrs
+        # Vectorized Spearman across all (b, h, freq): Pearson on ranks reduces to
+        # cov / var_pop since rank vectors of length N have constant variance (N^2-1)/12.
+        gt_scores = per_token_scores.max(dim=-1).values  # [bsz, kv_heads, num_pages]
+        coeff_abs = dct_scores.abs().permute(0, 1, 3, 2)  # [bsz, kv_heads, page_size, num_pages]
+        N = coeff_abs.shape[-1]
+        rx = coeff_abs.argsort(dim=-1, descending=True).argsort(dim=-1).float()  # [bsz, kv, F, N]
+        ry = gt_scores.argsort(dim=-1, descending=True).argsort(dim=-1).float()  # [bsz, kv, N]
+        center = (N - 1) / 2
+        var_pop = (N * N - 1) / 12
+        corrs_bhf = ((rx - center) * (ry - center).unsqueeze(-2)).mean(dim=-1) / var_pop  # [bsz, kv, F]
+        scores["_freq_discrimination"] = corrs_bhf.mean(dim=(0, 1)).cpu().tolist()
 
         # --- Approach 3: DCT Residual Energy Profile (Query-Adaptive) ---
         # Instead of isotropic correction (Exp C: ||q||^2 * scalar), use
@@ -518,79 +542,87 @@ def compute_all_scores(
 # ---------------------------------------------------------------------------
 # Analysis
 # ---------------------------------------------------------------------------
-def _analyze_method_vs_gt(
-    method_scores: torch.Tensor,   # [num_pages]
-    gt_scores: torch.Tensor,       # [num_pages]
-    gt_topk_idx: set[int],
-    actual_top_k: int,
-) -> dict[str, Any]:
-    """Analyze one method against ground truth for one head."""
-    method_topk_idx = set(method_scores.topk(actual_top_k).indices.tolist())
-    overlap = len(method_topk_idx & gt_topk_idx)
-    false_positives = method_topk_idx - gt_topk_idx
-    false_negatives = gt_topk_idx - method_topk_idx
-
-    method_ranks = method_scores.argsort(descending=True).argsort()
-
-    neg_gt = sum(1 for idx in method_topk_idx if gt_scores[idx].item() < 0)
-    fp_gt_scores = [gt_scores[idx].item() for idx in false_positives]
-    fn_ranks = [method_ranks[idx].item() for idx in false_negatives]
-    fn_gt_scores = [gt_scores[idx].item() for idx in false_negatives]
-
-    return {
-        "recall": overlap / actual_top_k,
-        "false_positive_count": len(false_positives),
-        "false_negative_count": len(false_negatives),
-        "neg_gt_in_topk": neg_gt,
-        "fp_gt_score_mean": (
-            sum(fp_gt_scores) / len(fp_gt_scores) if fp_gt_scores else 0.0
-        ),
-        "fn_rank_mean": (
-            sum(fn_ranks) / len(fn_ranks) if fn_ranks else 0.0
-        ),
-        "fn_gt_score_mean": (
-            sum(fn_gt_scores) / len(fn_gt_scores) if fn_gt_scores else 0.0
-        ),
-    }
-
-
 def analyze_one_sample(
     all_scores: dict[str, torch.Tensor],  # each [bsz, kv_heads, num_pages]
     ground_truth: str,
     methods: list[str],
     top_k: int,
 ) -> dict[str, Any]:
-    """Analyze all methods vs ground truth for a single sample across all heads."""
-    gt = all_scores[ground_truth][0]  # [kv_heads, num_pages]
+    """Analyze all methods vs ground truth for a single sample across all heads.
 
+    Vectorized: stacks all methods into one tensor and computes every metric in
+    batch, with a single GPU→CPU sync at the end.
+    """
+    gt = all_scores[ground_truth][0]  # [kv_heads, num_pages]
     kv_heads, num_pages = gt.shape
     actual_top_k = min(top_k, num_pages)
+    device = gt.device
 
-    head_results = []
-    for h in range(kv_heads):
-        gt_h = gt[h]
-        gt_topk_idx = set(gt_h.topk(actual_top_k).indices.tolist())
+    # Stack methods: [M, kv_heads, num_pages]
+    method_stack = torch.stack([all_scores[m][0] for m in methods], dim=0)
+    num_methods = method_stack.shape[0]
 
-        head_row = {}
-        for method in methods:
-            result = _analyze_method_vs_gt(
-                all_scores[method][0, h], gt_h, gt_topk_idx, actual_top_k,
-            )
-            for k, v in result.items():
-                head_row[f"{method}_{k}"] = v
-        head_results.append(head_row)
+    # Top-k membership masks
+    gt_topk_idx = gt.topk(actual_top_k, dim=-1).indices  # [kv, k]
+    gt_mask = torch.zeros(kv_heads, num_pages, dtype=torch.bool, device=device)
+    gt_mask.scatter_(1, gt_topk_idx, True)
 
-    n = len(head_results)
-    agg = {
-        "num_heads": n,
+    method_topk_idx = method_stack.topk(actual_top_k, dim=-1).indices  # [M, kv, k]
+    method_mask = torch.zeros(num_methods, kv_heads, num_pages, dtype=torch.bool, device=device)
+    method_mask.scatter_(2, method_topk_idx, True)
+
+    gt_mask_b = gt_mask.unsqueeze(0)  # [1, kv, N]
+    gt_b = gt.unsqueeze(0).float()    # [1, kv, N]
+
+    overlap = (method_mask & gt_mask_b).sum(dim=-1).float()  # [M, kv]
+    recall = overlap / actual_top_k
+    # |method_topk| == |gt_topk| == actual_top_k, so FP == FN == k - overlap
+    fp_fn_count = float(actual_top_k) - overlap
+
+    neg_gt = (method_mask & (gt_b < 0)).sum(dim=-1).float()  # [M, kv]
+
+    # Ranks (argsort-argsort): [M, kv, N]
+    method_ranks = method_stack.argsort(dim=-1, descending=True).argsort(dim=-1).float()
+
+    fp_mask = method_mask & ~gt_mask_b
+    fn_mask = gt_mask_b & ~method_mask
+    fp_mask_f = fp_mask.float()
+    fn_mask_f = fn_mask.float()
+
+    fp_count_f = fp_mask_f.sum(dim=-1).clamp(min=1)
+    fn_count_f = fn_mask_f.sum(dim=-1).clamp(min=1)
+    has_fp = fp_mask.any(dim=-1).float()
+    has_fn = fn_mask.any(dim=-1).float()
+
+    fp_gt_mean = (gt_b * fp_mask_f).sum(dim=-1) / fp_count_f * has_fp
+    fn_gt_mean = (gt_b * fn_mask_f).sum(dim=-1) / fn_count_f * has_fn
+    fn_rank_mean = (method_ranks * fn_mask_f).sum(dim=-1) / fn_count_f * has_fn
+
+    # Average across kv_heads, then stack metrics for a single .cpu() sync
+    metrics_stack = torch.stack([
+        recall.mean(dim=1),
+        fp_fn_count.mean(dim=1),    # false_positive_count
+        fp_fn_count.mean(dim=1),    # false_negative_count
+        neg_gt.mean(dim=1),
+        fp_gt_mean.mean(dim=1),
+        fn_rank_mean.mean(dim=1),
+        fn_gt_mean.mean(dim=1),
+    ], dim=0).cpu().tolist()  # [7, M]
+
+    agg: dict[str, Any] = {
+        "num_heads": kv_heads,
         "actual_top_k": actual_top_k,
         "num_pages": num_pages,
         "ground_truth": ground_truth,
     }
-    metric_keys = [k for k in head_results[0] if isinstance(head_results[0][k], (int, float))]
-    for k in metric_keys:
-        agg[f"{k}_avg"] = sum(r[k] for r in head_results) / n
-    agg["head_results"] = head_results
+    metric_names = [
+        "recall", "false_positive_count", "false_negative_count",
+        "neg_gt_in_topk", "fp_gt_score_mean", "fn_rank_mean", "fn_gt_score_mean",
+    ]
+    for mi, mname in enumerate(metric_names):
+        row = metrics_stack[mi]
+        for j, method in enumerate(methods):
+            agg[f"{method}_{mname}_avg"] = row[j]
     return agg
 
 
@@ -769,11 +801,23 @@ def main() -> None:
     all_methods += [f"dc_ac_{lam}" for lam in lambdas]
     all_methods += [f"sign_dc_ac_{lam}" for lam in lambdas]
     all_methods += [f"weighted_dc_ac_{lam}" for lam in lambdas]
+    all_methods += [f"signed_max_ac_{lam}" for lam in lambdas]
+    all_methods += [f"relu_max_ac_{lam}" for lam in lambdas]
+    all_methods += [f"abs_max_ac_{lam}" for lam in lambdas]
+    all_methods += [f"signed_max_ac_scaled_{lam}" for lam in lambdas]
+    all_methods += [f"relu_max_ac_scaled_{lam}" for lam in lambdas]
+    all_methods += [f"abs_max_ac_scaled_{lam}" for lam in lambdas]
     comp_size = max(1, int(args.page_size * args.compress_ratio))
     if comp_size > 1:
         all_methods += [f"proxy_dc_ac_{lam}" for lam in lambdas]
         all_methods += [f"sign_proxy_dc_ac_{lam}" for lam in lambdas]
         all_methods += [f"weighted_proxy_dc_ac_{lam}" for lam in lambdas]
+        all_methods += [f"proxy_signed_max_ac_{lam}" for lam in lambdas]
+        all_methods += [f"proxy_relu_max_ac_{lam}" for lam in lambdas]
+        all_methods += [f"proxy_abs_max_ac_{lam}" for lam in lambdas]
+        all_methods += [f"proxy_signed_max_ac_scaled_{lam}" for lam in lambdas]
+        all_methods += [f"proxy_relu_max_ac_scaled_{lam}" for lam in lambdas]
+        all_methods += [f"proxy_abs_max_ac_scaled_{lam}" for lam in lambdas]
         # Exp A: spread layout oracle
         all_methods += [f"spread_dc_ac_{lam}" for lam in lambdas]
         # Exp C: key-space CS correction
