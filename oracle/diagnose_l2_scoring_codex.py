@@ -174,8 +174,15 @@ def _compute_codex_spectral_scores(
     ucb_levels: list[int],
     ucb_num_bands: int,
     continuous_multiplier: int,
+    name_suffix: str = "",
 ) -> dict[str, torch.Tensor]:
-    """Compute spectral_recon_max, spectral_recon_ucb{1,2,3}_b{beta}, continuous_cosine_max."""
+    """Compute spectral_recon_max, spectral_recon_ucb{1,2,3}_b{beta}, continuous_cosine_max.
+
+    `name_suffix` is appended after the method base name (e.g. "_spread") so that
+    multi-layout runs can register layout-specific variants side-by-side.
+    UCB names get the suffix between the level and the beta tag, e.g.
+    `spectral_recon_ucb1_spread_b0.5`.
+    """
     out: dict[str, torch.Tensor] = {}
     if comp_size is None or comp_size <= 0 or paged_k is None or query_states is None:
         return out
@@ -209,14 +216,16 @@ def _compute_codex_spectral_scores(
     k_dct_kept = k_dct.index_select(-2, J_tensor)       # [B, H, N, c, D]
     a = torch.einsum('bhgd,bhncd->bhgnc', q_scaled, k_dct_kept)  # [B, H, G, N, c]
 
+    sfx = name_suffix
+
     # --- Method 1: spectral_recon_max ---
     shat = torch.einsum('tc,bhgnc->bhgnt', Phi_kept_T, a)        # [B, H, G, N, P]
     shat_max_per_group = shat.max(dim=-1).values                  # [B, H, G, N]
-    out['spectral_recon_max'] = shat_max_per_group.max(dim=2).values  # [B, H, N]
+    out[f'spectral_recon_max{sfx}'] = shat_max_per_group.max(dim=2).values  # [B, H, N]
 
     # --- Method 3: continuous_cosine_max ---
     shat_cont = torch.einsum('xc,bhgnc->bhgnx', Phi_dense_kept, a)  # [B, H, G, N, X]
-    out['continuous_cosine_max'] = (
+    out[f'continuous_cosine_max{sfx}'] = (
         shat_cont.max(dim=-1).values.max(dim=2).values
     )
 
@@ -237,7 +246,7 @@ def _compute_codex_spectral_scores(
             )  # [B, H, G, N, Bet]
             v1 = combined.max(dim=2).values                        # [B, H, N, Bet]
             for bi, beta in enumerate(betas):
-                out[f"spectral_recon_ucb1_b{beta}"] = v1[..., bi]
+                out[f"spectral_recon_ucb1{sfx}_b{beta}"] = v1[..., bi]
 
         if 3 in ucb_levels:
             Phi_notJ_T_sq = Phi_notJ_T.pow(2)                      # [P, P-c]
@@ -248,7 +257,7 @@ def _compute_codex_spectral_scores(
             score_curves = shat.unsqueeze(-1) + u_t.unsqueeze(-1) * betas_t
             v3 = score_curves.max(dim=-2).values.max(dim=2).values  # [B, H, N, Bet]
             for bi, beta in enumerate(betas):
-                out[f"spectral_recon_ucb3_b{beta}"] = v3[..., bi]
+                out[f"spectral_recon_ucb3{sfx}_b{beta}"] = v3[..., bi]
 
         if 2 in ucb_levels:
             num_dropped = len(not_J)
@@ -273,12 +282,12 @@ def _compute_codex_spectral_scores(
             score_curves_l2 = shat.unsqueeze(-1) + u_t_l2.unsqueeze(-1) * betas_t
             v2 = score_curves_l2.max(dim=-2).values.max(dim=2).values
             for bi, beta in enumerate(betas):
-                out[f"spectral_recon_ucb2_b{beta}"] = v2[..., bi]
+                out[f"spectral_recon_ucb2{sfx}_b{beta}"] = v2[..., bi]
     else:
         # Empty notJ: UCB variants degenerate to spectral_recon_max
         for lvl in ucb_levels or []:
             for beta in betas:
-                out[f"spectral_recon_ucb{lvl}_b{beta}"] = out['spectral_recon_max']
+                out[f"spectral_recon_ucb{lvl}{sfx}_b{beta}"] = out[f'spectral_recon_max{sfx}']
 
     return out
 
@@ -294,12 +303,18 @@ def compute_all_scores_codex(
     num_kv_groups: int | None = None,
     betas: list[float] | None = None,
     *,
-    layout: str = "low",
+    layouts: list[str] | None = None,
     ucb_levels: list[int] | None = None,
     ucb_num_bands: int = 4,
     continuous_multiplier: int = 4,
 ) -> dict[str, torch.Tensor]:
-    """Wrap base.compute_all_scores and merge codex spectral methods."""
+    """Wrap base.compute_all_scores and merge codex spectral methods.
+
+    `layouts` is a list of frequency-keep layouts to evaluate. For a single
+    layout, codex method names match the original (no suffix). For >1 layouts,
+    each method name is suffixed with `_{layout}` so the variants can be
+    analyzed side-by-side in one diagnostic run.
+    """
     import diagnose_l2_scoring as base
 
     scores = base.compute_all_scores(
@@ -314,6 +329,8 @@ def compute_all_scores_codex(
         betas=betas,
     )
 
+    layouts_eff = list(layouts) if layouts else ["low"]
+
     if (
         comp_size is not None
         and comp_size > 0
@@ -321,18 +338,22 @@ def compute_all_scores_codex(
         and query_states is not None
         and num_kv_groups is not None
     ):
-        codex_scores = _compute_codex_spectral_scores(
-            paged_k=paged_k,
-            query_states=query_states,
-            num_kv_groups=num_kv_groups,
-            comp_size=comp_size,
-            layout=layout,
-            betas=betas or [0.25, 0.5, 1.0],
-            ucb_levels=ucb_levels if ucb_levels is not None else [1, 2, 3],
-            ucb_num_bands=ucb_num_bands,
-            continuous_multiplier=continuous_multiplier,
-        )
-        scores.update(codex_scores)
+        multi = len(layouts_eff) > 1
+        for layout in layouts_eff:
+            suffix = f"_{layout}" if multi else ""
+            codex_scores = _compute_codex_spectral_scores(
+                paged_k=paged_k,
+                query_states=query_states,
+                num_kv_groups=num_kv_groups,
+                comp_size=comp_size,
+                layout=layout,
+                betas=betas or [0.25, 0.5, 1.0],
+                ucb_levels=ucb_levels if ucb_levels is not None else [1, 2, 3],
+                ucb_num_bands=ucb_num_bands,
+                continuous_multiplier=continuous_multiplier,
+                name_suffix=suffix,
+            )
+            scores.update(codex_scores)
 
     return scores
 
@@ -354,7 +375,7 @@ def _score_one_layer_codex(
     device: torch.device,
     dtype: torch.dtype,
     *,
-    layout: str = "low",
+    layouts: list[str] | None = None,
     ucb_levels: list[int] | None = None,
     ucb_num_bands: int = 4,
     continuous_multiplier: int = 4,
@@ -397,7 +418,7 @@ def _score_one_layer_codex(
         per_token_scores, proxy_scores, output_contrib, lambdas,
         comp_size=comp_size, paged_k=paged_k,
         query_states=query_states, num_kv_groups=num_kv_groups, betas=betas,
-        layout=layout, ucb_levels=ucb_levels,
+        layouts=layouts, ucb_levels=ucb_levels,
         ucb_num_bands=ucb_num_bands, continuous_multiplier=continuous_multiplier,
     )
     return all_scores
@@ -447,7 +468,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--layout",
         default=None,
-        help="Frequency layout for codex methods (low|spread|low_high|low_mid_high). "
+        help="Single-layout shortcut. Equivalent to --layouts <layout>. "
+             "Ignored if --layouts is also set.",
+    )
+    p.add_argument(
+        "--layouts",
+        default=None,
+        help="Comma-separated list of frequency layouts to register side-by-side "
+             "for codex methods (low|spread|low_high|low_mid_high). When more than "
+             "one is given, codex method names are suffixed with _{layout}. "
              "Defaults to 'low'.",
     )
     p.add_argument(
@@ -475,8 +504,11 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _build_method_registry(lambdas, betas, comp_size, ucb_levels):
-    """Slim whitelist of methods that get analyzed/printed."""
+def _build_method_registry(lambdas, betas, comp_size, ucb_levels, layouts):
+    """Slim whitelist of methods that get analyzed/printed.
+
+    For >1 layouts, codex method names are suffixed with _{layout}.
+    """
     methods = [
         "oracle_max", "oracle_mean",
         "proxy_max", "proxy_mean",
@@ -488,10 +520,13 @@ def _build_method_registry(lambdas, betas, comp_size, ucb_levels):
         methods += [f"proxy_dc_ac_{lam}" for lam in lambdas]
         methods += [f"spread_dc_ac_{lam}" for lam in lambdas]
     if comp_size > 0:
-        methods.append("spectral_recon_max")
-        for lvl in ucb_levels:
-            methods += [f"spectral_recon_ucb{lvl}_b{b}" for b in betas]
-        methods.append("continuous_cosine_max")
+        multi = len(layouts) > 1
+        for layout in layouts:
+            sfx = f"_{layout}" if multi else ""
+            methods.append(f"spectral_recon_max{sfx}")
+            for lvl in ucb_levels:
+                methods += [f"spectral_recon_ucb{lvl}{sfx}_b{b}" for b in betas]
+            methods.append(f"continuous_cosine_max{sfx}")
     return methods
 
 
@@ -575,12 +610,55 @@ def _self_test() -> None:
             ).max().item()
             assert rel_err < 1e-4, f"Test 4 (c={c}): Parseval rel err {rel_err}"
 
+    # ---- Test 6: multi-layout naming via name_suffix ----
+    out_low = _compute_codex_spectral_scores(
+        paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+        comp_size=4, layout="low", betas=test_betas, ucb_levels=test_levels,
+        ucb_num_bands=4, continuous_multiplier=4, name_suffix="_low",
+    )
+    out_spread = _compute_codex_spectral_scores(
+        paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+        comp_size=4, layout="spread", betas=test_betas, ucb_levels=test_levels,
+        ucb_num_bands=4, continuous_multiplier=4, name_suffix="_spread",
+    )
+    expected_low = {
+        "spectral_recon_max_low",
+        "continuous_cosine_max_low",
+        "spectral_recon_ucb1_low_b0.5",
+        "spectral_recon_ucb2_low_b0.5",
+        "spectral_recon_ucb3_low_b0.5",
+    }
+    expected_spread = {k.replace("_low", "_spread") for k in expected_low}
+    assert expected_low.issubset(out_low.keys()), \
+        f"Test 6 (low): missing keys {expected_low - set(out_low.keys())}"
+    assert expected_spread.issubset(out_spread.keys()), \
+        f"Test 6 (spread): missing keys {expected_spread - set(out_spread.keys())}"
+    # The low-layout suffixed value must equal the unsuffixed run
+    out_unsuffixed = _compute_codex_spectral_scores(
+        paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+        comp_size=4, layout="low", betas=test_betas, ucb_levels=test_levels,
+        ucb_num_bands=4, continuous_multiplier=4,
+    )
+    diff_suffix = (
+        out_low["spectral_recon_max_low"] - out_unsuffixed["spectral_recon_max"]
+    ).abs().max().item()
+    assert diff_suffix < 1e-7, f"Test 6: suffix vs unsuffix diff {diff_suffix}"
+    # Spread should differ from low (different reconstructed signal)
+    if not torch.allclose(
+        out_low["spectral_recon_max_low"],
+        out_spread["spectral_recon_max_spread"],
+    ):
+        pass  # expected: distinct values
+    else:
+        raise AssertionError("Test 6: spread layout produced identical scores to low (unexpected)")
+
     print("All self-tests passed:")
     print("  1. spectral_recon_max matches naive reference (c in {1,2,4,8,16})")
     print("  2. c=P: spectral_recon_max == oracle_max")
     print("  3. continuous_cosine_max >= spectral_recon_max element-wise")
     print("  4. UCB level 3 Parseval: sum_t u_t^2 == sigma_res^2")
     print("  5. c=P (empty notJ): all UCB variants == spectral_recon_max")
+    print("  6. multi-layout name_suffix produces distinct keys, low-suffix == unsuffixed")
 
 
 def main() -> None:
@@ -606,21 +684,33 @@ def main() -> None:
     lambdas = [float(x.strip()) for x in args.lambdas.split(",") if x.strip()]
     betas = [float(x.strip()) for x in args.betas.split(",") if x.strip()]
     ucb_levels = sorted({int(x.strip()) for x in args.ucb_levels.split(",") if x.strip()})
-    layout = args.layout or "low"
+
+    if args.layouts:
+        raw_layouts = [x.strip() for x in args.layouts.split(",") if x.strip()]
+    elif args.layout:
+        raw_layouts = [args.layout]
+    else:
+        raw_layouts = ["low"]
+    # Dedupe while preserving order
+    layouts: list[str] = []
+    for lay in raw_layouts:
+        if lay not in layouts:
+            layouts.append(lay)
 
     comp_size = max(1, int(args.page_size * args.compress_ratio))
-    all_methods = _build_method_registry(lambdas, betas, comp_size, ucb_levels)
+    all_methods = _build_method_registry(lambdas, betas, comp_size, ucb_levels, layouts)
 
     if comp_size > 1:
         print(f"Frequency indices (comp_size={comp_size}, page_size={args.page_size}):")
-        print(
-            f"  layout={layout!r}: "
-            f"{_resolve_frequency_keep_indices_local(args.page_size, comp_size, layout)}"
-        )
+        for lay in layouts:
+            print(
+                f"  layout={lay!r}: "
+                f"{_resolve_frequency_keep_indices_local(args.page_size, comp_size, lay)}"
+            )
 
     print(f"Full attention generation, {args.num_decode_steps} decode steps, scoring all layers")
     print(f"Ground truths: {gt_names}")
-    print(f"UCB levels: {ucb_levels}, betas: {betas}, layout: {layout}")
+    print(f"UCB levels: {ucb_levels}, betas: {betas}, layouts: {layouts}")
     print(f"continuous_multiplier: {args.continuous_multiplier} -> dense samples = {args.continuous_multiplier * args.page_size}")
     print(f"Methods printed: {len(all_methods)}")
 
@@ -639,11 +729,12 @@ def main() -> None:
     num_kv_groups = model.config.num_attention_heads // model.config.num_key_value_heads
     print(f"  num_layers={num_layers}, num_kv_groups={num_kv_groups}")
 
+    layouts_tag = "+".join(layouts)
     run_dirs = {}
     for gt_name in gt_names:
         run_dir = (
             args.output_dir
-            / f"ps{args.page_size}_topk{args.top_k}_cr{args.compress_ratio}_lay{layout}_gt_{gt_name}"
+            / f"ps{args.page_size}_topk{args.top_k}_cr{args.compress_ratio}_lay{layouts_tag}_gt_{gt_name}"
         )
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "config.json").write_text(
@@ -719,7 +810,7 @@ def main() -> None:
                             model.config, num_kv_groups, comp_size,
                             args.page_size, args.sink_size, args.recent_size,
                             args.top_k, lambdas, betas, device, dtype,
-                            layout=layout,
+                            layouts=layouts,
                             ucb_levels=ucb_levels,
                             ucb_num_bands=args.ucb_num_bands,
                             continuous_multiplier=args.continuous_multiplier,
@@ -768,6 +859,8 @@ def main() -> None:
                 print(f"  No results for {task}")
                 continue
 
+            gt_summaries: dict[str, dict[str, Any]] = {}
+
             for gt_name in gt_names:
                 methods = [m for m in all_methods if m != gt_name]
                 sample_results = []
@@ -801,6 +894,8 @@ def main() -> None:
                 for k in avg_keys:
                     task_summary[k] = sum(r[k] for r in sample_results) / n
 
+                gt_summaries[gt_name] = task_summary
+
                 print(
                     f"\n  === {task} Summary (vs {gt_name}, group_agg=max, "
                     f"{args.num_decode_steps} steps x {num_layers} layers) ==="
@@ -833,6 +928,30 @@ def main() -> None:
                     encoding="utf-8",
                 )
                 print(f"  Results saved to: {run_dir / f'{task}.json'}")
+
+            # --- Combined cross-GT recall comparison ---
+            if len(gt_summaries) >= 2:
+                gt_order = [gt for gt in gt_names if gt in gt_summaries]
+                showable = [
+                    m for m in all_methods
+                    if all(f"{m}_recall_avg" in gt_summaries[gt] for gt in gt_order)
+                ]
+
+                def _hdr(gt: str) -> str:
+                    return f"recall_vs_{gt}"
+
+                col_w = {gt: max(len(_hdr(gt)), 7) for gt in gt_order}
+                header_cells = "  ".join(f"{_hdr(gt):<{col_w[gt]}}" for gt in gt_order)
+                print(
+                    f"\n  === {task} Combined recall (vs {', '.join(gt_order)}) ==="
+                )
+                print(f"  {'method':35s}  {header_cells}")
+                for m in showable:
+                    cells = "  ".join(
+                        f"{gt_summaries[gt][f'{m}_recall_avg']:.3f}".ljust(col_w[gt])
+                        for gt in gt_order
+                    )
+                    print(f"  {m:35s}  {cells}")
 
     finally:
         cleanup_model(model)
