@@ -325,6 +325,20 @@ def _parse_dc_ac_scoring_method(scoring_method: str):
     return None
 
 
+def _parse_hybrid_multi_scoring_method(scoring_method: str):
+    """Parse hybrid_multi scoring method string.
+
+    Returns (M, alpha) or None if not a hybrid_multi method.
+      "hybrid_multi2_ac_max_a0.5" -> (2, 0.5)
+      "hybrid_multi4_ac_max_a1.0" -> (4, 1.0)
+    """
+    import re
+    m = re.match(r'^hybrid_multi(\d+)_ac_max_a([\d.]+)$', scoring_method)
+    if m:
+        return int(m.group(1)), float(m.group(2))
+    return None
+
+
 def dct_compress_page_with_indices(x, freq_indices):
     """Compress a page by selecting specific DCT frequencies before IDCT."""
     comp_size = len(freq_indices)
@@ -1010,6 +1024,97 @@ def _update_spectral_score_cache(attn_module, paged_k, num_pages, comp_size, cfg
     return cache[:, :, :num_pages]
 
 
+def _score_pages_hybrid_multi(
+    query_states,
+    paged_k,
+    spectral_comp_k,
+    M_proj,
+    M_highlight,
+    alpha,
+    num_kv_groups,
+    group_agg_method,
+    out=None,
+):
+    """Score pages with hybrid multi-highlight: M exact tokens + spectral reconstruction.
+
+    Combines top-M AC-energy tokens (exact Q.K) with spectral curve reconstruction
+    from the remaining DCT coefficients.
+
+    Args:
+        query_states:    [bsz, num_heads, 1, head_dim]
+        paged_k:         [bsz, num_kv_heads, num_pages, page_size, head_dim]
+        spectral_comp_k: [bsz, num_kv_heads, num_pages, c_multi, head_dim] or None
+        M_proj:          [c_multi, page_size] DCT spectral projection matrix, or None
+        M_highlight:     number of AC-energy-selected tokens per page
+        alpha:           spectral scaling factor
+        num_kv_groups:   GQA group count
+        group_agg_method: "mean" | "max" | "topp"
+        out:             optional pre-allocated [bsz, num_kv_heads, capacity] float32 buffer
+
+    Returns:
+        page_scores: [bsz, num_kv_heads, num_pages] (float32)
+    """
+    bsz, num_kv_heads, num_pages, page_size, head_dim = paged_k.shape
+    scaling = head_dim ** -0.5
+
+    # Reshape query for GQA: [bsz, num_kv_heads, G, head_dim]
+    q = query_states.squeeze(2).float()
+    q = q.reshape(bsz, num_kv_heads, num_kv_groups, head_dim) * scaling
+
+    k_f = paged_k.float()
+
+    # --- AC energy selection: pick top-M tokens per page ---
+    k_mean = k_f.mean(dim=-2, keepdim=True)                     # [B,H,N,1,D]
+    ac_energy = (k_f - k_mean).pow(2).sum(dim=-1)               # [B,H,N,P]
+    _, topM_idx = ac_energy.topk(M_highlight, dim=-1)            # [B,H,N,M]
+
+    idx_exp = topM_idx.unsqueeze(-1).expand(
+        bsz, num_kv_heads, num_pages, M_highlight, head_dim
+    )
+    K_multi = k_f.gather(dim=-2, index=idx_exp)                  # [B,H,N,M,D]
+
+    # Exact Q.K for selected tokens
+    multi_scores = torch.einsum(
+        'bhgd,bhnmd->bhgnm', q, K_multi
+    )                                                             # [B,H,G,N,M]
+    multi_hi = multi_scores.max(dim=-1).values                   # [B,H,G,N]
+
+    if spectral_comp_k is not None and M_proj is not None:
+        # --- Spectral reconstruction from c_multi DCT coefficients ---
+        a = torch.einsum(
+            'bhgd,bhncd->bhgnc', q, spectral_comp_k.float()
+        )                                                         # [B,H,G,N,c_multi]
+
+        Phi_T = M_proj.T.float().contiguous()                    # [P, c_multi]
+        shat = torch.einsum(
+            'tc,bhgnc->bhgnt', Phi_T, a
+        )                                                         # [B,H,G,N,P]
+        spectral_max = shat.max(dim=-1).values                   # [B,H,G,N]
+
+        # Combine: max(alpha * spectral_max, multi_hi)
+        combined = torch.maximum(alpha * spectral_max, multi_hi)  # [B,H,G,N]
+    else:
+        # No DCT budget: degenerate to multi-highlight only
+        combined = multi_hi                                       # [B,H,G,N]
+
+    # Group aggregation
+    if group_agg_method == "mean":
+        page_scores = combined.mean(dim=2)
+    elif group_agg_method == "max":
+        page_scores = combined.max(dim=2).values
+    elif group_agg_method == "topp":
+        k_top = min(2, num_kv_groups)
+        page_scores = combined.topk(k_top, dim=2).values.mean(dim=2)
+    else:
+        raise ValueError(f"Unsupported group_agg_method: {group_agg_method}")
+
+    if out is not None:
+        out_view = out[:, :, :num_pages]
+        out_view.copy_(page_scores)
+        return out_view
+    return page_scores.contiguous()
+
+
 def _block_center_positions(start_page_idx, n_pages, page_size, comp_size, sink_size, device):
     """Compute the center position of each compressed block within a page.
 
@@ -1325,20 +1430,41 @@ def dct_page_attention_forward(
         )
 
     score_query_states = query_states
-    dc_ac_parsed = _parse_dc_ac_scoring_method(cfg.scoring_method)
-    if dc_ac_parsed is not None:
-        dc_ac_layout, _, dc_ac_full = dc_ac_parsed
-        score_cache_size = cfg.page_size if dc_ac_full else comp_size
-        score_comp_k = _update_spectral_score_cache(
-            self, paged_k, num_pages, score_cache_size, cfg, dc_ac_layout,
+    hybrid_multi_parsed = _parse_hybrid_multi_scoring_method(cfg.scoring_method)
+    if hybrid_multi_parsed is not None:
+        hm_M, hm_alpha = hybrid_multi_parsed
+        # DCT coefficient count comes from compress_ratio; M tokens are additional.
+        c_multi = comp_size  # = max(1, int(page_size * compress_ratio))
+        if c_multi > 0:
+            spectral_comp_k = _update_spectral_score_cache(
+                self, paged_k, num_pages, c_multi, cfg, "low",
+            )
+            hm_proj = _get_or_build_dc_ac_spectral_matrix(
+                self, cfg.page_size, c_multi, paged_k.device, paged_k.dtype, "low",
+            )
+        else:
+            spectral_comp_k = None
+            hm_proj = None
+        page_scores = _score_pages_hybrid_multi(
+            score_query_states, paged_k[:, :, :num_pages], spectral_comp_k, hm_proj,
+            hm_M, hm_alpha, self.num_key_value_groups, cfg.group_agg_method,
+            out=self._page_scores_buf,
         )
     else:
-        score_comp_k = comp_k
+        dc_ac_parsed = _parse_dc_ac_scoring_method(cfg.scoring_method)
+        if dc_ac_parsed is not None:
+            dc_ac_layout, _, dc_ac_full = dc_ac_parsed
+            score_cache_size = cfg.page_size if dc_ac_full else comp_size
+            score_comp_k = _update_spectral_score_cache(
+                self, paged_k, num_pages, score_cache_size, cfg, dc_ac_layout,
+            )
+        else:
+            score_comp_k = comp_k
 
-    page_scores = score_pages_triton(
-        score_query_states, score_comp_k, cfg.scoring_method, cfg.group_agg_method, self.num_key_value_groups,
-        out=self._page_scores_buf,
-    )
+        page_scores = score_pages_triton(
+            score_query_states, score_comp_k, cfg.scoring_method, cfg.group_agg_method, self.num_key_value_groups,
+            out=self._page_scores_buf,
+        )
     debug_hook = _dct_page_debug_hook
     oracle_page_scores = None
     if debug_hook is not None or cfg.select_with_oracle_page_scores:
