@@ -242,6 +242,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dct_score_use_haar_mixed_proxy", action="store_true")
     p.add_argument("--dct_score_use_hadamard_proxy", action="store_true")
     p.add_argument("--dct_select_with_oracle_page_scores", action="store_true", default=True)
+    p.add_argument("--dct_no_select_with_oracle_page_scores", dest="dct_select_with_oracle_page_scores", action="store_false")
     p.add_argument("--dct_continuous_rope", action="store_true",
                    help="Temporarily disabled — raises error if used")
     p.add_argument("--dct_weight_compressed_by_population", action="store_true",

@@ -450,6 +450,82 @@ def _compute_codex_hybrid_scores(
             out[f'hybrid_multi{M}_max_over_a{a}'] = vm_max_over[..., ai]
             out[f'hybrid_multi{M}_add_over_a{a}'] = vm_add_over[..., ai]
 
+    # === Multi-highlight with acnorm selection + optional residual decode ===
+    for M in (multi_highlights or []):
+        M = int(M)
+        if M < 1 or M >= P:
+            continue
+        c_multi = max(0, c - M)
+
+        # Acnorm top-M selection
+        _, topM_idx_ac = ac_energy.topk(M, dim=-1)              # [B,H,N,M]
+        idx_M_ac = topM_idx_ac.unsqueeze(-1).expand(B, H, N, M, D)
+        K_multi_ac = k_f.gather(dim=-2, index=idx_M_ac)         # [B,H,N,M,D]
+        multi_scores_ac = torch.einsum(
+            'bhgd,bhnmd->bhgnm', q, K_multi_ac
+        )                                                        # [B,H,G,N,M]
+        multi_hi_ac = multi_scores_ac.max(dim=-1).values         # [B,H,G,N]
+
+        if c_multi > 0:
+            shat_multi_ac = _spectral_curve(c_multi)
+            spectral_multi_ac_max = shat_multi_ac.max(dim=-1).values
+
+            # --- ac: max-score decode ---
+            scaled_m = spectral_multi_ac_max.unsqueeze(-1) * alphas_t
+            hi_m = multi_hi_ac.unsqueeze(-1).expand_as(scaled_m)
+            vm_max = torch.maximum(scaled_m, hi_m).max(dim=2).values
+            vm_add = (scaled_m + hi_m).max(dim=2).values
+            for ai, a in enumerate(alphas):
+                out[f'hybrid_multi{M}_ac_max_a{a}'] = vm_max[..., ai]
+                out[f'hybrid_multi{M}_ac_add_a{a}'] = vm_add[..., ai]
+
+            # --- acresid: residual decode (query-aware selection) ---
+            topM_idx_g = topM_idx_ac.unsqueeze(2).expand(B, H, G, N, M)
+            shat_at_cands = shat_multi_ac.gather(dim=-1, index=topM_idx_g)
+            residuals = multi_scores_ac - shat_at_cands
+            best_m_idx = residuals.argmax(dim=-1)
+            best_score = multi_scores_ac.gather(
+                dim=-1, index=best_m_idx.unsqueeze(-1)
+            ).squeeze(-1)
+
+            scaled_m_r = spectral_multi_ac_max.unsqueeze(-1) * alphas_t
+            hi_r = best_score.unsqueeze(-1).expand_as(scaled_m_r)
+            vr_max = torch.maximum(scaled_m_r, hi_r).max(dim=2).values
+            vr_add = (scaled_m_r + hi_r).max(dim=2).values
+            for ai, a in enumerate(alphas):
+                out[f'hybrid_multi{M}_acresid_max_a{a}'] = vr_max[..., ai]
+                out[f'hybrid_multi{M}_acresid_add_a{a}'] = vr_add[..., ai]
+        else:
+            # c_multi == 0: both ac and acresid degenerate to max_m(q·K_m)
+            out[f'hybrid_multi{M}_ac_only'] = multi_hi_ac.max(dim=2).values
+
+        # Over budget: c DCT + M tokens
+        # --- ac over ---
+        scaled_full_m = spectral_full_max.unsqueeze(-1) * alphas_t
+        hi_m_f = multi_hi_ac.unsqueeze(-1).expand_as(scaled_full_m)
+        vm_max_over = torch.maximum(scaled_full_m, hi_m_f).max(dim=2).values
+        vm_add_over = (scaled_full_m + hi_m_f).max(dim=2).values
+        for ai, a in enumerate(alphas):
+            out[f'hybrid_multi{M}_ac_max_over_a{a}'] = vm_max_over[..., ai]
+            out[f'hybrid_multi{M}_ac_add_over_a{a}'] = vm_add_over[..., ai]
+
+        # --- acresid over: use shat_full for residual ---
+        topM_idx_g_f = topM_idx_ac.unsqueeze(2).expand(B, H, G, N, M)
+        shat_at_cands_f = shat_full.gather(dim=-1, index=topM_idx_g_f)
+        residuals_f = multi_scores_ac - shat_at_cands_f
+        best_m_idx_f = residuals_f.argmax(dim=-1)
+        best_score_f = multi_scores_ac.gather(
+            dim=-1, index=best_m_idx_f.unsqueeze(-1)
+        ).squeeze(-1)
+
+        scaled_full_r = spectral_full_max.unsqueeze(-1) * alphas_t
+        hi_r_f = best_score_f.unsqueeze(-1).expand_as(scaled_full_r)
+        vr_max_over = torch.maximum(scaled_full_r, hi_r_f).max(dim=2).values
+        vr_add_over = (scaled_full_r + hi_r_f).max(dim=2).values
+        for ai, a in enumerate(alphas):
+            out[f'hybrid_multi{M}_acresid_max_over_a{a}'] = vr_max_over[..., ai]
+            out[f'hybrid_multi{M}_acresid_add_over_a{a}'] = vr_add_over[..., ai]
+
     # === Oracle: query-aware residual-argmax highlight (heuristic-independent) ===
     per_tok = torch.einsum('bhgd,bhnsd->bhgns', q, k_f)     # [B,H,G,N,P]
     residual = per_tok - shat_lo                              # signed, not absolute
@@ -745,7 +821,7 @@ def _build_method_registry(lambdas, betas, comp_size, ucb_levels, layouts, alpha
         # Oracle (heuristic-independent)
         methods += [f"hybrid_highlight_max_oracle_a{a}" for a in alphas]
         methods += [f"hybrid_highlight_add_oracle_a{a}" for a in alphas]
-        # Multi-highlight methods
+        # Multi-highlight methods (K-norm selection)
         for M in (multi_highlights or []):
             c_multi = max(0, comp_size - M)
             if c_multi > 0:
@@ -755,6 +831,20 @@ def _build_method_registry(lambdas, betas, comp_size, ucb_levels, layouts, alpha
                 methods.append(f"hybrid_multi{M}_only")
             methods += [f"hybrid_multi{M}_max_over_a{a}" for a in alphas]
             methods += [f"hybrid_multi{M}_add_over_a{a}" for a in alphas]
+        # Multi-highlight with acnorm selection + residual decode
+        for M in (multi_highlights or []):
+            c_multi = max(0, comp_size - M)
+            if c_multi > 0:
+                methods += [f"hybrid_multi{M}_ac_max_a{a}" for a in alphas]
+                methods += [f"hybrid_multi{M}_ac_add_a{a}" for a in alphas]
+                methods += [f"hybrid_multi{M}_acresid_max_a{a}" for a in alphas]
+                methods += [f"hybrid_multi{M}_acresid_add_a{a}" for a in alphas]
+            else:
+                methods.append(f"hybrid_multi{M}_ac_only")
+            methods += [f"hybrid_multi{M}_ac_max_over_a{a}" for a in alphas]
+            methods += [f"hybrid_multi{M}_ac_add_over_a{a}" for a in alphas]
+            methods += [f"hybrid_multi{M}_acresid_max_over_a{a}" for a in alphas]
+            methods += [f"hybrid_multi{M}_acresid_add_over_a{a}" for a in alphas]
     return methods
 
 
@@ -988,6 +1078,42 @@ def _self_test() -> None:
             f"Test 13 (c={c}): hybrid_multi2_max < spectral_lo(c-2) by {-diff13}"
         )
 
+    # ---- Test 14: hybrid_multi2_ac_max >= spectral_recon_max(c-2) for c >= 4 ----
+    for c in [4, 8, 16]:
+        c_multi = c - 2
+        hy_ac2 = _compute_codex_hybrid_scores(
+            paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+            comp_size=c, layout="low", alphas=[1.0], continuous_multiplier=4,
+            multi_highlights=[2],
+        )
+        sp_lo_14 = _compute_codex_spectral_scores(
+            paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+            comp_size=c_multi, layout="low", betas=[], ucb_levels=[],
+            ucb_num_bands=4, continuous_multiplier=4,
+        )['spectral_recon_max']
+        diff14 = (hy_ac2['hybrid_multi2_ac_max_a1.0'] - sp_lo_14).min().item()
+        assert diff14 >= -1e-5, (
+            f"Test 14 (c={c}): hybrid_multi2_ac_max < spectral_lo(c-2) by {-diff14}"
+        )
+
+    # ---- Test 15: hybrid_multi2_acresid_max >= spectral_recon_max(c-2) for c >= 4 ----
+    for c in [4, 8, 16]:
+        c_multi = c - 2
+        hy_ar2 = _compute_codex_hybrid_scores(
+            paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+            comp_size=c, layout="low", alphas=[1.0], continuous_multiplier=4,
+            multi_highlights=[2],
+        )
+        sp_lo_15 = _compute_codex_spectral_scores(
+            paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+            comp_size=c_multi, layout="low", betas=[], ucb_levels=[],
+            ucb_num_bands=4, continuous_multiplier=4,
+        )['spectral_recon_max']
+        diff15 = (hy_ar2['hybrid_multi2_acresid_max_a1.0'] - sp_lo_15).min().item()
+        assert diff15 >= -1e-5, (
+            f"Test 15 (c={c}): hybrid_multi2_acresid_max < spectral_lo(c-2) by {-diff15}"
+        )
+
     print("All self-tests passed:")
     print("  1. spectral_recon_max matches naive reference (c in {1,2,4,8,16})")
     print("  2. c=P: spectral_recon_max == oracle_max")
@@ -1002,6 +1128,8 @@ def _self_test() -> None:
     print(" 11. hybrid_acnorm_max >= spectral_recon_max(c-1)")
     print(" 12. hybrid_specresid_max >= spectral_recon_max(c-1)")
     print(" 13. hybrid_multi2_max >= spectral_recon_max(c-2) for c >= 4")
+    print(" 14. hybrid_multi2_ac_max >= spectral_recon_max(c-2) for c >= 4")
+    print(" 15. hybrid_multi2_acresid_max >= spectral_recon_max(c-2) for c >= 4")
 
 
 def main() -> None:

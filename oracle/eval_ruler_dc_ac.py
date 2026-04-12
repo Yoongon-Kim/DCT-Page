@@ -8,6 +8,11 @@ Each combination is run as a subprocess via oracle/run_ruler_eval.py.
 Unlike proxy_dc_ac (which uses only comp_size DCT coefficients, typically 1),
 dc_ac uses ALL page_size coefficients for scoring:
     score = DC + lambda * sqrt(sum(AC[1:]^2))
+
+Modes:
+  - drop (default): unselected pages are discarded entirely.
+  - compressed (hybrid): unselected pages keep DCT-IDCT compressed KV tokens,
+    with optional population weighting (--weight_pop).
 """
 
 from __future__ import annotations
@@ -69,6 +74,33 @@ def parse_args() -> argparse.Namespace:
         help="Space-separated page_size,top_k pairs. E.g. '32,64 16,128'.",
     )
     p.add_argument(
+        "--unselected_mode",
+        type=str,
+        default="drop",
+        choices=["drop", "compressed"],
+        help="'drop' discards unselected pages; 'compressed' (hybrid) keeps "
+        "DCT-IDCT compressed KV for unselected pages.",
+    )
+    p.add_argument(
+        "--compress_ratio",
+        type=float,
+        default=0.0625,
+        help="Compression ratio for unselected pages in compressed mode.",
+    )
+    p.add_argument(
+        "--compression_method",
+        type=str,
+        default="dct",
+        choices=["haar", "dct"],
+        help="Compression method for unselected pages in compressed mode.",
+    )
+    p.add_argument(
+        "--weight_pop",
+        default="0",
+        help="Comma-separated 0/1 values to sweep --dct_weight_compressed_by_population. "
+        "E.g. '0', '1', or '0,1' to run both. Only effective in compressed mode.",
+    )
+    p.add_argument(
         "--group_agg_method",
         type=str,
         default="max",
@@ -93,6 +125,20 @@ def parse_combos(values: list[str]) -> list[tuple[int, int]]:
     return combos
 
 
+def parse_weight_pop(value: str) -> list[bool]:
+    out = []
+    for x in value.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        if x not in ("0", "1"):
+            raise ValueError(f"--weight_pop entries must be 0 or 1, got {x!r}")
+        out.append(x == "1")
+    if not out:
+        raise ValueError("--weight_pop must contain at least one of 0,1")
+    return out
+
+
 def resolve_tasks(value: str) -> list[str]:
     if value == "all":
         return list(TASKS)
@@ -103,8 +149,21 @@ def resolve_tasks(value: str) -> list[str]:
     return requested
 
 
-def make_run_dir(output_root: Path, page_size: int, top_k: int, lam: str) -> Path:
-    run_dir = output_root / f"ps{page_size}_topk{top_k}_dc_ac_{lam}"
+def make_run_dir(
+    output_root: Path,
+    page_size: int,
+    top_k: int,
+    lam: str,
+    unselected_mode: str,
+    compress_ratio: float = 0.0,
+    compression_method: str = "",
+    weight_pop: bool = False,
+) -> Path:
+    name = f"ps{page_size}_topk{top_k}_dc_ac_{lam}"
+    if unselected_mode == "compressed":
+        pop_tag = "popw" if weight_pop else "nopopw"
+        name += f"_cr{compress_ratio}_{compression_method}_{pop_tag}"
+    run_dir = output_root / name
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
@@ -119,6 +178,10 @@ def build_run_cmd(
     top_k: int,
     lam: str,
     group_agg_method: str,
+    unselected_mode: str,
+    compress_ratio: float,
+    compression_method: str,
+    weight_pop: bool,
     data_root: Path,
     num_samples: int,
     max_new_tokens: int,
@@ -143,68 +206,111 @@ def build_run_cmd(
         "--dct_recent_size", "128",
         "--dct_scoring_method", f"dc_ac_{lam}",
         "--dct_group_agg_method", group_agg_method,
-        "--dct_unselected_mode", "drop",
+        "--dct_unselected_mode", unselected_mode,
+        "--dct_no_select_with_oracle_page_scores",
     ]
+    if unselected_mode == "compressed":
+        cmd.extend([
+            "--dct_compress_ratio", str(compress_ratio),
+            "--dct_compression_method", compression_method,
+        ])
+        if compression_method == "dct":
+            cmd.append("--dct_score_use_low_proxy")
+        if weight_pop:
+            cmd.append("--dct_weight_compressed_by_population")
     if local_files_only:
         cmd.append("--local_files_only")
     return cmd
 
 
 def collect_run_summary(
-    page_size: int, top_k: int, lam: str, run_dir: Path,
+    page_size: int,
+    top_k: int,
+    lam: str,
+    run_dir: Path,
+    unselected_mode: str,
+    compress_ratio: float,
+    compression_method: str,
+    weight_pop: bool,
 ) -> list[dict]:
     with (run_dir / "summary.json").open("r", encoding="utf-8") as fp:
         summary = json.load(fp)
     rows = []
     for row in summary["rows"]:
-        rows.append({
+        entry = {
             "task": row["task"],
             "page_size": page_size,
             "top_k": top_k,
             "lambda": lam,
+            "unselected_mode": unselected_mode,
             "score": float(row["score"]),
             "output_jsonl": row["output_jsonl"],
             "run_dir": str(run_dir),
-        })
+        }
+        if unselected_mode == "compressed":
+            entry["compress_ratio"] = compress_ratio
+            entry["compression_method"] = compression_method
+            entry["weight_pop"] = int(weight_pop)
+        rows.append(entry)
     return rows
 
 
 def write_summary_files(output_root: Path, all_rows: list[dict]) -> None:
     all_rows = sorted(
         all_rows,
-        key=lambda r: (r["page_size"], float(r["lambda"]), TASKS.index(r["task"])),
+        key=lambda r: (
+            r["page_size"],
+            r["unselected_mode"],
+            r.get("weight_pop", 0),
+            float(r["lambda"]),
+            TASKS.index(r["task"]),
+        ),
     )
 
+    fieldnames = [
+        "task", "page_size", "top_k", "lambda", "unselected_mode",
+        "compress_ratio", "compression_method", "weight_pop",
+        "score", "output_jsonl", "run_dir",
+    ]
     with (output_root / "summary.tsv").open("w", encoding="utf-8", newline="") as fp:
-        writer = csv.DictWriter(
-            fp,
-            fieldnames=["task", "page_size", "top_k", "lambda", "score", "output_jsonl", "run_dir"],
-            delimiter="\t",
-        )
+        writer = csv.DictWriter(fp, fieldnames=fieldnames, delimiter="\t",
+                                extrasaction="ignore")
         writer.writeheader()
         writer.writerows(all_rows)
 
     avg_rows = []
     seen = set()
     for r in all_rows:
-        key = (r["page_size"], r["top_k"], r["lambda"])
+        key = (r["page_size"], r["top_k"], r["lambda"],
+               r["unselected_mode"], r.get("weight_pop", 0))
         if key in seen:
             continue
         seen.add(key)
-        group = [x for x in all_rows if (x["page_size"], x["top_k"], x["lambda"]) == key]
-        avg_rows.append({
+        group = [
+            x for x in all_rows
+            if (x["page_size"], x["top_k"], x["lambda"],
+                x["unselected_mode"], x.get("weight_pop", 0)) == key
+        ]
+        entry = {
             "page_size": r["page_size"],
             "top_k": r["top_k"],
             "lambda": r["lambda"],
+            "unselected_mode": r["unselected_mode"],
             "score_avg": sum(x["score"] for x in group) / len(group),
-        })
+        }
+        if r["unselected_mode"] == "compressed":
+            entry["compress_ratio"] = r.get("compress_ratio")
+            entry["compression_method"] = r.get("compression_method")
+            entry["weight_pop"] = r.get("weight_pop")
+        avg_rows.append(entry)
 
+    avg_fieldnames = [
+        "page_size", "top_k", "lambda", "unselected_mode",
+        "compress_ratio", "compression_method", "weight_pop", "score_avg",
+    ]
     with (output_root / "summary_avg.tsv").open("w", encoding="utf-8", newline="") as fp:
-        writer = csv.DictWriter(
-            fp,
-            fieldnames=["page_size", "top_k", "lambda", "score_avg"],
-            delimiter="\t",
-        )
+        writer = csv.DictWriter(fp, fieldnames=avg_fieldnames, delimiter="\t",
+                                extrasaction="ignore")
         writer.writeheader()
         writer.writerows(avg_rows)
 
@@ -220,75 +326,113 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     combos = parse_combos(args.combos)
     tasks = resolve_tasks(args.tasks)
+    weight_pops = parse_weight_pop(args.weight_pop)
+
+    # In drop mode, weight_pop is irrelevant — run once with False.
+    if args.unselected_mode == "drop":
+        weight_pops = [False]
 
     all_rows: list[dict] = []
 
     for page_size, top_k in combos:
         for lam in args.lambdas:
-            run_dir = make_run_dir(args.output_root, page_size, top_k, lam)
+            for weight_pop in weight_pops:
+                run_dir = make_run_dir(
+                    args.output_root, page_size, top_k, lam,
+                    args.unselected_mode, args.compress_ratio,
+                    args.compression_method, weight_pop,
+                )
 
-            if (run_dir / "summary.json").exists():
+                mode_tag = args.unselected_mode
+                if args.unselected_mode == "compressed":
+                    pop_str = "popw" if weight_pop else "nopopw"
+                    mode_tag = (
+                        f"compressed cr={args.compress_ratio} "
+                        f"{args.compression_method} {pop_str}"
+                    )
+
+                if (run_dir / "summary.json").exists():
+                    print(
+                        f"\n[dc_ac] SKIP page_size={page_size} top_k={top_k} "
+                        f"lambda={lam} {mode_tag} "
+                        f"-- summary already exists in {run_dir}",
+                        flush=True,
+                    )
+                    all_rows.extend(collect_run_summary(
+                        page_size, top_k, lam, run_dir,
+                        args.unselected_mode, args.compress_ratio,
+                        args.compression_method, weight_pop,
+                    ))
+                    continue
+
+                manifest = {
+                    "model_name_or_path": args.model_name_or_path,
+                    "context_len": args.context_len,
+                    "page_size": page_size,
+                    "top_k": top_k,
+                    "lambda": lam,
+                    "scoring_method": f"dc_ac_{lam}",
+                    "group_agg_method": args.group_agg_method,
+                    "unselected_mode": args.unselected_mode,
+                    "num_samples": args.num_samples,
+                    "max_new_tokens": args.max_new_tokens,
+                    "cuda_device": args.cuda_device,
+                    "tasks": tasks,
+                    "note": "Full dc_ac scoring: uses all page_size DCT coefficients, "
+                    "not just comp_size proxy coefficients.",
+                }
+                if args.unselected_mode == "compressed":
+                    manifest.update({
+                        "compress_ratio": args.compress_ratio,
+                        "compression_method": args.compression_method,
+                        "weight_compressed_by_population": weight_pop,
+                    })
+                (run_dir / "manifest.json").write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+
+                cmd = build_run_cmd(
+                    script_path=script_path,
+                    model_name_or_path=args.model_name_or_path,
+                    run_dir=run_dir,
+                    context_len=args.context_len,
+                    tasks=tasks,
+                    page_size=page_size,
+                    top_k=top_k,
+                    lam=lam,
+                    group_agg_method=args.group_agg_method,
+                    unselected_mode=args.unselected_mode,
+                    compress_ratio=args.compress_ratio,
+                    compression_method=args.compression_method,
+                    weight_pop=weight_pop,
+                    data_root=args.data_root,
+                    num_samples=args.num_samples,
+                    max_new_tokens=args.max_new_tokens,
+                    cuda_device=args.cuda_device,
+                    local_files_only=args.local_files_only,
+                )
+                (run_dir / "command.sh").write_text(
+                    "#!/usr/bin/env bash\nset -euo pipefail\n\n"
+                    + " ".join(shlex.quote(part) for part in cmd)
+                    + "\n",
+                    encoding="utf-8",
+                )
                 print(
-                    f"\n[dc_ac] SKIP page_size={page_size} top_k={top_k} lambda={lam} "
-                    f"-- summary already exists in {run_dir}",
+                    f"\n[dc_ac] page_size={page_size} top_k={top_k} "
+                    f"lambda={lam} {mode_tag} -> {run_dir}",
                     flush=True,
                 )
-                all_rows.extend(collect_run_summary(page_size, top_k, lam, run_dir))
-                continue
-
-            manifest = {
-                "model_name_or_path": args.model_name_or_path,
-                "context_len": args.context_len,
-                "page_size": page_size,
-                "top_k": top_k,
-                "lambda": lam,
-                "scoring_method": f"dc_ac_{lam}",
-                "group_agg_method": args.group_agg_method,
-                "unselected_mode": "drop",
-                "num_samples": args.num_samples,
-                "max_new_tokens": args.max_new_tokens,
-                "cuda_device": args.cuda_device,
-                "tasks": tasks,
-                "note": "Full dc_ac scoring: uses all page_size DCT coefficients, "
-                "not just comp_size proxy coefficients.",
-            }
-            (run_dir / "manifest.json").write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-
-            cmd = build_run_cmd(
-                script_path=script_path,
-                model_name_or_path=args.model_name_or_path,
-                run_dir=run_dir,
-                context_len=args.context_len,
-                tasks=tasks,
-                page_size=page_size,
-                top_k=top_k,
-                lam=lam,
-                group_agg_method=args.group_agg_method,
-                data_root=args.data_root,
-                num_samples=args.num_samples,
-                max_new_tokens=args.max_new_tokens,
-                cuda_device=args.cuda_device,
-                local_files_only=args.local_files_only,
-            )
-            (run_dir / "command.sh").write_text(
-                "#!/usr/bin/env bash\nset -euo pipefail\n\n"
-                + " ".join(shlex.quote(part) for part in cmd)
-                + "\n",
-                encoding="utf-8",
-            )
-            print(
-                f"\n[dc_ac] page_size={page_size} top_k={top_k} lambda={lam} -> {run_dir}",
-                flush=True,
-            )
-            print("  cmd: " + " ".join(shlex.quote(part) for part in cmd), flush=True)
-            if args.dry_run:
-                print(f"  Dry run: skipping execution", flush=True)
-                continue
-            subprocess.run(cmd, cwd=repo_root, check=True)
-            all_rows.extend(collect_run_summary(page_size, top_k, lam, run_dir))
+                print("  cmd: " + " ".join(shlex.quote(part) for part in cmd), flush=True)
+                if args.dry_run:
+                    print(f"  Dry run: skipping execution", flush=True)
+                    continue
+                subprocess.run(cmd, cwd=repo_root, check=True)
+                all_rows.extend(collect_run_summary(
+                    page_size, top_k, lam, run_dir,
+                    args.unselected_mode, args.compress_ratio,
+                    args.compression_method, weight_pop,
+                ))
 
     if all_rows:
         write_summary_files(args.output_root, all_rows)
