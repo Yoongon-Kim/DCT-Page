@@ -10,7 +10,7 @@ class DCTPageConfig:
     compress_ratio: float = 0.03125   # Per-page compression (32 -> 1 token)
     min_decode_kv_len_for_paging: int = 8192  # Fallback to baseline decode attention below this KV length
     proxy_frequency_layout: str = "low"  # "low" | "low_high" | "low_mid_high" | "spread"
-    scoring_method: str = "max"    # "mean" | "max" | "sum" | "proxy_dc_ac_{lambda}" | "spread_dc_ac_{lambda}"
+    scoring_method: str = "max"    # "mean" | "max" | "sum" | "dc_ac_{lambda}" | "proxy_dc_ac_{lambda}" | "spread_dc_ac_{lambda}"
     group_agg_method: str = "mean" # "mean" | "max" | "topp" — aggregation of per-head scores within a GQA group
     unselected_mode: str = "drop"  # "drop" | "compressed"
     compression_method: str = "haar"  # "haar" | "dct" — compression method for unselected pages in compressed mode

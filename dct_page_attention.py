@@ -310,13 +310,18 @@ def _resolve_frequency_keep_indices(seq_len, comp_size, layout):
 def _parse_dc_ac_scoring_method(scoring_method: str):
     """Parse DC+AC scoring method string.
 
-    Returns (layout, lambda_val) or None if not a DC+AC method.
-      "proxy_dc_ac_0.5"   -> ("low", 0.5)
-      "spread_dc_ac_1.0"  -> ("spread", 1.0)
+    Returns (layout, lambda_val, full_spectrum) or None if not a DC+AC method.
+      "proxy_dc_ac_0.5"   -> ("low", 0.5, False)
+      "spread_dc_ac_1.0"  -> ("spread", 1.0, False)
+      "dc_ac_1.0"         -> ("low", 1.0, True)   # full page_size DCT coefficients
     """
-    for prefix, layout in (("proxy_dc_ac_", "low"), ("spread_dc_ac_", "spread")):
+    for prefix, layout, full in (
+        ("proxy_dc_ac_", "low", False),
+        ("spread_dc_ac_", "spread", False),
+        ("dc_ac_", "low", True),
+    ):
         if scoring_method.startswith(prefix):
-            return layout, float(scoring_method[len(prefix):])
+            return layout, float(scoring_method[len(prefix):]), full
     return None
 
 
@@ -1322,9 +1327,10 @@ def dct_page_attention_forward(
     score_query_states = query_states
     dc_ac_parsed = _parse_dc_ac_scoring_method(cfg.scoring_method)
     if dc_ac_parsed is not None:
-        dc_ac_layout, _ = dc_ac_parsed
+        dc_ac_layout, _, dc_ac_full = dc_ac_parsed
+        score_cache_size = cfg.page_size if dc_ac_full else comp_size
         score_comp_k = _update_spectral_score_cache(
-            self, paged_k, num_pages, comp_size, cfg, dc_ac_layout,
+            self, paged_k, num_pages, score_cache_size, cfg, dc_ac_layout,
         )
     else:
         score_comp_k = comp_k

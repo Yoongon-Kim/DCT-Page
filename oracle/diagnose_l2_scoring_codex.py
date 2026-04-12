@@ -292,6 +292,186 @@ def _compute_codex_spectral_scores(
     return out
 
 
+def _compute_codex_hybrid_scores(
+    paged_k: torch.Tensor | None,
+    query_states: torch.Tensor | None,
+    num_kv_groups: int | None,
+    comp_size: int | None,
+    layout: str,
+    alphas: list[float],
+    continuous_multiplier: int,
+    multi_highlights: list[int] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Hybrid storage budget: (c-1) DCT coefficients + highlight token(s).
+
+    Three query-independent highlight heuristics (single token):
+      highlight  — K-norm argmax: argmax_t(||k_t||²)
+      acnorm     — AC energy argmax: argmax_t(||k_t - k_mean||²)
+      specresid  — spectral residual norm: argmax_t(||k_t - k_recon||²)
+
+    Multi-highlight (M>1 tokens, K-norm top-M):
+      hybrid_multi{M}  — (c-M) DCT + M tokens
+
+    Oracle (query-aware residual argmax, heuristic-independent):
+      hybrid_highlight_{max,add}_oracle
+
+    All swept over alpha (spectral scaling factor). Highlight is the anchor;
+    alpha controls how much to trust the smooth reconstruction.
+    """
+    out: dict[str, torch.Tensor] = {}
+    if (
+        paged_k is None or query_states is None
+        or num_kv_groups is None or comp_size is None or comp_size <= 0
+        or not alphas
+    ):
+        return out
+
+    B, H, N, P, D = paged_k.shape
+    G = int(num_kv_groups)
+    c = max(1, min(int(comp_size), P))
+    c_lo = max(1, c - 1)
+    device = paged_k.device
+    scaling = D ** -0.5
+    X = max(1, int(continuous_multiplier)) * P
+
+    k_f = paged_k.float()
+    q = query_states.squeeze(2).reshape(B, H, G, D).float() * scaling
+
+    k_for_dct = k_f.transpose(-2, -1)
+    k_dct = _dct_local(k_for_dct).transpose(-2, -1)
+
+    alphas_t = torch.tensor(alphas, device=device, dtype=torch.float32)
+
+    def _spectral_curve(c_used):
+        _, _, J_tensor, _, Phi_kept_T, _, _ = _get_codex_basis(
+            P, c_used, layout, X, device, torch.float32
+        )
+        k_dct_kept = k_dct.index_select(-2, J_tensor)
+        a = torch.einsum('bhgd,bhncd->bhgnc', q, k_dct_kept)
+        shat = torch.einsum('tc,bhgnc->bhgnt', Phi_kept_T, a)
+        return shat
+
+    # --- Shared spectral curves (computed once) ---
+    shat_lo = _spectral_curve(c_lo)
+    spectral_lo_max = shat_lo.max(dim=-1).values           # [B,H,G,N]
+
+    shat_full = _spectral_curve(c)
+    spectral_full_max = shat_full.max(dim=-1).values       # [B,H,G,N]
+
+    # --- Inner helper: emit strict + over variants for one highlight score ---
+    def _emit_heuristic(name: str, hi_score: torch.Tensor):
+        """hi_score: [B,H,G,N]"""
+        # Strict budget: (c-1) DCT + 1 highlight
+        scaled_lo = spectral_lo_max.unsqueeze(-1) * alphas_t       # [B,H,G,N,A]
+        hi_exp = hi_score.unsqueeze(-1).expand_as(scaled_lo)
+        v_max = torch.maximum(scaled_lo, hi_exp).max(dim=2).values  # [B,H,N,A]
+        v_add = (scaled_lo + hi_exp).max(dim=2).values
+        for ai, a in enumerate(alphas):
+            out[f'hybrid_{name}_max_a{a}'] = v_max[..., ai]
+            out[f'hybrid_{name}_add_a{a}'] = v_add[..., ai]
+
+        # Over budget: c DCT + 1 highlight
+        scaled_full = spectral_full_max.unsqueeze(-1) * alphas_t
+        hi_exp_f = hi_score.unsqueeze(-1).expand_as(scaled_full)
+        v_max_over = torch.maximum(scaled_full, hi_exp_f).max(dim=2).values
+        v_add_over = (scaled_full + hi_exp_f).max(dim=2).values
+        for ai, a in enumerate(alphas):
+            out[f'hybrid_{name}_max_over_a{a}'] = v_max_over[..., ai]
+            out[f'hybrid_{name}_add_over_a{a}'] = v_add_over[..., ai]
+
+    # --- Helper: gather single highlight token and compute score ---
+    def _highlight_score_from_idx(idx: torch.Tensor) -> torch.Tensor:
+        """idx: [B,H,N] → highlight_score: [B,H,G,N]"""
+        ie = idx.unsqueeze(-1).unsqueeze(-1).expand(B, H, N, 1, D)
+        K_hi = k_f.gather(dim=-2, index=ie).squeeze(-2)     # [B,H,N,D]
+        return torch.einsum('bhgd,bhnd->bhgn', q, K_hi)
+
+    # === Heuristic 1: highlight (K-norm argmax) ===
+    k_norm_tok = k_f.pow(2).sum(dim=-1)                     # [B,H,N,P]
+    highlight_idx = k_norm_tok.argmax(dim=-1)                # [B,H,N]
+    _emit_heuristic('highlight', _highlight_score_from_idx(highlight_idx))
+
+    # === Heuristic 2: acnorm (AC energy argmax) ===
+    k_mean = k_f.mean(dim=-2, keepdim=True)                 # [B,H,N,1,D]
+    ac_energy = (k_f - k_mean).pow(2).sum(dim=-1)           # [B,H,N,P]
+    acnorm_idx = ac_energy.argmax(dim=-1)                    # [B,H,N]
+    _emit_heuristic('acnorm', _highlight_score_from_idx(acnorm_idx))
+
+    # === Heuristic 3: specresid (spectral residual norm argmax) ===
+    # Token with most energy in omitted DCT frequencies.
+    # By Cauchy-Schwarz: |q.(k_t - k_recon)| <= ||q|| * ||k_t - k_recon||
+    _, _, J_lo_tensor, _, Phi_kept_T_lo, _, _ = _get_codex_basis(
+        P, c_lo, layout, X, device, torch.float32
+    )
+    k_dct_kept_lo = k_dct.index_select(-2, J_lo_tensor)     # [B,H,N,c_lo,D]
+    k_recon = torch.einsum(
+        'tc,bhncd->bhntd', Phi_kept_T_lo, k_dct_kept_lo
+    )                                                        # [B,H,N,P,D]
+    specresid_energy = (k_f - k_recon).pow(2).sum(dim=-1)   # [B,H,N,P]
+    specresid_idx = specresid_energy.argmax(dim=-1)          # [B,H,N]
+    _emit_heuristic('specresid', _highlight_score_from_idx(specresid_idx))
+
+    # === Multi-highlight: M>1 K-norm top-M tokens ===
+    for M in (multi_highlights or []):
+        M = int(M)
+        if M < 1 or M >= P:
+            continue
+        c_multi = max(0, c - M)
+
+        _, topM_idx = k_norm_tok.topk(M, dim=-1)            # [B,H,N,M]
+        idx_M = topM_idx.unsqueeze(-1).expand(B, H, N, M, D)
+        K_multi = k_f.gather(dim=-2, index=idx_M)           # [B,H,N,M,D]
+        multi_scores = torch.einsum(
+            'bhgd,bhnmd->bhgnm', q, K_multi
+        )                                                    # [B,H,G,N,M]
+        multi_hi = multi_scores.max(dim=-1).values           # [B,H,G,N]
+
+        if c_multi > 0:
+            shat_multi = _spectral_curve(c_multi)
+            spectral_multi_max = shat_multi.max(dim=-1).values
+
+            scaled_m = spectral_multi_max.unsqueeze(-1) * alphas_t
+            hi_m = multi_hi.unsqueeze(-1).expand_as(scaled_m)
+            vm_max = torch.maximum(scaled_m, hi_m).max(dim=2).values
+            vm_add = (scaled_m + hi_m).max(dim=2).values
+            for ai, a in enumerate(alphas):
+                out[f'hybrid_multi{M}_max_a{a}'] = vm_max[..., ai]
+                out[f'hybrid_multi{M}_add_a{a}'] = vm_add[..., ai]
+        else:
+            # c_multi == 0: no DCT budget, score = max_m(q . K_m)
+            out[f'hybrid_multi{M}_only'] = multi_hi.max(dim=2).values
+
+        # Over budget: c DCT + M highlights (always available)
+        scaled_full_m = spectral_full_max.unsqueeze(-1) * alphas_t
+        hi_m_f = multi_hi.unsqueeze(-1).expand_as(scaled_full_m)
+        vm_max_over = torch.maximum(scaled_full_m, hi_m_f).max(dim=2).values
+        vm_add_over = (scaled_full_m + hi_m_f).max(dim=2).values
+        for ai, a in enumerate(alphas):
+            out[f'hybrid_multi{M}_max_over_a{a}'] = vm_max_over[..., ai]
+            out[f'hybrid_multi{M}_add_over_a{a}'] = vm_add_over[..., ai]
+
+    # === Oracle: query-aware residual-argmax highlight (heuristic-independent) ===
+    per_tok = torch.einsum('bhgd,bhnsd->bhgns', q, k_f)     # [B,H,G,N,P]
+    residual = per_tok - shat_lo                              # signed, not absolute
+    oracle_idx = residual.argmax(dim=-1)                      # [B,H,G,N]
+    oracle_score = per_tok.gather(
+        dim=-1, index=oracle_idx.unsqueeze(-1)
+    ).squeeze(-1)                                             # [B,H,G,N]
+
+    scaled_spec_lo_o = spectral_lo_max.unsqueeze(-1) * alphas_t
+    or_exp = oracle_score.unsqueeze(-1).expand_as(scaled_spec_lo_o)
+
+    v_max_oracle = torch.maximum(scaled_spec_lo_o, or_exp).max(dim=2).values
+    for ai, alpha in enumerate(alphas):
+        out[f'hybrid_highlight_max_oracle_a{alpha}'] = v_max_oracle[..., ai]
+
+    v_add_oracle = (scaled_spec_lo_o + or_exp).max(dim=2).values
+    for ai, alpha in enumerate(alphas):
+        out[f'hybrid_highlight_add_oracle_a{alpha}'] = v_add_oracle[..., ai]
+
+    return out
+
+
 def compute_all_scores_codex(
     per_token_scores: torch.Tensor,
     proxy_scores: dict[str, torch.Tensor],
@@ -307,6 +487,8 @@ def compute_all_scores_codex(
     ucb_levels: list[int] | None = None,
     ucb_num_bands: int = 4,
     continuous_multiplier: int = 4,
+    alphas: list[float] | None = None,
+    multi_highlights: list[int] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Wrap base.compute_all_scores and merge codex spectral methods.
 
@@ -355,6 +537,16 @@ def compute_all_scores_codex(
             )
             scores.update(codex_scores)
 
+        # Hybrid methods (layout-independent; emitted once)
+        scores.update(_compute_codex_hybrid_scores(
+            paged_k=paged_k, query_states=query_states,
+            num_kv_groups=num_kv_groups, comp_size=comp_size,
+            layout=layouts_eff[0] if layouts_eff else "low",
+            alphas=alphas or [1.0, 2.0, 4.0, 8.0],
+            continuous_multiplier=continuous_multiplier,
+            multi_highlights=multi_highlights,
+        ))
+
     return scores
 
 
@@ -379,6 +571,8 @@ def _score_one_layer_codex(
     ucb_levels: list[int] | None = None,
     ucb_num_bands: int = 4,
     continuous_multiplier: int = 4,
+    alphas: list[float] | None = None,
+    multi_highlights: list[int] | None = None,
 ) -> dict[str, torch.Tensor] | None:
     """Same body as base._score_one_layer but routes to compute_all_scores_codex."""
     from diagnose_l2_scoring import (
@@ -420,6 +614,7 @@ def _score_one_layer_codex(
         query_states=query_states, num_kv_groups=num_kv_groups, betas=betas,
         layouts=layouts, ucb_levels=ucb_levels,
         ucb_num_bands=ucb_num_bands, continuous_multiplier=continuous_multiplier,
+        alphas=alphas, multi_highlights=multi_highlights,
     )
     return all_scores
 
@@ -449,8 +644,8 @@ def parse_args() -> argparse.Namespace:
              + ", ".join(GROUND_TRUTHS) + ")",
     )
 
-    p.add_argument("--page_size", type=int, default=16)
-    p.add_argument("--top_k", type=int, default=128)
+    p.add_argument("--page_size", type=int, default=32)
+    p.add_argument("--top_k", type=int, default=64)
     p.add_argument("--sink_size", type=int, default=4)
     p.add_argument("--recent_size", type=int, default=128)
     p.add_argument("--compress_ratio", type=float, default=0.125)
@@ -497,6 +692,18 @@ def parse_args() -> argparse.Namespace:
         help="continuous_cosine_max dense samples = multiplier * page_size.",
     )
     p.add_argument(
+        "--alphas",
+        default="1.0,2.0,4.0,8.0",
+        help="Comma-separated alpha values for hybrid highlight spectral scaling. "
+             "Balance point ≈ sqrt(page_size / (comp_size - 1)).",
+    )
+    p.add_argument(
+        "--multi_highlights",
+        default="2,3",
+        help="Comma-separated M values for multi-highlight variants. "
+             "Each M uses K-norm top-M and (c-M) DCT coefficients.",
+    )
+    p.add_argument(
         "--self_test",
         action="store_true",
         help="Run numerical self-tests and exit.",
@@ -504,10 +711,12 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _build_method_registry(lambdas, betas, comp_size, ucb_levels, layouts):
+def _build_method_registry(lambdas, betas, comp_size, ucb_levels, layouts, alphas,
+                           multi_highlights=None):
     """Slim whitelist of methods that get analyzed/printed.
 
-    For >1 layouts, codex method names are suffixed with _{layout}.
+    For >1 layouts, codex spectral method names are suffixed with _{layout}.
+    Hybrid methods are layout-independent (use first layout).
     """
     methods = [
         "oracle_max", "oracle_mean",
@@ -527,6 +736,25 @@ def _build_method_registry(lambdas, betas, comp_size, ucb_levels, layouts):
             for lvl in ucb_levels:
                 methods += [f"spectral_recon_ucb{lvl}{sfx}_b{b}" for b in betas]
             methods.append(f"continuous_cosine_max{sfx}")
+        # Hybrid heuristic methods — each heuristic × {max,add,max_over,add_over} × alpha
+        for hname in ('highlight', 'acnorm', 'specresid'):
+            methods += [f"hybrid_{hname}_max_a{a}" for a in alphas]
+            methods += [f"hybrid_{hname}_add_a{a}" for a in alphas]
+            methods += [f"hybrid_{hname}_max_over_a{a}" for a in alphas]
+            methods += [f"hybrid_{hname}_add_over_a{a}" for a in alphas]
+        # Oracle (heuristic-independent)
+        methods += [f"hybrid_highlight_max_oracle_a{a}" for a in alphas]
+        methods += [f"hybrid_highlight_add_oracle_a{a}" for a in alphas]
+        # Multi-highlight methods
+        for M in (multi_highlights or []):
+            c_multi = max(0, comp_size - M)
+            if c_multi > 0:
+                methods += [f"hybrid_multi{M}_max_a{a}" for a in alphas]
+                methods += [f"hybrid_multi{M}_add_a{a}" for a in alphas]
+            else:
+                methods.append(f"hybrid_multi{M}_only")
+            methods += [f"hybrid_multi{M}_max_over_a{a}" for a in alphas]
+            methods += [f"hybrid_multi{M}_add_over_a{a}" for a in alphas]
     return methods
 
 
@@ -652,6 +880,114 @@ def _self_test() -> None:
     else:
         raise AssertionError("Test 6: spread layout produced identical scores to low (unexpected)")
 
+    # ---- Test 7: hybrid_highlight_max >= spectral_recon_max(c-1) ----
+    test_alphas = [1.0, 4.0]
+    for c in [2, 4, 8, 16]:
+        hy = _compute_codex_hybrid_scores(
+            paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+            comp_size=c, layout="low", alphas=test_alphas, continuous_multiplier=4,
+        )
+        sp_lo_ref = _compute_codex_spectral_scores(
+            paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+            comp_size=max(1, c - 1), layout="low", betas=[], ucb_levels=[],
+            ucb_num_bands=4, continuous_multiplier=4,
+        )['spectral_recon_max']
+        for alpha in test_alphas:
+            diff7 = (hy[f'hybrid_highlight_max_a{alpha}'] - sp_lo_ref).min().item()
+            assert diff7 >= -1e-5, (
+                f"Test 7 (c={c}, a={alpha}): hybrid_max < spectral_lo by {-diff7}"
+            )
+
+    # ---- Test 8: hybrid_highlight_max_over at c=P equals oracle_max ----
+    hy_P = _compute_codex_hybrid_scores(
+        paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+        comp_size=P, layout="low", alphas=[1.0], continuous_multiplier=4,
+    )
+    diff8 = (hy_P['hybrid_highlight_max_over_a1.0'] - oracle_max_ref).abs().max().item()
+    assert diff8 < 1e-4, f"Test 8: hybrid_over at c=P != oracle_max, diff {diff8}"
+
+    # ---- Test 9: hybrid_highlight_max_oracle >= spectral_recon_max(c-1) ----
+    for c in [2, 4, 8]:
+        hy_o = _compute_codex_hybrid_scores(
+            paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+            comp_size=c, layout="low", alphas=[1.0], continuous_multiplier=4,
+        )
+        sp_lo = _compute_codex_spectral_scores(
+            paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+            comp_size=max(1, c - 1), layout="low", betas=[], ucb_levels=[],
+            ucb_num_bands=4, continuous_multiplier=4,
+        )['spectral_recon_max']
+        diff9 = (hy_o['hybrid_highlight_max_oracle_a1.0'] - sp_lo).min().item()
+        assert diff9 >= -1e-5, (
+            f"Test 9 (c={c}): hybrid_oracle < spectral_lo by {-diff9}"
+        )
+
+    # ---- Test 10: hybrid_highlight_max_over >= spectral_recon_max(c) ----
+    for c in [2, 4, 8]:
+        hy_ov = _compute_codex_hybrid_scores(
+            paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+            comp_size=c, layout="low", alphas=[1.0], continuous_multiplier=4,
+        )
+        sp_full = _compute_codex_spectral_scores(
+            paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+            comp_size=c, layout="low", betas=[], ucb_levels=[],
+            ucb_num_bands=4, continuous_multiplier=4,
+        )['spectral_recon_max']
+        diff10 = (hy_ov['hybrid_highlight_max_over_a1.0'] - sp_full).min().item()
+        assert diff10 >= -1e-5, (
+            f"Test 10 (c={c}): hybrid_over < spectral_full by {-diff10}"
+        )
+
+    # ---- Test 11: hybrid_acnorm_max >= spectral_recon_max(c-1) ----
+    for c in [2, 4, 8, 16]:
+        hy_ac = _compute_codex_hybrid_scores(
+            paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+            comp_size=c, layout="low", alphas=[1.0], continuous_multiplier=4,
+        )
+        sp_lo_11 = _compute_codex_spectral_scores(
+            paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+            comp_size=max(1, c - 1), layout="low", betas=[], ucb_levels=[],
+            ucb_num_bands=4, continuous_multiplier=4,
+        )['spectral_recon_max']
+        diff11 = (hy_ac['hybrid_acnorm_max_a1.0'] - sp_lo_11).min().item()
+        assert diff11 >= -1e-5, (
+            f"Test 11 (c={c}): hybrid_acnorm_max < spectral_lo by {-diff11}"
+        )
+
+    # ---- Test 12: hybrid_specresid_max >= spectral_recon_max(c-1) ----
+    for c in [2, 4, 8, 16]:
+        hy_sr = _compute_codex_hybrid_scores(
+            paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+            comp_size=c, layout="low", alphas=[1.0], continuous_multiplier=4,
+        )
+        sp_lo_12 = _compute_codex_spectral_scores(
+            paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+            comp_size=max(1, c - 1), layout="low", betas=[], ucb_levels=[],
+            ucb_num_bands=4, continuous_multiplier=4,
+        )['spectral_recon_max']
+        diff12 = (hy_sr['hybrid_specresid_max_a1.0'] - sp_lo_12).min().item()
+        assert diff12 >= -1e-5, (
+            f"Test 12 (c={c}): hybrid_specresid_max < spectral_lo by {-diff12}"
+        )
+
+    # ---- Test 13: hybrid_multi2_max >= spectral_recon_max(c-2) for c >= 4 ----
+    for c in [4, 8, 16]:
+        c_multi = c - 2
+        hy_m2 = _compute_codex_hybrid_scores(
+            paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+            comp_size=c, layout="low", alphas=[1.0], continuous_multiplier=4,
+            multi_highlights=[2],
+        )
+        sp_lo_13 = _compute_codex_spectral_scores(
+            paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+            comp_size=c_multi, layout="low", betas=[], ucb_levels=[],
+            ucb_num_bands=4, continuous_multiplier=4,
+        )['spectral_recon_max']
+        diff13 = (hy_m2['hybrid_multi2_max_a1.0'] - sp_lo_13).min().item()
+        assert diff13 >= -1e-5, (
+            f"Test 13 (c={c}): hybrid_multi2_max < spectral_lo(c-2) by {-diff13}"
+        )
+
     print("All self-tests passed:")
     print("  1. spectral_recon_max matches naive reference (c in {1,2,4,8,16})")
     print("  2. c=P: spectral_recon_max == oracle_max")
@@ -659,6 +995,13 @@ def _self_test() -> None:
     print("  4. UCB level 3 Parseval: sum_t u_t^2 == sigma_res^2")
     print("  5. c=P (empty notJ): all UCB variants == spectral_recon_max")
     print("  6. multi-layout name_suffix produces distinct keys, low-suffix == unsuffixed")
+    print("  7. hybrid_highlight_max >= spectral_recon_max(c-1)")
+    print("  8. hybrid_highlight_max_over at c=P == oracle_max")
+    print("  9. hybrid_highlight_max_oracle >= spectral_recon_max(c-1)")
+    print(" 10. hybrid_highlight_max_over >= spectral_recon_max(c)")
+    print(" 11. hybrid_acnorm_max >= spectral_recon_max(c-1)")
+    print(" 12. hybrid_specresid_max >= spectral_recon_max(c-1)")
+    print(" 13. hybrid_multi2_max >= spectral_recon_max(c-2) for c >= 4")
 
 
 def main() -> None:
@@ -684,6 +1027,8 @@ def main() -> None:
     lambdas = [float(x.strip()) for x in args.lambdas.split(",") if x.strip()]
     betas = [float(x.strip()) for x in args.betas.split(",") if x.strip()]
     ucb_levels = sorted({int(x.strip()) for x in args.ucb_levels.split(",") if x.strip()})
+    alphas = [float(x.strip()) for x in args.alphas.split(",") if x.strip()]
+    multi_highlights = [int(x.strip()) for x in args.multi_highlights.split(",") if x.strip()]
 
     if args.layouts:
         raw_layouts = [x.strip() for x in args.layouts.split(",") if x.strip()]
@@ -698,7 +1043,9 @@ def main() -> None:
             layouts.append(lay)
 
     comp_size = max(1, int(args.page_size * args.compress_ratio))
-    all_methods = _build_method_registry(lambdas, betas, comp_size, ucb_levels, layouts)
+    all_methods = _build_method_registry(
+        lambdas, betas, comp_size, ucb_levels, layouts, alphas, multi_highlights,
+    )
 
     if comp_size > 1:
         print(f"Frequency indices (comp_size={comp_size}, page_size={args.page_size}):")
@@ -710,7 +1057,8 @@ def main() -> None:
 
     print(f"Full attention generation, {args.num_decode_steps} decode steps, scoring all layers")
     print(f"Ground truths: {gt_names}")
-    print(f"UCB levels: {ucb_levels}, betas: {betas}, layouts: {layouts}")
+    print(f"UCB levels: {ucb_levels}, betas: {betas}, alphas: {alphas}, layouts: {layouts}")
+    print(f"Multi-highlight M values: {multi_highlights}")
     print(f"continuous_multiplier: {args.continuous_multiplier} -> dense samples = {args.continuous_multiplier * args.page_size}")
     print(f"Methods printed: {len(all_methods)}")
 
@@ -814,6 +1162,8 @@ def main() -> None:
                             ucb_levels=ucb_levels,
                             ucb_num_bands=args.ucb_num_bands,
                             continuous_multiplier=args.continuous_multiplier,
+                            alphas=alphas,
+                            multi_highlights=multi_highlights,
                         )
                         if all_scores is None:
                             continue

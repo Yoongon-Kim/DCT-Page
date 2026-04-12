@@ -211,7 +211,7 @@ def parse_args() -> argparse.Namespace:
         choices=["low", "low_high", "low_mid_high", "spread"],
     )
     p.add_argument("--dct_scoring_method", type=str, default="max",
-                   help="'mean'|'max'|'sum'|'proxy_dc_ac_{lam}'|'spread_dc_ac_{lam}'")
+                   help="'mean'|'max'|'sum'|'dc_ac_{lam}'|'proxy_dc_ac_{lam}'|'spread_dc_ac_{lam}'")
     p.add_argument(
         "--dct_group_agg_method",
         type=str,

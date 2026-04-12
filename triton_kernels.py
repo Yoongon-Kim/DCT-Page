@@ -321,7 +321,7 @@ def _score_pages_torch_fallback(
     from dct_page_attention import _parse_dc_ac_scoring_method
     dc_ac_parsed = _parse_dc_ac_scoring_method(scoring_method)
     if dc_ac_parsed is not None:
-        _, dc_ac_lambda = dc_ac_parsed
+        _, dc_ac_lambda, _ = dc_ac_parsed
         # group_token_scores: [bsz, kv_heads, groups, pages, comp_size]
         if group_agg_method == "mean":
             coeff_scores = group_token_scores.mean(dim=2)
@@ -439,7 +439,7 @@ def score_pages_triton(
     from dct_page_attention import _parse_dc_ac_scoring_method
     dc_ac_parsed = _parse_dc_ac_scoring_method(scoring_method)
     if dc_ac_parsed is not None:
-        _, dc_ac_lambda = dc_ac_parsed
+        _, dc_ac_lambda, _ = dc_ac_parsed
         GROUP_AGG = _GROUP_AGG_MAP[group_agg_method]
         BLOCK_P = 32
         num_page_tiles = (num_pages + BLOCK_P - 1) // BLOCK_P
