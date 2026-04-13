@@ -263,8 +263,10 @@ def apply_monkey_patch(args):
                 weight_compressed_by_population=args.weight_compressed_by_population,
             )
     elif args.mode == "multipole_attention":
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "baselines"))
         from multipole_attn import replace_attn_multipole
         from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
+        sys.path.pop(0)
         MULTIPOLE_ATTN_CONFIG["base_model"] = args.base_model
         replace_attn_multipole(MULTIPOLE_ATTN_CONFIG)
     elif args.mode == "baseline":

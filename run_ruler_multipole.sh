@@ -26,7 +26,7 @@ USE_REPLACEMENT=False
 CLUSTER_INTERVAL=128
 INFERENCE_TP=1
 
-CONFIG_FILE="multipole_attn/config.py"
+CONFIG_FILE="baselines/multipole_attn/config.py"
 
 write_config() {
     local pct_clusters="$1"
@@ -73,9 +73,9 @@ PYEOF
 }
 
 # ---- Sweep percent_clusters x percentiles x use_replacement ----
-for PCT_CLUSTERS in 6.25 3.125 1.5625 0.78125; do
-    for PERCENTILES in 1156 2180; do
-        for REPL in False True; do
+for PCT_CLUSTERS in 6.25; do
+    for PERCENTILES in 3131 4091; do
+        for REPL in False; do
             RUN_NAME="${MODEL_FAMILY}_multipole_pct${PCT_CLUSTERS}_ptl${PERCENTILES}_repl${REPL}"
 
             echo ""

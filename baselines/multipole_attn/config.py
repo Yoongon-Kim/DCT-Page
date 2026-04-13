@@ -2,7 +2,7 @@
 Multipole Attention evaluation configuration.
 
 Edit this file to change model, clustering parameters, and attention behavior
-before running eval_longbench_v1.py or eval_longbench_v2.py with --mode multipole_attention.
+before running eval_ruler.py with --mode multipole_attention.
 
 Key parameters:
   - percent_clusters_lst: percentage of keys to retain per hierarchy level
@@ -13,7 +13,7 @@ Key parameters:
 
 MULTIPOLE_ATTN_CONFIG = {
     # Base model (HF Hub ID or local path)
-    "base_model": "Qwen/Qwen3-8B",
+    "base_model": "meta-llama/Llama-3.1-8B-Instruct",
 
     # Enable centroid-based sparse attention
     "use_centroids": True,
@@ -25,7 +25,7 @@ MULTIPOLE_ATTN_CONFIG = {
     "percentiles_lst": [2180],
 
     # Use centroid value approximation for non-selected tokens
-    "use_replacement": False,
+    "use_replacement": True,
 
     # Number of new tokens between re-clustering during generation
     "cluster_interval": 128,
