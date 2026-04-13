@@ -106,7 +106,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--weight_pop",
-        default="0",
+        default="1",
         help="Comma-separated 0/1 values to sweep --dct_weight_compressed_by_population. "
         "E.g. '0', '1', or '0,1' to run both. Only effective in compressed mode.",
     )

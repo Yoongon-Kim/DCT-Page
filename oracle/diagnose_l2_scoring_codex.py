@@ -56,6 +56,22 @@ import torch
 GROUND_TRUTHS = ["oracle_max", "output_contribution"]
 
 _BASIS_CACHE: dict = {}
+_CIDCT_CACHE: dict = {}
+
+
+def _get_cidct_matrix(c: int, device: torch.device) -> torch.Tensor:
+    """Return cached c×c IDCT matrix (orthonormal DCT-III).
+
+    Treats c coefficient scores as a c-length frequency-domain signal and
+    transforms them to c time-domain samples via inverse DCT.  This allows
+    constructive interference between coefficients without expanding to
+    page_size.
+    """
+    key = (c, str(device))
+    if key not in _CIDCT_CACHE:
+        I_c = torch.eye(c, device=device, dtype=torch.float32)
+        _CIDCT_CACHE[key] = _dct_local(I_c)  # [c, c]: IDCT basis
+    return _CIDCT_CACHE[key]
 
 
 def _dct_local(x: torch.Tensor) -> torch.Tensor:
@@ -350,6 +366,21 @@ def _compute_codex_hybrid_scores(
         shat = torch.einsum('tc,bhgnc->bhgnt', Phi_kept_T, a)
         return shat
 
+    def _spectral_cidct_max(c_used):
+        """Coefficient scores through c×c IDCT, then max over c outputs.
+
+        Unlike _spectral_curve which expands to page_size via [P, c] basis,
+        this stays in the compressed dimension using a [c, c] IDCT matrix.
+        """
+        _, _, J_tensor, _, _, _, _ = _get_codex_basis(
+            P, c_used, layout, X, device, torch.float32
+        )
+        k_dct_kept = k_dct.index_select(-2, J_tensor)
+        a_coeff = torch.einsum('bhgd,bhncd->bhgnc', q, k_dct_kept)
+        cidct_mat = _get_cidct_matrix(c_used, device)             # [c, c]
+        shat_c = torch.einsum('rc,bhgnc->bhgnr', cidct_mat, a_coeff)
+        return shat_c.max(dim=-1).values                          # [B,H,G,N]
+
     # --- Shared spectral curves (computed once) ---
     shat_lo = _spectral_curve(c_lo)
     spectral_lo_max = shat_lo.max(dim=-1).values           # [B,H,G,N]
@@ -454,6 +485,14 @@ def _compute_codex_hybrid_scores(
             for ai, a in enumerate(alphas):
                 out[f'hybrid_multi{M}_ac_max_a{a}'] = vm_max[..., ai]
                 out[f'hybrid_multi{M}_ac_add_a{a}'] = vm_add[..., ai]
+
+            # --- ac: cidct (c×c IDCT, no expansion to page_size) ---
+            spectral_cidct = _spectral_cidct_max(c_multi)
+            scaled_cidct = spectral_cidct.unsqueeze(-1) * alphas_t
+            hi_cidct = multi_hi_ac.unsqueeze(-1).expand_as(scaled_cidct)
+            vm_cidct = torch.maximum(scaled_cidct, hi_cidct).max(dim=2).values
+            for ai, a in enumerate(alphas):
+                out[f'hybrid_multi{M}_ac_cidct_max_a{a}'] = vm_cidct[..., ai]
 
             # --- acresid: residual decode (query-aware selection) ---
             topM_idx_g = topM_idx_ac.unsqueeze(2).expand(B, H, G, N, M)
@@ -784,6 +823,7 @@ def _build_method_registry(lambdas, betas, comp_size, ucb_levels, layouts, alpha
             if c_multi > 0:
                 methods += [f"hybrid_multi{M}_ac_max_a{a}" for a in alphas]
                 methods += [f"hybrid_multi{M}_ac_add_a{a}" for a in alphas]
+                methods += [f"hybrid_multi{M}_ac_cidct_max_a{a}" for a in alphas]
                 methods += [f"hybrid_multi{M}_acresid_max_a{a}" for a in alphas]
                 methods += [f"hybrid_multi{M}_acresid_add_a{a}" for a in alphas]
             else:
@@ -1000,6 +1040,41 @@ def _self_test() -> None:
             f"Test 15 (c={c}): hybrid_multi2_acresid_max < spectral_lo(c-2) by {-diff15}"
         )
 
+    # ---- Test 16: hybrid_multi2_ac_cidct_max is finite and present for c >= 4 ----
+    for c in [4, 8, 16]:
+        hy_cidct = _compute_codex_hybrid_scores(
+            paged_k=paged_k, query_states=query_states, num_kv_groups=G,
+            comp_size=c, layout="low", alphas=[1.0, 4.0], continuous_multiplier=4,
+            multi_highlights=[2],
+        )
+        for alpha in [1.0, 4.0]:
+            key = f'hybrid_multi2_ac_cidct_max_a{alpha}'
+            assert key in hy_cidct, f"Test 16 (c={c}): {key} not in output"
+            assert hy_cidct[key].isfinite().all(), (
+                f"Test 16 (c={c}): {key} has non-finite values"
+            )
+            # cidct score should equal ac_max when c×c IDCT happens to
+            # recover the same peak as the P-expansion (not guaranteed in
+            # general, but values should be in a similar ballpark)
+            ac_max_key = f'hybrid_multi2_ac_max_a{alpha}'
+            ratio = (
+                hy_cidct[key].abs().mean()
+                / hy_cidct[ac_max_key].abs().mean().clamp(min=1e-12)
+            )
+            assert 0.01 < ratio < 100, (
+                f"Test 16 (c={c}, a={alpha}): cidct/ac_max ratio {ratio:.4f} "
+                f"outside [0.01, 100]"
+            )
+
+    # ---- Test 17: c×c IDCT matrix is orthonormal ----
+    for c in [2, 4, 8]:
+        cidct = _get_cidct_matrix(c, torch.device('cpu'))
+        eye_check = cidct @ cidct.T
+        diff17 = (eye_check - torch.eye(c)).abs().max().item()
+        assert diff17 < 1e-5, (
+            f"Test 17 (c={c}): IDCT not orthonormal, max err {diff17}"
+        )
+
     print("All self-tests passed:")
     print("  7. hybrid_highlight_max >= spectral_recon_max(c-1)")
     print("  9. hybrid_highlight_max_oracle >= spectral_recon_max(c-1)")
@@ -1007,6 +1082,8 @@ def _self_test() -> None:
     print(" 13. hybrid_multi2_max >= spectral_recon_max(c-2) for c >= 4")
     print(" 14. hybrid_multi2_ac_max >= spectral_recon_max(c-2) for c >= 4")
     print(" 15. hybrid_multi2_acresid_max >= spectral_recon_max(c-2) for c >= 4")
+    print(" 16. hybrid_multi2_ac_cidct_max is finite and well-scaled")
+    print(" 17. c×c IDCT matrix is orthonormal")
 
 
 def main() -> None:

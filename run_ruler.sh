@@ -9,14 +9,14 @@ BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-8B}"
 MODEL_TEMPLATE="${MODEL_TEMPLATE:-qwen-3}"
 TOKENIZER_FAMILY="${TOKENIZER_FAMILY:-qwen3}"
 NUM_SAMPLES="${NUM_SAMPLES:-25}"
-OUTPUT_DIR="${OUTPUT_DIR:-results/results_ruler/page_attention}"
+OUTPUT_DIR="${OUTPUT_DIR:-results_ruler/proxy_max}"
 
 # Sequence lengths to evaluate
 SEQ_LENGTHS="${SEQ_LENGTHS:-32768}" #"${SEQ_LENGTHS:-4096 8192 16384 32768 65536 131072}"
 
 # Tasks to evaluate (space-separated). Leave empty to use eval_ruler.py default (all tasks).
 # Example: TASKS="niah_single_1 niah_multikey_1 qa_1"
-TASKS="${TASKS:-cwe fwe niah_multikey_3}"
+TASKS="${TASKS:-}"
 TASKS_FLAG=""
 if [[ -n "$TASKS" ]]; then
     TASKS_FLAG="--tasks $TASKS"
@@ -32,15 +32,15 @@ fi
 SINK_SIZE=4
 RECENT_SIZE=128
 SCORING_METHOD="max"
-GROUP_AGG_METHOD="mean"
+GROUP_AGG_METHOD="max"
 # ---- Sweep (page_size, top_k) x compress_ratio x mode x compression_method x compressed_token_rope x weight_compressed_by_population ----
-for PS_TK in "16,128"; do
+for PS_TK in "32,64"; do
     IFS=',' read -r PAGE_SIZE TOP_K <<< "$PS_TK"
-    for COMPRESS_RATIO in 1; do
-      for MODE in compressed; do
-        for COMP_METHOD in haar; do
-          for COMP_TOKEN_ROPE in mixed block_center; do
-            for WEIGHT_POP in 0; do
+    for COMPRESS_RATIO in 0.25; do
+      for MODE in compressed drop; do
+        for COMP_METHOD in dct; do
+          for COMP_TOKEN_ROPE in mixed; do
+            for WEIGHT_POP in 1; do
               if [[ "$WEIGHT_POP" == "1" ]]; then
                   WEIGHT_POP_FLAG="--weight_compressed_by_population"
                   WEIGHT_POP_TAG="popw"
