@@ -4,8 +4,8 @@
 set -e
 
 # ---- Configuration ----
-BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-8B}"
-MODEL_FAMILY="${MODEL_FAMILY:-qwen3}"
+BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
+MODEL_FAMILY="${MODEL_FAMILY:-llama3}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-127500}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
