@@ -86,6 +86,7 @@ for TOKEN_BUDGET in 1156 2180; do
         --num_samples "$NUM_SAMPLES" \
         --output_dir "$OUTPUT_DIR" \
         --run_name "$RUN_NAME" \
+        --weight_compressed_by_population \
         $TASK_ARGS
 done
 

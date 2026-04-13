@@ -858,6 +858,7 @@ def main():
     for task in args.tasks:
         print(f"\n--- Loading task: {task} ---")
         local_candidates = [
+            REPO_DIR / "benchmark" / "data" / "longbench_v1_data" / f"{task}.jsonl",
             REPO_DIR / "longbench_v1_data" / f"{task}.jsonl",
             REPO_DIR / "longbench_v1_data" / "data" / f"{task}.jsonl",
         ]

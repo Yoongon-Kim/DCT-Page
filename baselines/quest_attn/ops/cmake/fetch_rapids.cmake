@@ -16,6 +16,18 @@ set(RAPIDS_VERSION "24.02")
 
 if(NOT EXISTS ${CMAKE_CURRENT_BINARY_DIR}/RAFT_RAPIDS.cmake)
     file(DOWNLOAD https://raw.githubusercontent.com/rapidsai/rapids-cmake/branch-${RAPIDS_VERSION}/RAPIDS.cmake
-            ${CMAKE_CURRENT_BINARY_DIR}/RAFT_RAPIDS.cmake)
+            ${CMAKE_CURRENT_BINARY_DIR}/RAFT_RAPIDS.cmake STATUS _dl_status)
+    list(GET _dl_status 0 _dl_code)
+    if(NOT _dl_code EQUAL 0)
+        message(STATUS "CMake file(DOWNLOAD) failed (${_dl_status}), falling back to curl")
+        file(REMOVE ${CMAKE_CURRENT_BINARY_DIR}/RAFT_RAPIDS.cmake)
+        execute_process(
+            COMMAND curl -sSL -o ${CMAKE_CURRENT_BINARY_DIR}/RAFT_RAPIDS.cmake
+                    https://raw.githubusercontent.com/rapidsai/rapids-cmake/branch-${RAPIDS_VERSION}/RAPIDS.cmake
+            RESULT_VARIABLE _curl_result)
+        if(NOT _curl_result EQUAL 0)
+            message(FATAL_ERROR "Failed to download RAPIDS.cmake via curl as well")
+        endif()
+    endif()
 endif()
 include(${CMAKE_CURRENT_BINARY_DIR}/RAFT_RAPIDS.cmake)

@@ -5,11 +5,11 @@
 set -e
 
 # ---- Configuration ----
-BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-8B}"
-MODEL_FAMILY="${MODEL_FAMILY:-qwen3}"
+BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
+MODEL_FAMILY="${MODEL_FAMILY:-llama3}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-127500}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
-OUTPUT_DIR="${OUTPUT_DIR:-results_longbench_v1/multipole_attention}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/results_longbench_v1/multipole_attention}"
 
 # Same tasks as run_longbench_v1.sh
 TASKS="${TASKS:-narrativeqa qasper gov_report 2wikimqa multifieldqa_en triviaqa}"
@@ -26,7 +26,7 @@ if [ -n "$TASKS" ]; then
     TASK_ARGS="--tasks $TASKS"
 fi
 
-CONFIG_FILE="multipole_attn/config.py"
+CONFIG_FILE="baselines/multipole_attn/config.py"
 
 write_config() {
     local pct_clusters="$1"
@@ -74,7 +74,7 @@ PYEOF
 
 # ---- Sweep percent_clusters x percentiles x use_replacement ----
 for PCT_CLUSTERS in 6.25; do
-    for PERCENTILES in 2180; do
+    for PERCENTILES in 2180 1156; do
         for REPL in True False; do
             RUN_NAME="${MODEL_FAMILY}_multipole_pct${PCT_CLUSTERS}_ptl${PERCENTILES}_repl${REPL}"
 
