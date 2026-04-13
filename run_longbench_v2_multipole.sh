@@ -10,7 +10,7 @@ MAX_INPUT_LEN="${MAX_INPUT_LEN:-127500}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
 PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-2048}"
-OUTPUT_DIR="${OUTPUT_DIR:-results_longbench_v2/multipole_attention}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/results_longbench_v2/multipole_attention}"
 
 # Fixed multipole parameters
 USE_CENTROIDS=True
@@ -18,7 +18,7 @@ USE_REPLACEMENT=False
 CLUSTER_INTERVAL=128
 INFERENCE_TP=1
 
-CONFIG_FILE="multipole_attn/config.py"
+CONFIG_FILE="baselines/multipole_attn/config.py"
 
 write_config() {
     local pct_clusters="$1"
@@ -67,7 +67,7 @@ PYEOF
 # ---- Sweep percent_clusters x percentiles x use_replacement ----
 for PCT_CLUSTERS in 6.25; do
     for PERCENTILES in 1156 2180; do
-        for REPL in False; do
+        for REPL in True False; do
             RUN_NAME="${MODEL_FAMILY}_multipole_pct${PCT_CLUSTERS}_ptl${PERCENTILES}_repl${REPL}"
 
             echo ""
