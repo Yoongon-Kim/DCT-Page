@@ -23,3 +23,4 @@ class DCTPageConfig:
     select_with_oracle_page_scores: bool = False  # Debug/upper-bound mode: use full-page oracle scores for top-k selection
     use_triton: bool = True            # Use fused Triton kernels (False = pure PyTorch, for comparison)
     weight_compressed_by_population: bool = False  # In compressed mode, scale each unselected-page rep's softmax mass by page_size/comp_size via a log(n) bias on QK logits (multipole-style population weighting). No-op for drop mode and for direct-spectral-proxy mode.
+    max_unselected_compressed: int = -1  # Max unselected pages contributing compressed tokens (-1 = unlimited, 0 = drop all unselected, N = keep top-N by score)

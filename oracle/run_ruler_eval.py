@@ -149,6 +149,7 @@ def apply_dct_patch(args: argparse.Namespace) -> None:
         select_with_oracle_page_scores=args.dct_select_with_oracle_page_scores,
         use_triton=not args.dct_no_triton,
         weight_compressed_by_population=args.dct_weight_compressed_by_population,
+        max_unselected_compressed=args.dct_max_unselected_compressed,
     )
     if "llama" in model_name:
         from dct_page_attention import replace_llama_attn
@@ -249,6 +250,9 @@ def parse_args() -> argparse.Namespace:
                    help="In compressed mode, scale each unselected-page rep's softmax mass "
                         "by page_size/comp_size via a log(n) bias on QK logits "
                         "(multipole-style population weighting). No-op for drop mode.")
+    p.add_argument("--dct_max_unselected_compressed", type=int, default=-1,
+                   help="Max unselected pages contributing compressed tokens "
+                        "(-1 = unlimited, 0 = drop all unselected, N = keep top-N by score)")
     p.add_argument("--dct_no_triton", action="store_true")
     p.add_argument("--sweep_combos", nargs="+", default=None,
                    help="Space-separated page_size,top_k pairs to sweep. "

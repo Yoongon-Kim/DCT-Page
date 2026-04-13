@@ -111,6 +111,13 @@ def parse_args() -> argparse.Namespace:
         "E.g. '0', '1', or '0,1' to run both. Only effective in compressed mode.",
     )
     p.add_argument(
+        "--max_unselected_compressed",
+        type=int,
+        default=-1,
+        help="Max unselected pages contributing compressed tokens "
+        "(-1 = unlimited, 0 = drop all unselected, N = keep top-N by score).",
+    )
+    p.add_argument(
         "--group_agg_method",
         type=str,
         default="max",
@@ -169,11 +176,14 @@ def make_run_dir(
     compress_ratio: float = 0.0,
     compression_method: str = "",
     weight_pop: bool = False,
+    max_unselected_compressed: int = -1,
 ) -> Path:
     name = f"ps{page_size}_topk{top_k}_hybrid_multi{M}_ac_max_a{alpha}_cr{compress_ratio}"
     if unselected_mode == "compressed":
         pop_tag = "popw" if weight_pop else "nopopw"
         name += f"_{compression_method}_{pop_tag}"
+        if max_unselected_compressed >= 0:
+            name += f"_muc{max_unselected_compressed}"
     run_dir = output_root / name
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
@@ -199,6 +209,7 @@ def build_run_cmd(
     max_new_tokens: int,
     cuda_device: int,
     local_files_only: bool,
+    max_unselected_compressed: int = -1,
 ) -> list[str]:
     scoring_method = f"hybrid_multi{M}_ac_max_a{alpha}"
     cmd = [
@@ -231,6 +242,8 @@ def build_run_cmd(
             cmd.append("--dct_score_use_low_proxy")
         if weight_pop:
             cmd.append("--dct_weight_compressed_by_population")
+        if max_unselected_compressed >= 0:
+            cmd.extend(["--dct_max_unselected_compressed", str(max_unselected_compressed)])
     if local_files_only:
         cmd.append("--local_files_only")
     return cmd
@@ -360,14 +373,19 @@ def main() -> None:
                         args.output_root, page_size, top_k, M, alpha,
                         args.unselected_mode, args.compress_ratio,
                         args.compression_method, weight_pop,
+                        args.max_unselected_compressed,
                     )
 
                     mode_tag = args.unselected_mode
                     if args.unselected_mode == "compressed":
                         pop_str = "popw" if weight_pop else "nopopw"
+                        muc_str = (
+                            f" muc={args.max_unselected_compressed}"
+                            if args.max_unselected_compressed >= 0 else ""
+                        )
                         mode_tag = (
                             f"compressed cr={args.compress_ratio} "
-                            f"{args.compression_method} {pop_str}"
+                            f"{args.compression_method} {pop_str}{muc_str}"
                         )
 
                     scoring_method = f"hybrid_multi{M}_ac_max_a{alpha}"
@@ -409,6 +427,7 @@ def main() -> None:
                         manifest.update({
                             "compression_method": args.compression_method,
                             "weight_compressed_by_population": weight_pop,
+                            "max_unselected_compressed": args.max_unselected_compressed,
                         })
                     (run_dir / "manifest.json").write_text(
                         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
@@ -435,6 +454,7 @@ def main() -> None:
                         max_new_tokens=args.max_new_tokens,
                         cuda_device=args.cuda_device,
                         local_files_only=args.local_files_only,
+                        max_unselected_compressed=args.max_unselected_compressed,
                     )
                     (run_dir / "command.sh").write_text(
                         "#!/usr/bin/env bash\nset -euo pipefail\n\n"

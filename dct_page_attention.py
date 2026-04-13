@@ -1560,94 +1560,221 @@ def dct_page_attention_forward(
 
     elif cfg.unselected_mode == "compressed":
         num_unselected = num_pages - actual_top_k
-        middle_len = actual_top_k * cfg.page_size + num_unselected * comp_size
-        assembled_len = cfg.sink_size + middle_len + actual_recent
 
-        # Population weighting: when enabled (and not in direct-spectral-proxy mode),
-        # we add log(page_size/comp_size) to the QK logits at unselected-rep
-        # positions via SDPA's attn_mask. This makes each rep contribute to the
-        # softmax as if it were page_size/comp_size real tokens (multipole-style).
-        weight_pop = (
-            cfg.weight_compressed_by_population
-            and not cfg.score_use_direct_spectral_proxy
-            and num_unselected > 0
-            and comp_size < cfg.page_size
-        )
-        if weight_pop:
-            log_pop_weight = math.log(cfg.page_size / comp_size)
+        # Determine effective number of unselected pages to keep as compressed.
+        if cfg.max_unselected_compressed >= 0:
+            effective_num_comp = min(cfg.max_unselected_compressed, num_unselected)
         else:
-            log_pop_weight = 0.0
+            effective_num_comp = num_unselected  # -1 means unlimited
 
-        # Pre-allocate or expand output buffers
-        _buf_len = getattr(self, '_assemble_buf_len', 0)
-        _buf_grew = False
-        if assembled_len > _buf_len:
-            _max_len = assembled_len + cfg.page_size
-            _nkv = _num_kv_heads
-            self._final_k_buf = torch.empty(
-                bsz, _nkv, _max_len, self.head_dim, dtype=paged_k.dtype, device=paged_k.device
-            )
-            self._final_v_buf = torch.empty_like(self._final_k_buf)
-            self._sel_idx_buf = torch.empty(
-                bsz, _nkv, actual_top_k, dtype=torch.int32, device=paged_k.device
-            )
-            # Bias buffer is float32 (SDPA upcasts mask to compute dtype anyway).
-            # Allocated lazily so the drop path and the flag-off compressed path
-            # never pay the memory cost.
-            self._final_bias_buf = None
-            self._assemble_buf_len = _max_len
-            _buf_grew = True
+        if effective_num_comp == 0:
+            # ---- Path C: no compressed pages — equivalent to drop mode ----
+            assembled_len = cfg.sink_size + actual_top_k * cfg.page_size + actual_recent
 
-        if weight_pop and (
-            getattr(self, '_final_bias_buf', None) is None
-            or self._final_bias_buf.shape[2] < self._assemble_buf_len
-        ):
-            self._final_bias_buf = torch.zeros(
-                bsz, _num_kv_heads, self._assemble_buf_len,
-                dtype=torch.float32, device=paged_k.device,
+            _buf_len = getattr(self, '_assemble_buf_len', 0)
+            if assembled_len > _buf_len:
+                _max_len = assembled_len + cfg.page_size
+                _nkv = _num_kv_heads
+                self._final_k_buf = torch.empty(
+                    bsz, _nkv, _max_len, self.head_dim, dtype=paged_k.dtype, device=paged_k.device
+                )
+                self._final_v_buf = torch.empty_like(self._final_k_buf)
+                self._sel_idx_buf = torch.empty(
+                    bsz, _nkv, actual_top_k, dtype=torch.int32, device=paged_k.device
+                )
+                self._assemble_buf_len = _max_len
+
+            final_k, final_v = assemble_kv_drop_triton(
+                paged_k, paged_v,
+                sink_k, sink_v, recent_k, recent_v,
+                selected_indices,
+                None, None,
+                out_k=self._final_k_buf,
+                out_v=self._final_v_buf,
+                out_sel_idx=self._sel_idx_buf,
+                original_position_rope=False,
             )
 
-        if weight_pop:
-            # Zero only the slice we are about to (re)write — the kernel writes
-            # log_pop_weight at unselected-rep slots only, so leftover values
-            # at sink/selected/recent slots from prior steps must be cleared.
-            self._final_bias_buf[:, :, :assembled_len].zero_()
-            bias_out_arg = self._final_bias_buf
+        elif effective_num_comp < num_unselected:
+            # ---- Path B: limited compressed pages — PyTorch gather+scatter ----
+            # Select which unselected pages to keep as compressed (top-N by score).
+            _masked_scores = selection_page_scores.clone()
+            _masked_scores.scatter_(2, selected_indices.long(), float('-inf'))
+            _, compressed_indices = torch.topk(_masked_scores, effective_num_comp, dim=-1)
+            compressed_indices = compressed_indices.sort(dim=-1).values  # [bsz, kv_heads, N]
+
+            # Compute interleaved write offsets using searchsorted on sorted indices.
+            _sel_long = selected_indices.long()
+            _comp_long = compressed_indices.long()
+            # For each selected page: how many compressed pages come before it?
+            count_comp_before_sel = torch.searchsorted(_comp_long, _sel_long)
+            _ranks_sel = torch.arange(actual_top_k, device=paged_k.device).view(1, 1, -1)
+            selected_write_offsets = (
+                cfg.sink_size + _ranks_sel * cfg.page_size + count_comp_before_sel * comp_size
+            )
+            # For each compressed page: how many selected pages come before it?
+            count_full_before_comp = torch.searchsorted(_sel_long, _comp_long)
+            _ranks_comp = torch.arange(effective_num_comp, device=paged_k.device).view(1, 1, -1)
+            compressed_write_offsets = (
+                cfg.sink_size + count_full_before_comp * cfg.page_size + _ranks_comp * comp_size
+            )
+
+            middle_len = actual_top_k * cfg.page_size + effective_num_comp * comp_size
+            assembled_len = cfg.sink_size + middle_len + actual_recent
+
+            # Population weighting
+            weight_pop = (
+                cfg.weight_compressed_by_population
+                and not cfg.score_use_direct_spectral_proxy
+                and effective_num_comp > 0
+                and comp_size < cfg.page_size
+            )
+            log_pop_weight = math.log(cfg.page_size / comp_size) if weight_pop else 0.0
+
+            # Pre-allocate or expand output buffers
+            _buf_len = getattr(self, '_assemble_buf_len', 0)
+            if assembled_len > _buf_len:
+                _max_len = assembled_len + cfg.page_size
+                _nkv = _num_kv_heads
+                self._final_k_buf = torch.empty(
+                    bsz, _nkv, _max_len, self.head_dim, dtype=paged_k.dtype, device=paged_k.device
+                )
+                self._final_v_buf = torch.empty_like(self._final_k_buf)
+                self._final_bias_buf = None
+                self._assemble_buf_len = _max_len
+
+            if weight_pop and (
+                getattr(self, '_final_bias_buf', None) is None
+                or self._final_bias_buf.shape[2] < self._assemble_buf_len
+            ):
+                self._final_bias_buf = torch.zeros(
+                    bsz, _num_kv_heads, self._assemble_buf_len,
+                    dtype=torch.float32, device=paged_k.device,
+                )
+
+            final_k = self._final_k_buf[:, :, :assembled_len, :]
+            final_v = self._final_v_buf[:, :, :assembled_len, :]
+
+            # --- Sink ---
+            final_k[:, :, :cfg.sink_size, :] = sink_k
+            final_v[:, :, :cfg.sink_size, :] = sink_v
+
+            # --- Scatter selected pages (full KV) ---
+            _sel_idx_exp = _sel_long.unsqueeze(-1).unsqueeze(-1).expand(
+                bsz, _num_kv_heads, actual_top_k, cfg.page_size, self.head_dim
+            )
+            _sel_k = paged_k.gather(2, _sel_idx_exp)
+            _sel_v = paged_v.gather(2, _sel_idx_exp)
+            _t_off_sel = torch.arange(cfg.page_size, device=paged_k.device).view(1, 1, 1, -1)
+            _dest_sel = (selected_write_offsets.unsqueeze(-1) + _t_off_sel).reshape(
+                bsz, _num_kv_heads, actual_top_k * cfg.page_size
+            ).unsqueeze(-1).expand(bsz, _num_kv_heads, actual_top_k * cfg.page_size, self.head_dim)
+            final_k.scatter_(2, _dest_sel, _sel_k.reshape(bsz, _num_kv_heads, -1, self.head_dim))
+            final_v.scatter_(2, _dest_sel, _sel_v.reshape(bsz, _num_kv_heads, -1, self.head_dim))
+
+            # --- Scatter compressed pages (compressed KV) ---
+            _comp_idx_exp = _comp_long.unsqueeze(-1).unsqueeze(-1).expand(
+                bsz, _num_kv_heads, effective_num_comp, comp_size, self.head_dim
+            )
+            _comp_k = comp_k.gather(2, _comp_idx_exp)
+            _comp_v = comp_v.gather(2, _comp_idx_exp)
+            _t_off_comp = torch.arange(comp_size, device=paged_k.device).view(1, 1, 1, -1)
+            _dest_comp = (compressed_write_offsets.unsqueeze(-1) + _t_off_comp).reshape(
+                bsz, _num_kv_heads, effective_num_comp * comp_size
+            ).unsqueeze(-1).expand(bsz, _num_kv_heads, effective_num_comp * comp_size, self.head_dim)
+            final_k.scatter_(2, _dest_comp, _comp_k.reshape(bsz, _num_kv_heads, -1, self.head_dim))
+            final_v.scatter_(2, _dest_comp, _comp_v.reshape(bsz, _num_kv_heads, -1, self.head_dim))
+
+            # --- Recent ---
+            final_k[:, :, assembled_len - actual_recent:assembled_len, :] = recent_k
+            final_v[:, :, assembled_len - actual_recent:assembled_len, :] = recent_v
+
+            # --- Population bias ---
+            if weight_pop:
+                self._final_bias_buf[:, :, :assembled_len].zero_()
+                _dest_comp_flat = (compressed_write_offsets.unsqueeze(-1) + _t_off_comp).reshape(
+                    bsz, _num_kv_heads, effective_num_comp * comp_size
+                )
+                _bias_vals = torch.full_like(_dest_comp_flat, log_pop_weight, dtype=torch.float32)
+                self._final_bias_buf.scatter_(2, _dest_comp_flat, _bias_vals)
+                bias_out_arg = self._final_bias_buf
+
         else:
-            bias_out_arg = None
+            # ---- Path A: all unselected pages compressed — existing Triton assembly ----
+            middle_len = actual_top_k * cfg.page_size + num_unselected * comp_size
+            assembled_len = cfg.sink_size + middle_len + actual_recent
 
-        # Build stride cache on first call; rebuild when strides change.
-        # Must also rebuild when _final_k_buf is reallocated, because the buffer's
-        # dim-0/dim-1 strides depend on max_len (which changes on reallocation).
-        # Also rebuild when the bias buffer's strides change (allocation, regrow,
-        # or weight_pop flag flipped on/off between calls).
-        _cur_paged_strides = (paged_k.stride(0), paged_k.stride(1), paged_k.stride(2), paged_k.stride(3))
-        _cur_bias_strides = (
-            (self._final_bias_buf.stride(0), self._final_bias_buf.stride(1), self._final_bias_buf.stride(2))
-            if weight_pop else (0, 0, 0)
-        )
-        _cached = getattr(self, '_assemble_stride_cache', None)
-        if (_buf_grew
-                or _cached is None
-                or _cached['paged_strides'] != _cur_paged_strides
-                or _cached.get('bias_strides', (0, 0, 0)) != _cur_bias_strides):
-            self._assemble_stride_cache = build_assemble_stride_cache(
-                paged_k, comp_k, sink_k, recent_k, selected_indices,
-                None, self._final_k_buf,
-                bias_out=self._final_bias_buf if weight_pop else None,
+            # Population weighting
+            weight_pop = (
+                cfg.weight_compressed_by_population
+                and not cfg.score_use_direct_spectral_proxy
+                and num_unselected > 0
+                and comp_size < cfg.page_size
             )
+            if weight_pop:
+                log_pop_weight = math.log(cfg.page_size / comp_size)
+            else:
+                log_pop_weight = 0.0
 
-        final_k, final_v = assemble_kv_split_triton(
-            paged_k, paged_v, comp_k, comp_v,
-            sink_k, sink_v, recent_k, recent_v,
-            selected_indices,
-            None, None,  # no RoPE in Triton (already baked in cache)
-            out_k=self._final_k_buf,
-            out_v=self._final_v_buf,
-            stride_cache=self._assemble_stride_cache,
-            bias_out=bias_out_arg,
-            log_pop_weight=log_pop_weight,
-        )
+            # Pre-allocate or expand output buffers
+            _buf_len = getattr(self, '_assemble_buf_len', 0)
+            _buf_grew = False
+            if assembled_len > _buf_len:
+                _max_len = assembled_len + cfg.page_size
+                _nkv = _num_kv_heads
+                self._final_k_buf = torch.empty(
+                    bsz, _nkv, _max_len, self.head_dim, dtype=paged_k.dtype, device=paged_k.device
+                )
+                self._final_v_buf = torch.empty_like(self._final_k_buf)
+                self._sel_idx_buf = torch.empty(
+                    bsz, _nkv, actual_top_k, dtype=torch.int32, device=paged_k.device
+                )
+                self._final_bias_buf = None
+                self._assemble_buf_len = _max_len
+                _buf_grew = True
+
+            if weight_pop and (
+                getattr(self, '_final_bias_buf', None) is None
+                or self._final_bias_buf.shape[2] < self._assemble_buf_len
+            ):
+                self._final_bias_buf = torch.zeros(
+                    bsz, _num_kv_heads, self._assemble_buf_len,
+                    dtype=torch.float32, device=paged_k.device,
+                )
+
+            if weight_pop:
+                self._final_bias_buf[:, :, :assembled_len].zero_()
+                bias_out_arg = self._final_bias_buf
+            else:
+                bias_out_arg = None
+
+            _cur_paged_strides = (paged_k.stride(0), paged_k.stride(1), paged_k.stride(2), paged_k.stride(3))
+            _cur_bias_strides = (
+                (self._final_bias_buf.stride(0), self._final_bias_buf.stride(1), self._final_bias_buf.stride(2))
+                if weight_pop else (0, 0, 0)
+            )
+            _cached = getattr(self, '_assemble_stride_cache', None)
+            if (_buf_grew
+                    or _cached is None
+                    or _cached['paged_strides'] != _cur_paged_strides
+                    or _cached.get('bias_strides', (0, 0, 0)) != _cur_bias_strides):
+                self._assemble_stride_cache = build_assemble_stride_cache(
+                    paged_k, comp_k, sink_k, recent_k, selected_indices,
+                    None, self._final_k_buf,
+                    bias_out=self._final_bias_buf if weight_pop else None,
+                )
+
+            final_k, final_v = assemble_kv_split_triton(
+                paged_k, paged_v, comp_k, comp_v,
+                sink_k, sink_v, recent_k, recent_v,
+                selected_indices,
+                None, None,  # no RoPE in Triton (already baked in cache)
+                out_k=self._final_k_buf,
+                out_v=self._final_v_buf,
+                stride_cache=self._assemble_stride_cache,
+                bias_out=bias_out_arg,
+                log_pop_weight=log_pop_weight,
+            )
 
     else:
         raise ValueError(f"Unsupported unselected_mode: {cfg.unselected_mode}")
@@ -1707,6 +1834,7 @@ def replace_qwen2_attn(
     select_with_oracle_page_scores=False,
     use_triton=True,
     weight_compressed_by_population=False,
+    max_unselected_compressed=-1,
 ):
     """
     Replace Qwen2Attention.forward with DCT Page Attention.
@@ -1735,6 +1863,7 @@ def replace_qwen2_attn(
         select_with_oracle_page_scores=select_with_oracle_page_scores,
         use_triton=use_triton,
         weight_compressed_by_population=weight_compressed_by_population,
+        max_unselected_compressed=max_unselected_compressed,
     )
 
     comp_size = max(1, int(page_size * compress_ratio))
@@ -1753,7 +1882,8 @@ def replace_qwen2_attn(
         f"score_use_hadamard_proxy={score_use_hadamard_proxy}, "
         f"select_with_oracle_page_scores={select_with_oracle_page_scores}, "
         f"use_triton={use_triton}, "
-        f"weight_compressed_by_population={weight_compressed_by_population}"
+        f"weight_compressed_by_population={weight_compressed_by_population}, "
+        f"max_unselected_compressed={max_unselected_compressed}"
     )
     print(f"  Page attention active during decode only (prefill uses full attention)")
 
@@ -1781,6 +1911,7 @@ def replace_qwen3_attn(
     select_with_oracle_page_scores=False,
     use_triton=True,
     weight_compressed_by_population=False,
+    max_unselected_compressed=-1,
 ):
     """
     Replace Qwen3Attention.forward with DCT Page Attention.
@@ -1811,6 +1942,7 @@ def replace_qwen3_attn(
         select_with_oracle_page_scores=select_with_oracle_page_scores,
         use_triton=use_triton,
         weight_compressed_by_population=weight_compressed_by_population,
+        max_unselected_compressed=max_unselected_compressed,
     )
 
     comp_size = max(1, int(page_size * compress_ratio))
@@ -1829,7 +1961,8 @@ def replace_qwen3_attn(
         f"score_use_hadamard_proxy={score_use_hadamard_proxy}, "
         f"select_with_oracle_page_scores={select_with_oracle_page_scores}, "
         f"use_triton={use_triton}, "
-        f"weight_compressed_by_population={weight_compressed_by_population}"
+        f"weight_compressed_by_population={weight_compressed_by_population}, "
+        f"max_unselected_compressed={max_unselected_compressed}"
     )
     print(f"  Page attention active during decode only (prefill uses full attention)")
 
@@ -1857,6 +1990,7 @@ def replace_llama_attn(
     select_with_oracle_page_scores=False,
     use_triton=True,
     weight_compressed_by_population=False,
+    max_unselected_compressed=-1,
 ):
     """
     Replace LlamaAttention.forward with DCT Page Attention.
@@ -1887,6 +2021,7 @@ def replace_llama_attn(
         select_with_oracle_page_scores=select_with_oracle_page_scores,
         use_triton=use_triton,
         weight_compressed_by_population=weight_compressed_by_population,
+        max_unselected_compressed=max_unselected_compressed,
     )
 
     comp_size = max(1, int(page_size * compress_ratio))
@@ -1905,7 +2040,8 @@ def replace_llama_attn(
         f"score_use_hadamard_proxy={score_use_hadamard_proxy}, "
         f"select_with_oracle_page_scores={select_with_oracle_page_scores}, "
         f"use_triton={use_triton}, "
-        f"weight_compressed_by_population={weight_compressed_by_population}"
+        f"weight_compressed_by_population={weight_compressed_by_population}, "
+        f"max_unselected_compressed={max_unselected_compressed}"
     )
     print(f"  Page attention active during decode only (prefill uses full attention)")
 
