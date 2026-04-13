@@ -15,6 +15,11 @@ import argparse
 import random
 import csv
 
+# Ensure baselines/ packages (seer_attn, multipole_attn, quest_attn) are importable
+_BASELINES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "baselines")
+if _BASELINES_DIR not in sys.path:
+    sys.path.insert(0, _BASELINES_DIR)
+
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -49,7 +54,7 @@ def parse_args():
 
     # Mode
     parser.add_argument("--mode", type=str, required=True,
-                        choices=["baseline", "page_attention", "rope_gap", "seer_attention", "multipole_attention"])
+                        choices=["baseline", "page_attention", "rope_gap", "seer_attention", "multipole_attention", "quest_attention"])
 
     # Model
     parser.add_argument("--base_model", type=str,
@@ -116,6 +121,8 @@ def parse_args():
             args.run_name = "seer_attention"
         elif args.mode == "multipole_attention":
             args.run_name = "multipole_attention"
+        elif args.mode == "quest_attention":
+            args.run_name = "quest_attention"
         else:
             args.run_name = f"page_attn_topk{args.top_k}"
 
@@ -261,6 +268,10 @@ def evaluate(model, tokenizer, dataset, args):
         generated_ids = output_ids[0, input_len:]
         del input_ids, output_ids
         torch.cuda.empty_cache()
+
+        if args.mode == "quest_attention":
+            model.quest_clear()
+
         response = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
         predicted = extract_answer(response)
@@ -507,7 +518,7 @@ def main():
         from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
         MULTIPOLE_ATTN_CONFIG["base_model"] = args.base_model
         replace_attn_multipole(MULTIPOLE_ATTN_CONFIG)
-    elif args.mode not in ("seer_attention",):
+    elif args.mode not in ("seer_attention", "quest_attention"):
         print("Baseline mode: full attention (no monkey-patch)")
 
     # Load tokenizer + model
@@ -533,6 +544,33 @@ def main():
         ).cuda()
         model.eval()
         tokenizer = AutoTokenizer.from_pretrained(model.config.base_model)
+        print(f"Model loaded. Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
+    elif args.mode == "quest_attention":
+        from quest_attn.config import QUEST_ATTN_CONFIG
+        from quest_attn import LlamaForCausalLM as QuestLlamaForCausalLM
+
+        base_model = QUEST_ATTN_CONFIG["base_model"]
+        model_name_lower = base_model.lower()
+        if not any(fam in model_name_lower for fam in ["llama", "mistral"]):
+            raise ValueError(
+                f"Quest only supports LLaMA-family models (Llama-2, Llama-3.x, Mistral), "
+                f"got: {base_model}"
+            )
+        print(f"Loading Quest model: {base_model}")
+        model = QuestLlamaForCausalLM.from_pretrained(
+            base_model,
+            device_map="cuda:0",
+            torch_dtype=torch.float16,
+        )
+        model.quest_init(
+            page_size=QUEST_ATTN_CONFIG["page_size"],
+            max_seq_len=QUEST_ATTN_CONFIG["max_seq_len"],
+            token_budget=QUEST_ATTN_CONFIG["token_budget"],
+            dtype=torch.float16,
+            device=torch.device("cuda:0"),
+        )
+        model.eval()
+        tokenizer = AutoTokenizer.from_pretrained(base_model)
         print(f"Model loaded. Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
     else:
         attn_impl = "sdpa"
@@ -596,6 +634,9 @@ def main():
     elif args.mode == "multipole_attention":
         from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
         summary["multipole_attn_config"] = MULTIPOLE_ATTN_CONFIG
+    elif args.mode == "quest_attention":
+        from quest_attn.config import QUEST_ATTN_CONFIG
+        summary["quest_attn_config"] = QUEST_ATTN_CONFIG
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
 

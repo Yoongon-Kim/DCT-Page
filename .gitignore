@@ -4,3 +4,5 @@ results*/
 longbench_v1_data/
 ruler_data/
 __pycache__/
+baselines/quest_attn/ops/build/
+baselines/quest_attn/_kernels*.so
