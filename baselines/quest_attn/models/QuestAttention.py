@@ -10,6 +10,19 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, apply_rotary_pos_emb, repeat_kv
 
 import quest_attn.utils
+from quest_attn.utils import rms_norm_forward
+
+
+class _HeadRMSNorm(nn.Module):
+    """RMSNorm on head_dim for QK-norm (Qwen3-style). Uses the same CUDA kernel."""
+
+    def __init__(self, head_dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(head_dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return rms_norm_forward(x, self.weight, self.eps)
 
 class QuestAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -23,8 +36,8 @@ class QuestAttention(nn.Module):
         self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.pretraining_tp = config.pretraining_tp
-        self.max_position_embeddings = config.max_position_embeddings
+        self.pretraining_tp = getattr(config, 'pretraining_tp', 1)
+        self.max_position_embeddings = getattr(config, 'max_position_embeddings', 4096)
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -35,12 +48,23 @@ class QuestAttention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
+        # Optional QK-norm (Qwen3 applies RMSNorm on head_dim BEFORE RoPE)
+        _model_type = getattr(config, 'model_type', 'llama')
+        if _model_type == 'qwen3':
+            self.q_norm = _HeadRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = _HeadRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        else:
+            self.q_norm = None
+            self.k_norm = None
+
         self._init_rope()
 
     def _init_rope(self):
+        self.rope_theta = getattr(self.config, 'rope_theta', 1e4)
         # rope_theta is default to 1e4, as set in RoPE kernel API.
-        if self.config.rope_scaling is None:
-            self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
+        if getattr(self.config, 'rope_scaling', None) is None:
+            self.rotary_emb = None  # RoPE applied by FlashInfer kernel
             self.rope_scale = 1.0
         else:
             scaling_type = self.config.rope_scaling["type"]
@@ -95,8 +119,13 @@ class QuestAttention(nn.Module):
         key_states = key_states.view(q_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(q_len, self.num_key_value_heads, self.head_dim)
 
+        # Optional QK-norm (Qwen3 applies norm BEFORE RoPE)
+        if self.q_norm is not None:
+            query_states = self.q_norm(query_states)
+            key_states = self.k_norm(key_states)
+
         torch.cuda.nvtx.range_push("RoPE")
-        quest_attn.utils.apply_rope_in_place(query_states, key_states, iController.kv_cache.seqlen - q_len, rope_scale=self.rope_scale)
+        quest_attn.utils.apply_rope_in_place(query_states, key_states, iController.kv_cache.seqlen - q_len, rope_scale=self.rope_scale, rope_theta=self.rope_theta)
         torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("append_kv")

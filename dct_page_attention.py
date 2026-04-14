@@ -870,8 +870,90 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
     return comp_k[:, :, :num_pages], comp_v[:, :, :num_pages]
 
 
+def _update_quest_metadata(attn_module, paged_k, num_pages):
+    """Incrementally maintain per-page per-channel min/max key metadata for QUEST scoring.
+
+    Returns (min_k, max_k) each of shape [bsz, num_kv_heads, num_pages, head_dim].
+    """
+    bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
+
+    cached_min = getattr(attn_module, '_quest_min_k_cache', None)
+    cached_max = getattr(attn_module, '_quest_max_k_cache', None)
+    n_cached = getattr(attn_module, '_quest_n_pages_cached', 0)
+
+    # Invalidate if sequence restarted
+    if cached_min is None or num_pages < n_cached or cached_min.shape[0] != bsz:
+        cached_min = None
+        cached_max = None
+        n_cached = 0
+
+    n_new = num_pages - n_cached
+    if n_new > 0:
+        new_k = paged_k[:, :, n_cached:num_pages]  # [B, H, n_new, page_size, D]
+        # Per-channel min/max across page_size tokens
+        new_min = new_k.amin(dim=3)  # [B, H, n_new, D]
+        new_max = new_k.amax(dim=3)  # [B, H, n_new, D]
+
+        if cached_min is None:
+            cached_min = new_min
+            cached_max = new_max
+        else:
+            cached_min = torch.cat([cached_min, new_min], dim=2)
+            cached_max = torch.cat([cached_max, new_max], dim=2)
+
+    attn_module._quest_min_k_cache = cached_min
+    attn_module._quest_max_k_cache = cached_max
+    attn_module._quest_n_pages_cached = num_pages
+
+    return cached_min, cached_max
+
+
+def _score_pages_quest(query, min_k, max_k, group_agg_method, num_kv_groups, out=None):
+    """QUEST-style page scoring: score = sum_d max(q_d * max_d, q_d * min_d).
+
+    Args:
+        query: [bsz, num_heads, 1, head_dim]
+        min_k: [bsz, num_kv_heads, num_pages, head_dim]
+        max_k: [bsz, num_kv_heads, num_pages, head_dim]
+        group_agg_method: "mean" | "max" | "topp"
+        num_kv_groups: number of GQA groups (num_heads // num_kv_heads)
+        out: optional pre-allocated [bsz, num_kv_heads, num_pages] buffer
+
+    Returns:
+        page_scores: [bsz, num_kv_heads, num_pages]
+    """
+    bsz, num_heads, _, head_dim = query.shape
+    num_kv_heads = min_k.shape[1]
+    num_pages = min_k.shape[2]
+
+    # Reshape query for GQA: [bsz, num_kv_heads, G, head_dim]
+    q = query.squeeze(2).float()
+    q = q.reshape(bsz, num_kv_heads, num_kv_groups, head_dim)
+
+    # QUEST scoring per kv-head, per GQA group
+    q_max = torch.einsum('bhgd,bhpd->bhgp', q, max_k.float())   # [B, kv_heads, G, P]
+    q_min = torch.einsum('bhgd,bhpd->bhgp', q, min_k.float())   # [B, kv_heads, G, P]
+    page_scores = torch.maximum(q_max, q_min)                     # [B, kv_heads, G, P]
+
+    # Group aggregation (matches existing score_pages_triton logic)
+    if group_agg_method == "mean":
+        page_scores = page_scores.mean(dim=2)                     # [B, kv_heads, P]
+    elif group_agg_method == "max":
+        page_scores = page_scores.max(dim=2).values               # [B, kv_heads, P]
+    elif group_agg_method == "topp":
+        k_top = min(2, num_kv_groups)
+        page_scores = page_scores.topk(k_top, dim=2).values.mean(dim=2)
+    else:
+        raise ValueError(f"Unsupported group_agg_method: {group_agg_method}")
+
+    if out is not None:
+        out[:, :, :num_pages].copy_(page_scores)
+        return out[:, :, :num_pages]
+    return page_scores
+
+
 def _compress_pages(attn_module, paged_x, comp_size):
-    """Project [bsz, kv_heads, num_pages, page_size, head_dim] pages to comp_size."""
+    """Project [bsz, kv_heads, num_pages, page_size, head_dim] pages to comp_size via DCT."""
     page_size = paged_x.shape[3]
     M = _get_or_build_projection_matrix(
         attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
@@ -1284,7 +1366,7 @@ def dct_page_attention_forward(
     hidden_states: torch.Tensor,
     position_embeddings: tuple,
     attention_mask: Optional[torch.Tensor] = None, # The type can be torch.Tensor or None, and the default value is None
-    past_key_values: Optional[Cache] = None,
+    past_key_value: Optional[Cache] = None,
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> tuple:
@@ -1294,6 +1376,8 @@ def dct_page_attention_forward(
     - Prefill (q_len > 1): standard full causal attention.
     - Decode (q_len == 1, long KV cache): DCT page attention.
     """
+    # transformers 4.54 passes the cache as 'past_key_value' (singular)
+    past_key_values = past_key_value
     cfg = _dct_page_cfg
     num_score_proxy_modes = sum(
         int(flag)
@@ -1401,6 +1485,22 @@ def dct_page_attention_forward(
         )
     kv_len = key_states.shape[2]
 
+    # Fallback to standard attention when KV cache is too short for paging.
+    if kv_len < min_len_for_paging:
+        attention_interface = _get_attention_interface(self)
+        attn_output, _ = attention_interface(
+            self,
+            query_states, key_states, value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=getattr(self, "sliding_window", None),
+            **kwargs,
+        )
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, None
+
     # Step 3: Segment KV cache and update the incremental compressed page cache.
     # DCT is computed only for pages that are newly finalized since the last
     # decode step; all previously cached compressed representations are reused.
@@ -1430,41 +1530,48 @@ def dct_page_attention_forward(
         )
 
     score_query_states = query_states
-    hybrid_multi_parsed = _parse_hybrid_multi_scoring_method(cfg.scoring_method)
-    if hybrid_multi_parsed is not None:
-        hm_M, hm_alpha = hybrid_multi_parsed
-        # DCT coefficient count comes from compress_ratio; M tokens are additional.
-        c_multi = comp_size  # = max(1, int(page_size * compress_ratio))
-        if c_multi > 0:
-            spectral_comp_k = _update_spectral_score_cache(
-                self, paged_k, num_pages, c_multi, cfg, "low",
-            )
-            hm_proj = _get_or_build_dc_ac_spectral_matrix(
-                self, cfg.page_size, c_multi, paged_k.device, paged_k.dtype, "low",
-            )
-        else:
-            spectral_comp_k = None
-            hm_proj = None
-        page_scores = _score_pages_hybrid_multi(
-            score_query_states, paged_k[:, :, :num_pages], spectral_comp_k, hm_proj,
-            hm_M, hm_alpha, self.num_key_value_groups, cfg.group_agg_method,
+    if cfg.score_use_quest_minmax:
+        quest_min_k, quest_max_k = _update_quest_metadata(self, paged_k, num_pages)
+        page_scores = _score_pages_quest(
+            score_query_states, quest_min_k, quest_max_k,
+            cfg.group_agg_method, self.num_key_value_groups,
             out=self._page_scores_buf,
         )
     else:
-        dc_ac_parsed = _parse_dc_ac_scoring_method(cfg.scoring_method)
-        if dc_ac_parsed is not None:
-            dc_ac_layout, _, dc_ac_full = dc_ac_parsed
-            score_cache_size = cfg.page_size if dc_ac_full else comp_size
-            score_comp_k = _update_spectral_score_cache(
-                self, paged_k, num_pages, score_cache_size, cfg, dc_ac_layout,
+        hybrid_multi_parsed = _parse_hybrid_multi_scoring_method(cfg.scoring_method)
+        if hybrid_multi_parsed is not None:
+            hm_M, hm_alpha = hybrid_multi_parsed
+            c_multi = comp_size
+            if c_multi > 0:
+                spectral_comp_k = _update_spectral_score_cache(
+                    self, paged_k, num_pages, c_multi, cfg, "low",
+                )
+                hm_proj = _get_or_build_dc_ac_spectral_matrix(
+                    self, cfg.page_size, c_multi, paged_k.device, paged_k.dtype, "low",
+                )
+            else:
+                spectral_comp_k = None
+                hm_proj = None
+            page_scores = _score_pages_hybrid_multi(
+                score_query_states, paged_k[:, :, :num_pages], spectral_comp_k, hm_proj,
+                hm_M, hm_alpha, self.num_key_value_groups, cfg.group_agg_method,
+                out=self._page_scores_buf,
             )
         else:
-            score_comp_k = comp_k
+            dc_ac_parsed = _parse_dc_ac_scoring_method(cfg.scoring_method)
+            if dc_ac_parsed is not None:
+                dc_ac_layout, _, dc_ac_full = dc_ac_parsed
+                score_cache_size = cfg.page_size if dc_ac_full else comp_size
+                score_comp_k = _update_spectral_score_cache(
+                    self, paged_k, num_pages, score_cache_size, cfg, dc_ac_layout,
+                )
+            else:
+                score_comp_k = comp_k
 
-        page_scores = score_pages_triton(
-            score_query_states, score_comp_k, cfg.scoring_method, cfg.group_agg_method, self.num_key_value_groups,
-            out=self._page_scores_buf,
-        )
+            page_scores = score_pages_triton(
+                score_query_states, score_comp_k, cfg.scoring_method, cfg.group_agg_method, self.num_key_value_groups,
+                out=self._page_scores_buf,
+            )
     debug_hook = _dct_page_debug_hook
     oracle_page_scores = None
     if debug_hook is not None or cfg.select_with_oracle_page_scores:
@@ -1831,6 +1938,7 @@ def replace_qwen2_attn(
     score_use_haar_proxy=True,
     score_use_haar_mixed_proxy=False,
     score_use_hadamard_proxy=False,
+    score_use_quest_minmax=False,
     select_with_oracle_page_scores=False,
     use_triton=True,
     weight_compressed_by_population=False,
@@ -1860,6 +1968,7 @@ def replace_qwen2_attn(
         score_use_haar_proxy=score_use_haar_proxy,
         score_use_haar_mixed_proxy=score_use_haar_mixed_proxy,
         score_use_hadamard_proxy=score_use_hadamard_proxy,
+        score_use_quest_minmax=score_use_quest_minmax,
         select_with_oracle_page_scores=select_with_oracle_page_scores,
         use_triton=use_triton,
         weight_compressed_by_population=weight_compressed_by_population,
@@ -1908,6 +2017,7 @@ def replace_qwen3_attn(
     score_use_haar_proxy=True,
     score_use_haar_mixed_proxy=False,
     score_use_hadamard_proxy=False,
+    score_use_quest_minmax=False,
     select_with_oracle_page_scores=False,
     use_triton=True,
     weight_compressed_by_population=False,
@@ -1939,6 +2049,7 @@ def replace_qwen3_attn(
         score_use_haar_proxy=score_use_haar_proxy,
         score_use_haar_mixed_proxy=score_use_haar_mixed_proxy,
         score_use_hadamard_proxy=score_use_hadamard_proxy,
+        score_use_quest_minmax=score_use_quest_minmax,
         select_with_oracle_page_scores=select_with_oracle_page_scores,
         use_triton=use_triton,
         weight_compressed_by_population=weight_compressed_by_population,
@@ -1987,6 +2098,7 @@ def replace_llama_attn(
     score_use_haar_proxy=True,
     score_use_haar_mixed_proxy=False,
     score_use_hadamard_proxy=False,
+    score_use_quest_minmax=False,
     select_with_oracle_page_scores=False,
     use_triton=True,
     weight_compressed_by_population=False,
@@ -2018,6 +2130,7 @@ def replace_llama_attn(
         score_use_haar_proxy=score_use_haar_proxy,
         score_use_haar_mixed_proxy=score_use_haar_mixed_proxy,
         score_use_hadamard_proxy=score_use_hadamard_proxy,
+        score_use_quest_minmax=score_use_quest_minmax,
         select_with_oracle_page_scores=select_with_oracle_page_scores,
         use_triton=use_triton,
         weight_compressed_by_population=weight_compressed_by_population,

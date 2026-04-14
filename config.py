@@ -20,6 +20,7 @@ class DCTPageConfig:
     score_use_haar_proxy: bool = True  # Default score path: Haar lowpass block proxies instead of DCT IDCT proxies
     score_use_haar_mixed_proxy: bool = False  # Score with Haar mixed global/detail proxies instead of DCT IDCT proxies
     score_use_hadamard_proxy: bool = False  # Score with Walsh-Hadamard compressed proxies in original-position RoPE space
+    score_use_quest_minmax: bool = False  # QUEST-style scoring: per-page per-channel min/max key metadata → sum_i max(q_i*max_i, q_i*min_i)
     select_with_oracle_page_scores: bool = False  # Debug/upper-bound mode: use full-page oracle scores for top-k selection
     use_triton: bool = True            # Use fused Triton kernels (False = pure PyTorch, for comparison)
     weight_compressed_by_population: bool = False  # In compressed mode, scale each unselected-page rep's softmax mass by page_size/comp_size via a log(n) bias on QK logits (multipole-style population weighting). No-op for drop mode and for direct-spectral-proxy mode.

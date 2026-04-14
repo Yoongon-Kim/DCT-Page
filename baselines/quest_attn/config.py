@@ -13,11 +13,11 @@ Key parameters:
   - max_seq_len:   maximum context length for KV cache allocation
   - token_budget:  max tokens to attend to per decode step (= page_budget * page_size)
 
-Note: Quest only supports LLaMA-family models (Llama-2, Llama-3.x, Mistral).
+Note: Quest supports LLaMA-family models (Llama-2, Llama-3.x, Mistral) and Qwen3.
 """
 
 QUEST_ATTN_CONFIG = {
-    # Base model (HF Hub ID or local path) — must be LLaMA-family
+    # Base model (HF Hub ID or local path) — LLaMA-family or Qwen3
     "base_model": "meta-llama/Llama-3.1-8B-Instruct",
 
     # Tokens per KV cache page

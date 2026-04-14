@@ -1,117 +1,170 @@
-# DCT-Page
+# CLAUDE.md
 
-Decode-time sparse page attention for long-context LLMs with training-free Haar/DCT proxy scoring and fused Triton kernels.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## What it does
+## Project Overview
 
-During autoregressive decoding (q_len=1), DCT-Page divides the KV cache into fixed-size **pages** (default 32 tokens), scores each page with a lightweight Haar lowpass or DCT proxy (compressed 32:1), selects the top-k most relevant pages for full attention, and either drops or compresses the rest. Prefill uses standard full attention unchanged.
+DCT-Page is a decode-time sparse page attention mechanism for long-context LLMs. During autoregressive decoding, it divides the KV cache into fixed-size pages, scores each page with a lightweight Haar/DCT proxy (32:1 compression), selects top-k pages for full attention, and drops or compresses the rest. Prefill uses standard full attention unchanged.
 
 KV layout at decode time:
 ```
 [sink (4 tokens)] [page 0] [page 1] ... [page N-1] [recent (128 tokens)]
 ```
 
-- **Drop mode** (default): unselected pages are discarded entirely (fastest).
-- **Compressed/hybrid mode**: unselected pages use Haar/DCT compressed KV (maintains a quality floor).
+- **Drop mode** (default): unselected pages discarded entirely (fastest).
+- **Compressed/hybrid mode**: unselected pages use Haar/DCT compressed KV (quality floor).
 
-## Repo structure
+## Architecture
 
-```
-dct_page_attention.py   Core attention forward, compression, RoPE, monkey-patching
-triton_kernels.py       Fused Triton kernels: score, topk, assemble, RoPE
-config.py               DCTPageConfig dataclass with all hyperparameters
+### Core modules
 
-eval_ruler.py           RULER benchmark evaluation (synthetic long-context tasks)
-eval_longbench_v1.py    LongBench v1 (16 English tasks, F1/ROUGE/accuracy)
-eval_longbench_v2.py    LongBench v2 (multiple-choice format)
-run_*.sh                Shell scripts for parametric sweeps
+| File | Role |
+|---|---|
+| `dct_page_attention.py` | Main attention forward, compression, RoPE, monkey-patching (~2000 lines) |
+| `triton_kernels.py` | Fused Triton kernels: score, topk, assemble, RoPE (~2100 lines) |
+| `config.py` | `DCTPageConfig` dataclass with all hyperparameters |
 
-baselines/              Multipole Attention and SEER Attention implementations
-benchmark/              RULER benchmark data prep and eval utilities
-oracle/                 Oracle/upper-bound evaluation and proxy diagnostics
-  diagnose_l2_scoring.py  Diagnostic tool comparing page scoring methods against ground truth
-speed/                  Decode throughput and per-layer profiling scripts
-results/                Benchmark outputs (RULER, LongBench, speed)
-```
+### Evaluation & benchmarking
 
-## Key modules
+| File | Role |
+|---|---|
+| `eval_ruler.py` | RULER benchmark (synthetic long-context tasks, exact match) |
+| `eval_longbench_v1.py` | LongBench v1 (16 English tasks, F1/ROUGE/accuracy) |
+| `eval_longbench_v2.py` | LongBench v2 (multiple-choice format) |
+| `run_ruler_eval.py` | Single-mode RULER runner with flat task jsonl outputs |
+| `compare_ruler_runs.py` | Post-hoc comparison across completed RULER runs |
+| `compare_baseline_dct.py` | Ad-hoc pairwise baseline vs DCT/Haar comparison |
+| `speed_test_dummy.py` | Decode throughput benchmark |
+| `profile_decode.py` | Layer-by-layer decode-path CUDA event profiling |
+| `oracle/run_ruler_eval.py` | Standalone RULER runner for oracle experiments |
+| `oracle/eval_ruler_hybridmulti.py` | hybrid_multi scoring RULER sweep (M, alpha params) |
 
-### dct_page_attention.py
-- `dct_page_attention_forward()` -- replacement forward for LlamaAttention/Qwen2Attention/Qwen3Attention. Prefill: standard attention + cache pre-allocation. Decode: score pages -> topk select -> assemble -> SDPA.
-- `replace_llama_attn()`, `replace_qwen2_attn()`, `replace_qwen3_attn()` -- monkey-patch entry points. Call **before** loading the model.
-- `_update_comp_cache()` -- incremental page compression (Haar or DCT).
-- `_build_haar_lowpass_projection_matrix()` -- default scoring proxy (block averaging).
-- `PreAllocatedLayer` -- fixed-stride KV buffer for O(1) decode append.
+### Key functions in dct_page_attention.py
 
-### triton_kernels.py
-- `_score_pages_fused_kernel` -- scores all pages via query-compressed-key dot products.
-- `_topk_sort_kernel` -- parallel topk via bitonic sort.
-- `_assemble_kv_full_kernel` -- gathers sink + selected pages + recent, applies RoPE.
-- `_apply_rope_q_kernel` -- single-token decode query RoPE.
-- Each kernel has a `*_triton()` wrapper and a PyTorch fallback path.
+- `dct_page_attention_forward()` — replacement forward. Prefill: standard attention + cache pre-allocation. Decode: score pages -> topk select -> assemble -> SDPA.
+- `replace_llama_attn()`, `replace_qwen2_attn()`, `replace_qwen3_attn()` — monkey-patch entry points. Call **before** `from_pretrained()`.
+- `_update_comp_cache()` — incremental page compression (Haar or DCT), only compresses new pages since last decode step.
+- `_build_haar_lowpass_projection_matrix()` — default scoring proxy (block averaging).
+- `PreAllocatedLayer` — fixed-stride KV buffer replacing `DynamicLayer` for O(1) decode append.
 
-### config.py
-`DCTPageConfig` dataclass. Key defaults: `page_size=32`, `top_k=64`, `sink_size=4`, `recent_size=128`, `compress_ratio=0.03125`, `scoring_method="max"`, `unselected_mode="drop"`, `score_use_haar_proxy=True`, `use_triton=True`.
+### Key functions in triton_kernels.py
 
-### oracle/diagnose_l2_scoring.py
-Systematic experiment framework for finding the best cheap proxy to approximate oracle page selection. Hooks into attention via `L2DiagnosticRecorder` to capture `paged_k`, `paged_v`, `query_states` at the first decode step of the last layer, then computes and compares many scoring strategies.
+Each kernel has a `*_triton()` wrapper and a pure-PyTorch fallback:
+- `_score_pages_fused_kernel` — scores all pages via query-compressed-key dot products
+- `_topk_sort_kernel` — parallel topk via bitonic sort
+- `_assemble_kv_full_kernel` — gathers sink + selected pages + recent, applies RoPE
+- `_apply_rope_q_kernel` — single-token decode query RoPE
 
-**Ground truths** (`--ground_truths`):
-- `oracle_max`: full-token max Q·K score per page
-- `output_contribution`: per-page contribution to attention output `|| sum_{i in page} softmax(s_i) * v_i ||` with global softmax over all tokens (sink + paged + recent)
+## Commands
 
-**Scoring methods compared**:
-- Baselines: `oracle_max`, `oracle_mean`, `l2_energy`
-- Proxy (DCT-compressed): `proxy_max`, `proxy_mean`
-- DC+AC family (DCT decomposition with tunable lambda): `dc_ac`, `proxy_dc_ac`, `spread_dc_ac`, `log_spread_dc_ac`, `reverse_log_spread_dc_ac`
-- Spread proxy variants: `spread_proxy_dc_ac`, `spread_proxy_max`, `spread_proxy_mean`
-- Correction experiments:
-  - Exp B — Parseval correction (`parseval_{lam}_b{beta}`): estimates missing AC energy via Parseval's theorem
-  - Exp C — Cauchy-Schwarz key-space correction (`cs_key_{lam}_b{beta}`): bounds missing score energy from key Frobenius norms
-  - Exp D — Diagonal Gram proxy (`diag_gram_{lam}_b{beta}`): uses `diag(K^T K)` for cheaper L2 estimation
-  - Exp E — Per-frequency discrimination: Spearman correlation of each DCT coefficient with `oracle_max`
-
-**Metrics reported** per method vs ground truth: recall, false positives/negatives, negative-GT-in-topk, false-negative rank, false-negative GT score. Results saved as JSON per task.
-
-## Setup
+### Setup
 
 ```bash
 pip install -r requirements.txt
 # Requires: torch 2.10, transformers 4.54, triton 3.6
 ```
 
-## Running evaluations
+### RULER evaluation
 
-**RULER** (synthetic long-context):
 ```bash
-python eval_ruler.py --mode page_attention --base_model meta-llama/Llama-3.1-8B-Instruct \
-  --seq_lengths 16384 32768 --tasks niah_multikey_3 --num_samples 25 \
-  --page_size 32 --top_k 64 --unselected_mode drop --output_dir results_ruler --run_name my_run
+# DCT-Page drop mode
+python run_ruler_eval.py --mode page_attention --context_len 16384 \
+  --tasks niah_multikey_3 --tag my_run --num_samples 25 --max_new_tokens 128 \
+  --cuda_device 0 --dct_page_size 32 --dct_top_k 64 --dct_unselected_mode drop
+
+# Baseline
+python run_ruler_eval.py --mode baseline --context_len 16384 \
+  --tasks niah_multikey_3 --tag baseline --num_samples 25 --cuda_device 0
+
+# Compare runs
+python compare_ruler_runs.py \
+  --run_dirs results/ruler_runs/run_a,results/ruler_runs/run_b \
+  --labels baseline,drop_haar --output_dir results/ruler_compare
+
+# Llama RULER sweep (page_size x top_k)
+bash run_ruler_llama.sh
+
+# Oracle hybrid_multi scoring sweep
+python oracle/eval_ruler_hybridmulti.py --context_len 32768 \
+  --base_model meta-llama/Llama-3.1-8B-Instruct
 ```
 
-**LongBench v1/v2**:
+### LongBench evaluation
+
 ```bash
-python eval_longbench_v1.py --mode page_attention --base_model meta-llama/Llama-3.1-8B-Instruct \
-  --page_size 32 --top_k 64 --output_dir results_longbench_v1 --run_name my_run
+# v1 baseline / drop / hybrid / quest_attention
+python eval_longbench_v1.py --mode {baseline|page_attention|seer_attention|multipole_attention|quest_attention} \
+  --base_model meta-llama/Llama-3.1-8B-Instruct \
+  --output_dir results/longbench_v1/<name> --run_name <name> \
+  --page_size 32 --top_k 64 --unselected_mode {drop|hybrid}
+
+# v2 (same modes, uses eval_longbench_v2.py)
+python eval_longbench_v2.py --mode page_attention \
+  --base_model meta-llama/Llama-3.1-8B-Instruct \
+  --output_dir results/longbench_v2/<name> --run_name <name> \
+  --page_size 32 --top_k 64 --unselected_mode drop
+
+# Llama sweep scripts (baseline + top_k sweep)
+bash run_longbench_v1_llama.sh
+bash run_longbench_v2_llama.sh
+
+# Summarize completed runs
+python summarize_longbench_v1.py <run_dir1> <run_dir2> ...
+python summarize_longbench_v2.py <run_dir>
 ```
 
-**Speed test**:
+### Speed measurement
+
 ```bash
-python speed/speed_test_dummy.py --mode dct --model meta-llama/Llama-3.1-8B-Instruct \
-  --context_lengths 8192,16384,32768 --page_size 32 --top_k 64 --output_dir results/speed
+# All three modes via wrapper
+bash run_speed.sh
+GPU=1 bash run_speed.sh  # single GPU
+
+# Direct single-mode
+python speed_test_dummy.py --mode {baseline|dct} \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --context_lengths 8192,16384,32768 --output_dir results/speed
+
+# Per-layer decode profile
+python profile_decode.py --context_length 32768 \
+  --model meta-llama/Llama-3.1-8B-Instruct --page_size 32 --top_k 64
 ```
 
-**Parametric sweeps**: use `run_ruler.sh`, `run_longbench_v1.sh`, etc.
+### Oracle diagnostics
 
-**Baselines** (`--mode baseline`, `seer_attention`, or `multipole_attention` in eval scripts).
+```bash
+python oracle/diagnose_l2_scoring.py \
+  --ground_truths oracle_max output_contribution \
+  --scoring_methods oracle_max oracle_mean proxy_max proxy_mean dc_ac \
+  --context_length 16384 --model meta-llama/Llama-3.1-8B-Instruct
+```
 
 ## Conventions
 
-- **Monkey-patch pattern**: set global config then patch `forward`. Always call `replace_*_attn()` before `from_pretrained()`.
-- **Tensor shapes**: `[bsz, num_heads, seq_len, head_dim]` after transpose. `paged_*` = reshaped to `[..., num_pages, page_size, ...]`. `comp_*` = compressed. `*_buf` = pre-allocated buffer.
-- **Buffer caching**: kernels and projection matrices are cached on `attn_module` attributes (lazy init, shape/device checked each call).
-- **Triton kernels**: `@triton.jit` with constexpr block sizes, wrapper functions handle grid launch and fallback.
-- **No unit test suite**: validation is through benchmark runs (RULER, LongBench).
-- **Supported models**: Llama 3.x, Qwen 2.x, Qwen 3.x (with QK-norm).
-- **RoPE**: supports default, yarn, and llama3 rope types. `continuous_rope` is currently disabled; `block_center` RoPE for compressed tokens is active.
-- **Config naming in run scripts**: run names encode params, e.g. `drop_ps32_top64_comp1_haar`.
+- **Monkey-patch pattern**: set global config (`_dct_page_cfg` module variable) then patch `forward`. Always call `replace_*_attn()` before `from_pretrained()`.
+- **Tensor naming**: `paged_*` = reshaped to `[..., num_pages, page_size, ...]`. `comp_*` = compressed. `*_buf` = pre-allocated buffer.
+- **Buffer caching**: projection matrices and kernel caches are stored on `attn_module` attributes (lazy init, shape/device checked each call via `_get_or_build_*` functions).
+- **Triton kernels**: `@triton.jit` with constexpr block sizes; wrappers handle grid launch and PyTorch fallback when `use_triton=False`.
+- **No test suite**: validation through benchmark runs (RULER, LongBench).
+- **Supported models**: Llama 3.x (`replace_llama_attn`), Qwen 2.x (`replace_qwen2_attn`), Qwen 3.x with QK-norm (`replace_qwen3_attn`).
+- **RoPE**: supports default, Yarn, and Llama3 rope types. `continuous_rope` currently disabled; `compressed_token_rope="mixed"` active.
+- **Run naming**: encodes params, e.g. `drop_ps32_top64_comp1_haar`.
+- **DCTPageConfig defaults**: `page_size=32`, `top_k=64`, `sink_size=4`, `recent_size=128`, `compress_ratio=0.03125` (comp_size=1), `scoring_method="max"`, `score_use_haar_proxy=True`, `unselected_mode="drop"`, `use_triton=True`.
+
+## Data paths
+
+- RULER synthetic data: `results_ruler/data/synthetic/{seq_len}/`
+- LongBench v1 data: `longbench_v1_data/data/*.jsonl` or `benchmark/data/longbench_v1_data/*.jsonl`
+- Results: `results/`, `results_ruler/`
+
+## Notes
+
+- Default score proxy is **Haar lowpass** (block averaging), not DCT low-frequency.
+- `hybrid` mode is for accuracy experiments; speed optimization targets `drop` mode.
+- LongBench v1 no-chat tasks: `trec`, `triviaqa`, `samsum`, `lsht`, `lcc`, `repobench-p`.
+- `min_decode_kv_len_for_paging=8192`: below this KV length, falls back to baseline decode attention.
+- `max_unselected_compressed` (default `-1`): in compressed mode, limits how many unselected pages contribute compressed KV. `-1` = unlimited, `0` = drop all unselected (equivalent to drop mode), `N` = keep top-N by score.
+- Parametric sweep scripts: `run_*.sh` files at repo root (`run_ruler_llama.sh`, `run_ruler_multipole.sh`, `run_longbench_v1_llama.sh`, `run_longbench_v2_llama.sh`, etc.).
+- Baselines in `baselines/`: SEER Attention, Multipole Attention, Quest Attention. All eval scripts add `baselines/` to `sys.path` at startup so baseline packages are importable.
+- **Quest Attention** (`baselines/quest_attn/`): uses a custom model class (not monkey-patching). Requires `quest_init()` after loading. Supports LLaMA-family models (Llama-2/3.x, Mistral) and Qwen3. Has custom CUDA kernels in `ops/csrc/` built via `build_kernels.sh`. Config in `quest_attn/config.py`. Model classes: `LlamaForCausalLM` (llama.py), `Qwen3ForCausalLM` (qwen3.py). Both share `QuestAttention` which conditionally applies QK-norm for Qwen3.
+- `oracle/` folder contains standalone experiment scripts: `run_ruler_eval.py` (independent RULER runner), `eval_ruler_hybridmulti.py` (hybrid_multi scoring sweeps), `diagnose_l2_scoring.py` (proxy scoring diagnostics).
