@@ -9,7 +9,7 @@ BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 MODEL_TEMPLATE="${MODEL_TEMPLATE:-llama-3}"
 TOKENIZER_FAMILY="${TOKENIZER_FAMILY:-llama}"
 NUM_SAMPLES="${NUM_SAMPLES:-25}"
-OUTPUT_DIR="${OUTPUT_DIR:-results/results_ruler/proxy_max}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/results_ruler/page_attention}"
 
 # Sequence lengths to evaluate
 SEQ_LENGTHS="${SEQ_LENGTHS:-32768}" #"${SEQ_LENGTHS:-4096 8192 16384 32768 65536 131072}"
@@ -34,10 +34,10 @@ RECENT_SIZE=128
 SCORING_METHOD="max"
 GROUP_AGG_METHOD="max"
 # ---- Sweep (page_size, top_k) x compress_ratio x mode x compression_method x compressed_token_rope x weight_compressed_by_population ----
-for PS_TK in "16,188" "16,248" "32,93" "32,124"; do
+for PS_TK in "16,128" "16,64" "32,64" "32,32"; do
     IFS=',' read -r PAGE_SIZE TOP_K <<< "$PS_TK"
-    for COMPRESS_RATIO in 0.0625; do
-      for MODE in drop; do
+    for COMPRESS_RATIO in 0.125; do
+      for MODE in drop compressed; do
         for COMP_METHOD in dct; do
           for COMP_TOKEN_ROPE in mixed; do
             for WEIGHT_POP in 1; do
