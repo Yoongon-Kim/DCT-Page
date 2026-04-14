@@ -12,7 +12,6 @@ PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-2048}"
 OUTPUT_DIR="${OUTPUT_DIR:-results/results_longbench_v2/page_attention}"
 
 # DCT Page Attention defaults
-PAGE_SIZE=128
 SINK_SIZE=4
 RECENT_SIZE=128
 SCORING_METHOD="mean"
@@ -33,15 +32,16 @@ python eval_longbench_v2.py \
     --run_name qwen3_baseline
 
 # ---- Step 2: Sweep compress_ratio x top_k x group_agg_method (page attention) ----
-for COMPRESS_RATIO in 0.0625; do  # 4/128, 8/128, 16/128, 32/128
-    for TOP_K in 4 8 16 32; do
+for PS_TK in "128,4" "128,8" "128,16" "128,32"; do
+    IFS=',' read -r PAGE_SIZE TOP_K <<< "$PS_TK"
+    for COMPRESS_RATIO in 0.0625; do  # 4/128, 8/128, 16/128, 32/128
         for SCORING_METHOD in mean max; do
             for GAM in max mean; do
                 for MODE in drop compressed; do
                   for COMP_METHOD in haar dct; do
                     echo ""
                     echo "===================================================================="
-                    echo "PAGE ATTENTION : cr=${COMPRESS_RATIO}, top_k=${TOP_K}, scoring_method=${SCORING_METHOD}, group_agg=${GAM}, mode=${MODE}, comp=${COMP_METHOD}"
+                    echo "PAGE ATTENTION : ps=${PAGE_SIZE}, top_k=${TOP_K}, cr=${COMPRESS_RATIO}, scoring_method=${SCORING_METHOD}, group_agg=${GAM}, mode=${MODE}, comp=${COMP_METHOD}"
                     echo "===================================================================="
                     python eval_longbench_v2.py \
                         --mode page_attention \
@@ -50,7 +50,7 @@ for COMPRESS_RATIO in 0.0625; do  # 4/128, 8/128, 16/128, 32/128
                         --max_new_tokens "$MAX_NEW_TOKENS" \
                         --num_samples "$NUM_SAMPLES" \
                         --output_dir "$OUTPUT_DIR" \
-                        --run_name "qwen3_page_attn_${COMPRESS_RATIO}_topk${TOP_K}_${SCORING_METHOD}_${GAM}_${MODE}_${COMP_METHOD}" \
+                        --run_name "qwen3_page_attn_ps${PAGE_SIZE}_topk${TOP_K}_cr${COMPRESS_RATIO}_${SCORING_METHOD}_${GAM}_${MODE}_${COMP_METHOD}" \
                         --page_size "$PAGE_SIZE" \
                         --top_k "$TOP_K" \
                         --sink_size "$SINK_SIZE" \

@@ -399,6 +399,15 @@ def build_summary(results, args):
         summary["scoring_method"] = args.scoring_method
         summary["group_agg_method"] = args.group_agg_method
         summary["unselected_mode"] = args.unselected_mode
+    elif args.mode == "seer_attention":
+        from seer_attn.config import SEER_ATTN_CONFIG
+        summary["seer_attn_config"] = SEER_ATTN_CONFIG
+    elif args.mode == "multipole_attention":
+        from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
+        summary["multipole_attn_config"] = MULTIPOLE_ATTN_CONFIG
+    elif args.mode == "quest_attention":
+        from quest_attn.config import QUEST_ATTN_CONFIG
+        summary["quest_attn_config"] = QUEST_ATTN_CONFIG
 
     return summary
 
@@ -612,33 +621,7 @@ def main():
     # Print summary
     print_summary(results, args.run_name)
 
-    # # Save summary JSON
-    summary_path = os.path.join(args.output_dir, f"{args.run_name}_summary.json")
-    overall_acc = sum(1 for r in results if r["correct"]) / len(results) * 100 if results else 0
-    summary = {
-        "mode": args.mode,
-        "model": args.base_model,
-        "run_name": args.run_name,
-        "num_samples": len(results),
-        "overall_accuracy": round(overall_acc, 2),
-    }
-    if args.mode == "page_attention":
-        summary["top_k"] = args.top_k
-        summary["page_size"] = args.page_size
-        summary["scoring_method"] = args.scoring_method
-        summary["group_agg_method"] = args.group_agg_method
-        summary["unselected_mode"] = args.unselected_mode
-    elif args.mode == "seer_attention":
-        from seer_attn.config import SEER_ATTN_CONFIG
-        summary["seer_attn_config"] = SEER_ATTN_CONFIG
-    elif args.mode == "multipole_attention":
-        from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
-        summary["multipole_attn_config"] = MULTIPOLE_ATTN_CONFIG
-    elif args.mode == "quest_attention":
-        from quest_attn.config import QUEST_ATTN_CONFIG
-        summary["quest_attn_config"] = QUEST_ATTN_CONFIG
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
+    summary_path, csv_path = write_summary_files(results, args)
 
     print(f"\nResults saved to: {os.path.join(args.output_dir, args.run_name + '.jsonl')}")
     print(f"Summary saved to: {summary_path}")

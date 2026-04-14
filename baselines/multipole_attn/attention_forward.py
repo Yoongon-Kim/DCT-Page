@@ -92,8 +92,13 @@ def multipole_attention_forward(
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ):
-    # Derive past_seen_tokens from cache_position (works with stock transformers)
-    past_seen_tokens = cache_position[0].item() if cache_position is not None else 0
+    # Derive past_seen_tokens from cache_position or past_key_values
+    if cache_position is not None:
+        past_seen_tokens = cache_position[0].item()
+    elif past_key_values is not None:
+        past_seen_tokens = past_key_values.get_seq_length()
+    else:
+        past_seen_tokens = 0
 
     # Reset per-example state
     if past_seen_tokens == 0:
