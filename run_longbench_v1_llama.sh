@@ -41,7 +41,7 @@ python eval_longbench_v1.py \
     $TASK_ARGS
 
 # ---- Step 2: Sweep compress_ratio x top_k x scoring_method x group_agg_method x mode ----
-for PS_TK in "32,64" "32,32" "16,124" "16,64"; do
+for PS_TK in "16,128"; do
     IFS=',' read -r PAGE_SIZE TOP_K <<< "$PS_TK"
     for COMPRESS_RATIO in 0.0625; do
         for SCORING_METHOD in max; do
