@@ -26,6 +26,8 @@ from tqdm import tqdm
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from eval_ruler import model_name_tag
+
 
 # ---------------------------------------------------------------------------
 # Prompt template (matches official LongBench v2 0shot.txt)
@@ -105,6 +107,13 @@ def parse_args():
                              "(multipole-style population weighting). No-op for drop mode.")
     parser.add_argument("--no_triton", action="store_true",
                         help="Disable Triton kernels (use pure PyTorch for comparison)")
+    parser.add_argument("--comp_kv_quant", type=str, default="none",
+                        choices=["none", "fp8_e4m3", "fp8_e5m2", "int8", "int4"],
+                        help="Fake-quantization of compressed K/V at write time "
+                             "(precision study; no real byte-level storage change)")
+    parser.add_argument("--comp_kv_quant_granularity", type=str, default="per_page",
+                        choices=["per_page", "per_comp_token"],
+                        help="Scale granularity for comp_kv_quant")
 
     # Chunked prefill (useful for multipole_attention on single GPU)
     parser.add_argument("--prefill_chunk_size", type=int, default=0,
@@ -113,18 +122,19 @@ def parse_args():
     args = parser.parse_args()
 
     if args.run_name is None:
+        tag = model_name_tag(args.base_model)
         if args.mode == "baseline":
-            args.run_name = "baseline"
+            args.run_name = f"{tag}_baseline"
         elif args.mode == "rope_gap":
-            args.run_name = f"rope_gap_{args.num_gaps}x{args.gap_size}"
+            args.run_name = f"{tag}_rope_gap_{args.num_gaps}x{args.gap_size}"
         elif args.mode == "seer_attention":
-            args.run_name = "seer_attention"
+            args.run_name = f"{tag}_seer_attention"
         elif args.mode == "multipole_attention":
-            args.run_name = "multipole_attention"
+            args.run_name = f"{tag}_multipole_attention"
         elif args.mode == "quest_attention":
-            args.run_name = "quest_attention"
+            args.run_name = f"{tag}_quest_attention"
         else:
-            args.run_name = f"page_attn_topk{args.top_k}"
+            args.run_name = f"{tag}_page_attn_topk{args.top_k}"
 
     return args
 
@@ -481,6 +491,8 @@ def main():
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
                 weight_compressed_by_population=args.weight_compressed_by_population,
+                comp_kv_quant=args.comp_kv_quant,
+                comp_kv_quant_granularity=args.comp_kv_quant_granularity,
             )
         elif "qwen3" in model_name_lower:
             from dct_page_attention import replace_qwen3_attn
@@ -498,6 +510,8 @@ def main():
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
                 weight_compressed_by_population=args.weight_compressed_by_population,
+                comp_kv_quant=args.comp_kv_quant,
+                comp_kv_quant_granularity=args.comp_kv_quant_granularity,
             )
         else:
             from dct_page_attention import replace_qwen2_attn
@@ -515,6 +529,8 @@ def main():
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
                 weight_compressed_by_population=args.weight_compressed_by_population,
+                comp_kv_quant=args.comp_kv_quant,
+                comp_kv_quant_granularity=args.comp_kv_quant_granularity,
             )
     elif args.mode == "rope_gap":
         from rope_gap_attention import replace_qwen2_with_rope_gaps

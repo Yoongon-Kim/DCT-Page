@@ -6,10 +6,16 @@ set -e
 
 # ---- Configuration ----
 BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
-MODEL_TEMPLATE="${MODEL_TEMPLATE:-llama-3}"
-TOKENIZER_FAMILY="${TOKENIZER_FAMILY:-llama}"
 NUM_SAMPLES="${NUM_SAMPLES:-25}"
 OUTPUT_DIR="${OUTPUT_DIR:-results/results_ruler/page_attention}"
+
+# Derive a short model tag from BASE_MODEL (used in run names).
+# Only Llama 3.x and Qwen3 are supported — eval_ruler.py enforces this.
+case "$(echo "$BASE_MODEL" | tr '[:upper:]' '[:lower:]')" in
+    *llama*)  MODEL_TAG="llama" ;;
+    *qwen3*)  MODEL_TAG="qwen" ;;
+    *) echo "Unsupported BASE_MODEL: $BASE_MODEL (only Llama 3.x / Qwen3)"; exit 1 ;;
+esac
 
 # Sequence lengths to evaluate
 SEQ_LENGTHS="${SEQ_LENGTHS:-32768}" #"${SEQ_LENGTHS:-4096 8192 16384 32768 65536 131072}"
@@ -48,7 +54,7 @@ for PS_TK in "16,128" "16,64" "32,64" "32,32"; do
                   WEIGHT_POP_FLAG=""
                   WEIGHT_POP_TAG="nopopw"
               fi
-              RUN_NAME="${TOKENIZER_FAMILY}_ps${PAGE_SIZE}_topk${TOP_K}_cr${COMPRESS_RATIO}_${MODE}_${COMP_METHOD}_tokenrope${COMP_TOKEN_ROPE}_${WEIGHT_POP_TAG}"
+              RUN_NAME="${MODEL_TAG}_ps${PAGE_SIZE}_topk${TOP_K}_cr${COMPRESS_RATIO}_${MODE}_${COMP_METHOD}_tokenrope${COMP_TOKEN_ROPE}_${WEIGHT_POP_TAG}"
 
               echo ""
               echo "===================================================================="
@@ -57,7 +63,7 @@ for PS_TK in "16,128" "16,64" "32,64" "32,32"; do
               python eval_ruler.py \
                   --mode page_attention \
                   --base_model "$BASE_MODEL" \
-                  $PREPARE_FLAG --model_template_type "$MODEL_TEMPLATE" --tokenizer_family "$TOKENIZER_FAMILY" \
+                  $PREPARE_FLAG \
                   --seq_lengths $SEQ_LENGTHS \
                   --num_samples "$NUM_SAMPLES" \
                   --output_dir "$OUTPUT_DIR/$COMP_METHOD" \

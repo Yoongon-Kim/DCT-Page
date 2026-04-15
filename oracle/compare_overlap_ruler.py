@@ -45,6 +45,8 @@ import yaml
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from eval_ruler import infer_model_family
+
 # ---------------------------------------------------------------------------
 # Helpers (originally lived in the deleted analyze_selection_oracle_overlap.py)
 # ---------------------------------------------------------------------------
@@ -191,7 +193,6 @@ def parse_args() -> argparse.Namespace:
     # RULER
     p.add_argument("--tasks", type=str, nargs="+", default=ALL_TASKS)
     p.add_argument("--seq_len", type=int, default=32768)
-    p.add_argument("--tokenizer_family", type=str, default="qwen3")
     p.add_argument("--num_samples", type=int, default=25)
 
     # DCT page config
@@ -422,8 +423,9 @@ def main() -> None:
             print("=" * 60)
 
             # Load data
+            _, tokenizer_family = infer_model_family(args.base_model)
             data_path = (
-                Path("ruler_data") / args.tokenizer_family
+                Path("ruler_data") / tokenizer_family
                 / str(args.seq_len) / task / "validation.jsonl"
             )
             if not data_path.exists():

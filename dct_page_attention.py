@@ -832,6 +832,17 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
             new_comp_k = _compress_pages(attn_module, new_k_for_compress, comp_size)
             new_comp_v = _compress_pages(attn_module, new_v, comp_size)
 
+        # Step B': fake-quantize compressed K and V to simulate low-precision storage.
+        # No-op when cfg.comp_kv_quant == "none". Runs before block_center RoPE so the
+        # re-rotation applies to the quantized values (matches real fp8-store semantics).
+        if cfg.comp_kv_quant != "none":
+            new_comp_k = _fake_quantize_comp(
+                new_comp_k, cfg.comp_kv_quant, cfg.comp_kv_quant_granularity
+            )
+            new_comp_v = _fake_quantize_comp(
+                new_comp_v, cfg.comp_kv_quant, cfg.comp_kv_quant_granularity
+            )
+
         # Step C: re-apply RoPE to compressed K at block-center positions
         if cfg.compressed_token_rope == "block_center":
             new_positions = _block_center_positions(
@@ -868,6 +879,56 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
     if comp_k is None:
         return None, None
     return comp_k[:, :, :num_pages], comp_v[:, :, :num_pages]
+
+
+_FP8_MAX = {"fp8_e4m3": 448.0, "fp8_e5m2": 57344.0}
+_FP8_DTYPE = {"fp8_e4m3": torch.float8_e4m3fn, "fp8_e5m2": torch.float8_e5m2}
+
+
+def _fake_quantize_comp(x: torch.Tensor, quant_type: str, granularity: str) -> torch.Tensor:
+    """Quantize→dequantize round-trip for compressed K/V.
+
+    Returns a tensor with the same shape and dtype as the input, but with
+    precision loss baked in. Used to study whether storing compressed KV in
+    low precision would degrade page selection quality.
+
+    x shape: [bsz, num_kv_heads, num_pages, comp_size, head_dim]
+    granularity:
+      per_page:       one absmax scale per (bsz, kv_head, page)
+      per_comp_token: one absmax scale per (bsz, kv_head, page, comp_idx)
+    """
+    if quant_type == "none":
+        return x
+
+    if granularity == "per_page":
+        reduce_dims = (-2, -1)
+    elif granularity == "per_comp_token":
+        reduce_dims = (-1,)
+    else:
+        raise ValueError(f"Unsupported comp_kv_quant_granularity: {granularity}")
+
+    orig_dtype = x.dtype
+    x_fp = x.to(torch.float32)
+    abs_max = x_fp.abs().amax(dim=reduce_dims, keepdim=True).clamp(min=1e-8)
+
+    if quant_type in ("fp8_e4m3", "fp8_e5m2"):
+        fp8_max = _FP8_MAX[quant_type]
+        fp8_dtype = _FP8_DTYPE[quant_type]
+        scale = abs_max / fp8_max
+        x_q = (x_fp / scale).to(fp8_dtype)
+        return (x_q.to(torch.float32) * scale).to(orig_dtype)
+
+    if quant_type == "int8":
+        scale = abs_max / 127.0
+        x_q = torch.round(x_fp / scale).clamp(-128.0, 127.0)
+        return (x_q * scale).to(orig_dtype)
+
+    if quant_type == "int4":
+        scale = abs_max / 7.0
+        x_q = torch.round(x_fp / scale).clamp(-8.0, 7.0)
+        return (x_q * scale).to(orig_dtype)
+
+    raise ValueError(f"Unsupported comp_kv_quant: {quant_type}")
 
 
 def _compress_pages(attn_module, paged_x, comp_size):
@@ -1835,6 +1896,8 @@ def replace_qwen2_attn(
     use_triton=True,
     weight_compressed_by_population=False,
     max_unselected_compressed=-1,
+    comp_kv_quant="none",
+    comp_kv_quant_granularity="per_page",
 ):
     """
     Replace Qwen2Attention.forward with DCT Page Attention.
@@ -1864,6 +1927,8 @@ def replace_qwen2_attn(
         use_triton=use_triton,
         weight_compressed_by_population=weight_compressed_by_population,
         max_unselected_compressed=max_unselected_compressed,
+        comp_kv_quant=comp_kv_quant,
+        comp_kv_quant_granularity=comp_kv_quant_granularity,
     )
 
     comp_size = max(1, int(page_size * compress_ratio))
@@ -1883,7 +1948,9 @@ def replace_qwen2_attn(
         f"select_with_oracle_page_scores={select_with_oracle_page_scores}, "
         f"use_triton={use_triton}, "
         f"weight_compressed_by_population={weight_compressed_by_population}, "
-        f"max_unselected_compressed={max_unselected_compressed}"
+        f"max_unselected_compressed={max_unselected_compressed}, "
+        f"comp_kv_quant={comp_kv_quant}, "
+        f"comp_kv_quant_granularity={comp_kv_quant_granularity}"
     )
     print(f"  Page attention active during decode only (prefill uses full attention)")
 
@@ -1912,6 +1979,8 @@ def replace_qwen3_attn(
     use_triton=True,
     weight_compressed_by_population=False,
     max_unselected_compressed=-1,
+    comp_kv_quant="none",
+    comp_kv_quant_granularity="per_page",
 ):
     """
     Replace Qwen3Attention.forward with DCT Page Attention.
@@ -1943,6 +2012,8 @@ def replace_qwen3_attn(
         use_triton=use_triton,
         weight_compressed_by_population=weight_compressed_by_population,
         max_unselected_compressed=max_unselected_compressed,
+        comp_kv_quant=comp_kv_quant,
+        comp_kv_quant_granularity=comp_kv_quant_granularity,
     )
 
     comp_size = max(1, int(page_size * compress_ratio))
@@ -1962,7 +2033,9 @@ def replace_qwen3_attn(
         f"select_with_oracle_page_scores={select_with_oracle_page_scores}, "
         f"use_triton={use_triton}, "
         f"weight_compressed_by_population={weight_compressed_by_population}, "
-        f"max_unselected_compressed={max_unselected_compressed}"
+        f"max_unselected_compressed={max_unselected_compressed}, "
+        f"comp_kv_quant={comp_kv_quant}, "
+        f"comp_kv_quant_granularity={comp_kv_quant_granularity}"
     )
     print(f"  Page attention active during decode only (prefill uses full attention)")
 
@@ -1991,6 +2064,8 @@ def replace_llama_attn(
     use_triton=True,
     weight_compressed_by_population=False,
     max_unselected_compressed=-1,
+    comp_kv_quant="none",
+    comp_kv_quant_granularity="per_page",
 ):
     """
     Replace LlamaAttention.forward with DCT Page Attention.
@@ -2022,6 +2097,8 @@ def replace_llama_attn(
         use_triton=use_triton,
         weight_compressed_by_population=weight_compressed_by_population,
         max_unselected_compressed=max_unselected_compressed,
+        comp_kv_quant=comp_kv_quant,
+        comp_kv_quant_granularity=comp_kv_quant_granularity,
     )
 
     comp_size = max(1, int(page_size * compress_ratio))
@@ -2041,7 +2118,9 @@ def replace_llama_attn(
         f"select_with_oracle_page_scores={select_with_oracle_page_scores}, "
         f"use_triton={use_triton}, "
         f"weight_compressed_by_population={weight_compressed_by_population}, "
-        f"max_unselected_compressed={max_unselected_compressed}"
+        f"max_unselected_compressed={max_unselected_compressed}, "
+        f"comp_kv_quant={comp_kv_quant}, "
+        f"comp_kv_quant_granularity={comp_kv_quant_granularity}"
     )
     print(f"  Page attention active during decode only (prefill uses full attention)")
 

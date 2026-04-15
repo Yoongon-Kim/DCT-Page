@@ -5,11 +5,17 @@ set -e
 
 # ---- Configuration ----
 BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-8B}"
-MODEL_TEMPLATE="${MODEL_TEMPLATE:-qwen-3}"
-TOKENIZER_FAMILY="${TOKENIZER_FAMILY:-qwen3}"
-MODEL_FAMILY="${MODEL_FAMILY:-qwen3}"
 NUM_SAMPLES="${NUM_SAMPLES:-25}"
-OUTPUT_DIR="${OUTPUT_DIR:-results_ruler/seer_attention/${MODEL_FAMILY}}"
+
+# Derive a short model tag from BASE_MODEL (used for output dir + run name).
+# Only Llama 3.x and Qwen3 are supported — eval_ruler.py enforces this.
+case "$(echo "$BASE_MODEL" | tr '[:upper:]' '[:lower:]')" in
+    *llama*)  MODEL_TAG="llama" ;;
+    *qwen3*)  MODEL_TAG="qwen" ;;
+    *) echo "Unsupported BASE_MODEL: $BASE_MODEL (only Llama 3.x / Qwen3)"; exit 1 ;;
+esac
+
+OUTPUT_DIR="${OUTPUT_DIR:-results_ruler/seer_attention/${MODEL_TAG}}"
 
 # Sequence lengths to evaluate
 SEQ_LENGTHS="${SEQ_LENGTHS:-32768}" # "${SEQ_LENGTHS:-4096 8192 16384 32768 65536 131072}"
@@ -71,7 +77,7 @@ PYEOF
 
 # ---- Sweep token_budget ----
 for TOKEN_BUDGET in 1156 2180; do
-    RUN_NAME="${MODEL_FAMILY}_seer_budget${TOKEN_BUDGET}"
+    RUN_NAME="${MODEL_TAG}_seer_budget${TOKEN_BUDGET}"
 
     echo ""
     echo "===================================================================="
@@ -83,7 +89,7 @@ for TOKEN_BUDGET in 1156 2180; do
     python eval_ruler.py \
         --mode seer_attention \
         --base_model "$BASE_MODEL" \
-        $PREPARE_FLAG --model_template_type "$MODEL_TEMPLATE" --tokenizer_family "$TOKENIZER_FAMILY" \
+        $PREPARE_FLAG \
         --seq_lengths $SEQ_LENGTHS \
         --num_samples "$NUM_SAMPLES" \
         --output_dir "$OUTPUT_DIR" \

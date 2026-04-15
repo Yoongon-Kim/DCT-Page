@@ -5,11 +5,14 @@ Supports four attention modes (baseline, page_attention, seer_attention,
 multipole_attention) with optional data preparation.  Mirrors the mode-based
 dispatch pattern of eval_longbench_v1.py.
 
+Supported models: Llama 3.1 8B Instruct and Qwen3-8B. Chat template and
+data-directory family are derived from --base_model.
+
 Usage examples:
     # Prepare data + run baseline
     python eval_ruler.py --mode baseline \
         --base_model meta-llama/Llama-3.1-8B-Instruct \
-        --prepare --model_template_type llama-3 \
+        --prepare \
         --output_dir results_ruler --run_name baseline
 
     # Run seer attention (data already prepared)
@@ -54,6 +57,38 @@ RULER_DATA_DIR = Path(os.path.dirname(os.path.abspath(__file__))) / "benchmark" 
 
 
 # ---------------------------------------------------------------------------
+# Model family inference
+# ---------------------------------------------------------------------------
+# Only Llama 3.1 and Qwen3 are supported. The chat template (for prepare.py)
+# and the data-directory family are derived from --base_model so the three
+# can never drift out of sync.
+def infer_model_family(base_model: str) -> tuple[str, str]:
+    """Return (model_template_type, tokenizer_family) for the base model."""
+    s = base_model.lower()
+    if "llama" in s:
+        return "llama-3", "llama"
+    if "qwen3" in s:
+        return "qwen-3", "qwen3"
+    raise ValueError(
+        f"Unsupported --base_model: {base_model!r}. "
+        "Only Llama 3.x and Qwen3 are supported."
+    )
+
+
+def model_name_tag(base_model: str) -> str:
+    """Short, human-friendly tag for run names.
+
+    'Qwen/Qwen3-8B' -> 'qwen', 'meta-llama/Llama-3.1-8B-Instruct' -> 'llama'.
+    """
+    s = base_model.lower()
+    if "llama" in s:
+        return "llama"
+    if "qwen" in s:
+        return "qwen"
+    raise ValueError(f"Unsupported --base_model: {base_model!r}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def parse_args():
@@ -71,11 +106,6 @@ def parse_args():
     # Data preparation
     parser.add_argument("--prepare", action="store_true",
                         help="Run data preparation before prediction (skips if data exists)")
-    parser.add_argument("--model_template_type", type=str, default="qwen-3",
-                        help="Template type for prepare.py (e.g. llama-3, qwen-3)")
-    parser.add_argument("--tokenizer_family", type=str, default="qwen3",
-                        choices=["llama", "qwen2", "qwen3"],
-                        help="Tokenizer family name for data directory (models in same family share data)")
 
     # RULER config
     parser.add_argument("--seq_lengths", type=int, nargs="+",
@@ -114,23 +144,31 @@ def parse_args():
                              "by page_size/comp_size via a log(n) bias on QK logits "
                              "(multipole-style population weighting). No-op for drop mode.")
     parser.add_argument("--no_triton", action="store_true")
+    parser.add_argument("--comp_kv_quant", type=str, default="none",
+                        choices=["none", "fp8_e4m3", "fp8_e5m2", "int8", "int4"],
+                        help="Fake-quantization of compressed K/V at write time "
+                             "(precision study; no real byte-level storage change)")
+    parser.add_argument("--comp_kv_quant_granularity", type=str, default="per_page",
+                        choices=["per_page", "per_comp_token"],
+                        help="Scale granularity for comp_kv_quant")
     parser.add_argument("--skip_existing", action="store_true",
                         help="Skip run if summary.json already exists in output dir")
 
     args = parser.parse_args()
 
     if args.run_name is None:
+        tag = model_name_tag(args.base_model)
         if args.mode == "baseline":
-            args.run_name = "baseline"
+            args.run_name = f"{tag}_baseline"
         elif args.mode == "page_attention":
-            args.run_name = (f"page_attn_topk{args.top_k}_cr{args.compress_ratio}"
-                             f"_ps{args.page_size}_{args.unselected_mode}")
+            args.run_name = (f"{tag}_page_attn_topk{args.top_k}_cr{args.compress_ratio}"
+                             f"_ps{args.page_size}_{args.unselected_mode}_{args.comp_kv_quant}")
         elif args.mode == "seer_attention":
-            args.run_name = "seer_attention"
+            args.run_name = f"{tag}_seer_attention"
         elif args.mode == "multipole_attention":
-            args.run_name = "multipole_attention"
+            args.run_name = f"{tag}_multipole_attention"
         elif args.mode == "quest_attention":
-            args.run_name = "quest_attention"
+            args.run_name = f"{tag}_quest_attention"
 
     if args.skip_existing:
         summary_path = Path(args.output_dir) / args.run_name / "summary.json"
@@ -179,7 +217,7 @@ def load_task_configs():
 # ---------------------------------------------------------------------------
 def prepare_data(args):
     """Run eval_ruler/data/prepare.py for tasks that don't have data yet."""
-    model_family = args.tokenizer_family
+    model_template_type, model_family = infer_model_family(args.base_model)
     prepare_script = os.path.join(RULER_DIR, "data", "prepare.py")
 
     for seq_len in args.seq_lengths:
@@ -200,7 +238,7 @@ def prepare_data(args):
                 "--tokenizer_path", args.base_model,
                 "--tokenizer_type", "hf",
                 "--max_seq_length", str(seq_len),
-                "--model_template_type", args.model_template_type,
+                "--model_template_type", model_template_type,
                 "--num_samples", str(args.num_samples),
             ]
             print(f"  Preparing {task} @ seq_len={seq_len}...")
@@ -234,6 +272,8 @@ def apply_monkey_patch(args):
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
                 weight_compressed_by_population=args.weight_compressed_by_population,
+                comp_kv_quant=args.comp_kv_quant,
+                comp_kv_quant_granularity=args.comp_kv_quant_granularity,
             )
         elif "qwen3" in model_name_lower:
             from dct_page_attention import replace_qwen3_attn
@@ -251,6 +291,8 @@ def apply_monkey_patch(args):
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
                 weight_compressed_by_population=args.weight_compressed_by_population,
+                comp_kv_quant=args.comp_kv_quant,
+                comp_kv_quant_granularity=args.comp_kv_quant_granularity,
             )
         else:
             from dct_page_attention import replace_qwen2_attn
@@ -268,6 +310,8 @@ def apply_monkey_patch(args):
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
                 weight_compressed_by_population=args.weight_compressed_by_population,
+                comp_kv_quant=args.comp_kv_quant,
+                comp_kv_quant_granularity=args.comp_kv_quant_granularity,
             )
     elif args.mode == "multipole_attention":
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "baselines"))
@@ -529,7 +573,7 @@ def main():
     apply_monkey_patch(args)
     model, tokenizer = load_model_and_tokenizer(args)
 
-    model_family = args.tokenizer_family
+    _, model_family = infer_model_family(args.base_model)
 
     # Step 3: Predict + evaluate per sequence length
     all_seq_results = {}  # {seq_len: {task: score}}

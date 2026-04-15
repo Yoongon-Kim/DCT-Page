@@ -5,11 +5,17 @@ set -e
 
 # ---- Configuration ----
 BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
-MODEL_TEMPLATE="${MODEL_TEMPLATE:-llama-3}"
-TOKENIZER_FAMILY="${TOKENIZER_FAMILY:-llama}"
-MODEL_FAMILY="${MODEL_FAMILY:-llama3}"
 NUM_SAMPLES="${NUM_SAMPLES:-25}"
-OUTPUT_DIR="${OUTPUT_DIR:-results_ruler/multipole_attention/${MODEL_FAMILY}}"
+
+# Derive a short model tag from BASE_MODEL (used for output dir + run name).
+# Only Llama 3.x and Qwen3 are supported — eval_ruler.py enforces this.
+case "$(echo "$BASE_MODEL" | tr '[:upper:]' '[:lower:]')" in
+    *llama*)  MODEL_TAG="llama" ;;
+    *qwen3*)  MODEL_TAG="qwen" ;;
+    *) echo "Unsupported BASE_MODEL: $BASE_MODEL (only Llama 3.x / Qwen3)"; exit 1 ;;
+esac
+
+OUTPUT_DIR="${OUTPUT_DIR:-results_ruler/multipole_attention/${MODEL_TAG}}"
 
 # Sequence lengths to evaluate
 SEQ_LENGTHS="${SEQ_LENGTHS:-32768}" #"${SEQ_LENGTHS:-4096 8192 16384 32768 65536 131072}"
@@ -76,7 +82,7 @@ PYEOF
 for PCT_CLUSTERS in 6.25; do
     for PERCENTILES in 3131 4091; do
         for REPL in False; do
-            RUN_NAME="${MODEL_FAMILY}_multipole_pct${PCT_CLUSTERS}_ptl${PERCENTILES}_repl${REPL}"
+            RUN_NAME="${MODEL_TAG}_multipole_pct${PCT_CLUSTERS}_ptl${PERCENTILES}_repl${REPL}"
 
             echo ""
             echo "===================================================================="
@@ -89,7 +95,7 @@ for PCT_CLUSTERS in 6.25; do
                 --mode multipole_attention \
                 --base_model "$BASE_MODEL" \
                 --skip_existing \
-                $PREPARE_FLAG --model_template_type "$MODEL_TEMPLATE" --tokenizer_family "$TOKENIZER_FAMILY" \
+                $PREPARE_FLAG \
                 --seq_lengths $SEQ_LENGTHS \
                 --num_samples "$NUM_SAMPLES" \
                 --output_dir "$OUTPUT_DIR" \

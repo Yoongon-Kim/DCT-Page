@@ -25,7 +25,7 @@ MULTIPOLE_ATTN_CONFIG = {
     "percentiles_lst": [1156],
 
     # Use centroid value approximation for non-selected tokens
-    "use_replacement": False,
+    "use_replacement": True,
 
     # Number of new tokens between re-clustering during generation
     "cluster_interval": 128,

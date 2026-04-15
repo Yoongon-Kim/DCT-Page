@@ -24,3 +24,5 @@ class DCTPageConfig:
     use_triton: bool = True            # Use fused Triton kernels (False = pure PyTorch, for comparison)
     weight_compressed_by_population: bool = False  # In compressed mode, scale each unselected-page rep's softmax mass by page_size/comp_size via a log(n) bias on QK logits (multipole-style population weighting). No-op for drop mode and for direct-spectral-proxy mode.
     max_unselected_compressed: int = -1  # Max unselected pages contributing compressed tokens (-1 = unlimited, 0 = drop all unselected, N = keep top-N by score)
+    comp_kv_quant: str = "none"  # "none" | "fp8_e4m3" | "fp8_e5m2" | "int8" | "int4" — fake-quantization of compressed K and V at write time (for selection-precision study).
+    comp_kv_quant_granularity: str = "per_page"  # "per_page" | "per_comp_token" — scale granularity for fake-quant. per_page: one scale per (bsz, kv_head, page); per_comp_token: one scale per (bsz, kv_head, page, comp_idx).
