@@ -1176,6 +1176,63 @@ def _score_pages_hybrid_multi(
     return page_scores.contiguous()
 
 
+def _score_pages_spectral_recon_max(
+    query_states,
+    spectral_comp_k,
+    M_proj,
+    num_kv_groups,
+    group_agg_method,
+    out=None,
+):
+    """Score pages via spectral reconstruction of per-token Q·K scores.
+
+    Dot-products the scaled query with the (already DCT'd) compressed keys to get
+    frequency-domain score coefficients, then reconstructs them back to `page_size`
+    per-token scores using the IDCT-style synthesis matrix. Takes the max across
+    tokens in each page, then aggregates across GQA groups.
+
+    Args:
+        query_states:    [bsz, num_heads, 1, head_dim]
+        spectral_comp_k: [bsz, num_kv_heads, num_pages, comp_size, head_dim]
+                         (raw DCT coefficients of keys; from _update_spectral_score_cache)
+        M_proj:          [comp_size, page_size] DCT spectral projection matrix
+        num_kv_groups:   GQA group count
+        group_agg_method: "mean" | "max" | "topp"
+        out:             optional pre-allocated [bsz, num_kv_heads, capacity] float32 buffer
+
+    Returns:
+        page_scores: [bsz, num_kv_heads, num_pages] (float32)
+    """
+    bsz, num_kv_heads, num_pages, comp_size, head_dim = spectral_comp_k.shape
+    scaling = head_dim ** -0.5
+    q = query_states.squeeze(2).float()
+    q = q.reshape(bsz, num_kv_heads, num_kv_groups, head_dim) * scaling
+
+    a = torch.einsum(
+        'bhgd,bhncd->bhgnc', q, spectral_comp_k.float()
+    )                                                             # [B,H,G,N,c]
+
+    Phi_T = M_proj.T.float().contiguous()                        # [P, c]
+    shat = torch.einsum('tc,bhgnc->bhgnt', Phi_T, a)             # [B,H,G,N,P]
+    per_group = shat.max(dim=-1).values                          # [B,H,G,N]
+
+    if group_agg_method == "mean":
+        page_scores = per_group.mean(dim=2)
+    elif group_agg_method == "max":
+        page_scores = per_group.max(dim=2).values
+    elif group_agg_method == "topp":
+        k_top = min(2, num_kv_groups)
+        page_scores = per_group.topk(k_top, dim=2).values.mean(dim=2)
+    else:
+        raise ValueError(f"Unsupported group_agg_method: {group_agg_method}")
+
+    if out is not None:
+        out_view = out[:, :, :num_pages]
+        out_view.copy_(page_scores)
+        return out_view
+    return page_scores.contiguous()
+
+
 def _block_center_positions(start_page_idx, n_pages, page_size, comp_size, sink_size, device):
     """Compute the center position of each compressed block within a page.
 
@@ -1511,6 +1568,25 @@ def dct_page_attention_forward(
             hm_M, hm_alpha, self.num_key_value_groups, cfg.group_agg_method,
             out=self._page_scores_buf,
         )
+    elif cfg.scoring_method == "spectral_recon_max":
+        # Lowpass spectral reconstruction scoring (layout hardcoded to "low").
+        if comp_size > 0:
+            sr_spectral_comp_k = _update_spectral_score_cache(
+                self, paged_k, num_pages, comp_size, cfg, "low",
+            )
+            sr_proj = _get_or_build_dc_ac_spectral_matrix(
+                self, cfg.page_size, comp_size, paged_k.device, paged_k.dtype, "low",
+            )
+            page_scores = _score_pages_spectral_recon_max(
+                score_query_states,
+                sr_spectral_comp_k[:, :, :num_pages],
+                sr_proj,
+                self.num_key_value_groups,
+                cfg.group_agg_method,
+                out=self._page_scores_buf,
+            )
+        else:
+            page_scores = self._page_scores_buf[:, :, :num_pages].zero_()
     else:
         dc_ac_parsed = _parse_dc_ac_scoring_method(cfg.scoring_method)
         if dc_ac_parsed is not None:

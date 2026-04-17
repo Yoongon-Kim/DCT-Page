@@ -124,7 +124,7 @@ def parse_args():
     parser.add_argument("--recent_size", type=int, default=128)
     parser.add_argument("--compress_ratio", type=float, default=0.125)
     parser.add_argument("--scoring_method", type=str, default="max",
-                        help="'mean'|'max'|'sum'|'proxy_dc_ac_{lam}'|'spread_dc_ac_{lam}'")
+                        help="'mean'|'max'|'sum'|'proxy_dc_ac_{lam}'|'spread_dc_ac_{lam}'|'spectral_recon_max'")
     parser.add_argument("--group_agg_method", type=str, default="max",
                         choices=["mean", "max", "topp"])
     parser.add_argument("--unselected_mode", type=str, default="drop",
@@ -217,7 +217,7 @@ def load_task_configs():
 # ---------------------------------------------------------------------------
 def prepare_data(args):
     """Run eval_ruler/data/prepare.py for tasks that don't have data yet."""
-    model_template_type, model_family = infer_model_family(args.base_model)
+    _, model_family = infer_model_family(args.base_model)
     prepare_script = os.path.join(RULER_DIR, "data", "prepare.py")
 
     for seq_len in args.seq_lengths:
@@ -230,6 +230,8 @@ def prepare_data(args):
             data_file.parent.mkdir(parents=True, exist_ok=True)
             save_dir = str(RULER_DATA_DIR / model_family / str(seq_len))
 
+            # NeMo-Skills-style prep: bare task text, no chat tokens baked in.
+            # The chat template is applied at inference time via apply_chat_template.
             cmd = [
                 sys.executable, prepare_script,
                 "--save_dir", save_dir,
@@ -238,7 +240,8 @@ def prepare_data(args):
                 "--tokenizer_path", args.base_model,
                 "--tokenizer_type", "hf",
                 "--max_seq_length", str(seq_len),
-                "--model_template_type", model_template_type,
+                "--model_template_type", "base",
+                "--prepare_for_ns",
                 "--num_samples", str(args.num_samples),
             ]
             print(f"  Preparing {task} @ seq_len={seq_len}...")
@@ -419,6 +422,53 @@ def load_model_and_tokenizer(args):
 # ---------------------------------------------------------------------------
 # Prediction for a single task
 # ---------------------------------------------------------------------------
+def _build_chat_messages(sample):
+    """Build the chat messages for a RULER sample.
+
+    The cwe/vt task scripts embed a one-shot example inside `input`. If we can
+    detect it (by finding the answer_prefix text inside `input`), we split
+    the embedded example into proper user/assistant/user turns instead of
+    flattening everything into one user message. Chat models are trained on
+    alternating turns; this gives the few-shot a clearer structure.
+    """
+    answer_prefix = sample.get("answer_prefix", "")
+    inp = sample["input"]
+
+    if not answer_prefix:
+        return [{"role": "user", "content": inp}], False  # no partial assistant
+
+    # Detect embedded few-shot by searching for the answer_prefix text in the
+    # input. Try the full stripped prefix first, then a 40-char prefix (to
+    # tolerate format-arg substitution, e.g. vt's {num_v}/{query}).
+    stripped = answer_prefix.strip()
+    idx = inp.find(stripped)
+    if idx < 0 and len(stripped) > 40:
+        idx = inp.find(stripped[:40])
+
+    if idx < 0:
+        # No few-shot detected: single user turn + partial assistant
+        return [
+            {"role": "user", "content": inp},
+            {"role": "assistant", "content": answer_prefix},
+        ], True
+
+    # Few-shot present: split into three turns + partial assistant.
+    end = inp.find("\n", idx)
+    if end < 0:
+        # Unexpected: no newline after the embedded answer → fall back
+        return [
+            {"role": "user", "content": inp},
+            {"role": "assistant", "content": answer_prefix},
+        ], True
+
+    return [
+        {"role": "user", "content": inp[:idx].rstrip()},
+        {"role": "assistant", "content": inp[idx:end].strip()},
+        {"role": "user", "content": inp[end + 1:].lstrip()},
+        {"role": "assistant", "content": answer_prefix},
+    ], True
+
+
 def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
     """Generate predictions for one RULER task. Returns list of result dicts."""
     data_file = data_dir / task / "validation.jsonl"
@@ -454,14 +504,29 @@ def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
 
     with open(pred_file, "a", encoding="utf-8", buffering=1) as fout:
         for sample in tqdm(remaining, desc=f"  {task}"):
-            prompt = sample["input"]+sample.get("answer_prefix","")
-            # add_special_tokens=False: the prompt already embeds BOS via the
-            # chat template (meta-llama3 / qwen-3), so we must not let the
-            # tokenizer prepend another one.
-            input_ids = tokenizer(
-                prompt, return_tensors="pt", add_special_tokens=False,
-            ).input_ids.to(model.device)
+            # Data is prepped with --model_template_type base --prepare_for_ns,
+            # so `input` is bare task text. Apply the model's own chat template
+            # at inference time (NeMo-Skills approach). For few-shot tasks
+            # (cwe, vt), _build_chat_messages splits the embedded example into
+            # proper alternating user/assistant/user turns; otherwise it's a
+            # single user turn. answer_prefix (if any) becomes a partial
+            # assistant turn completed by the model via continue_final_message.
+            # date_string is pinned for reproducibility (Llama-3.1 would inject
+            # today's date otherwise).
+            messages, is_partial = _build_chat_messages(sample)
+            input_ids = tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                continue_final_message=is_partial,
+                add_generation_prompt=not is_partial,
+                return_tensors="pt",
+                date_string="26 Jul 2024",
+            )
+            if not isinstance(input_ids, torch.Tensor):
+                input_ids = input_ids["input_ids"]
+            input_ids = input_ids.to(model.device)
             input_len = input_ids.shape[1]
+            prompt_text = sample["input"] + sample.get("answer_prefix", "")
 
             with torch.no_grad():
                 if args.mode == "seer_attention":
@@ -488,7 +553,7 @@ def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
             result = {
                 "index": sample["index"],
                 "pred": pred_text,
-                "input": prompt,
+                "input": prompt_text,
                 "outputs": sample["outputs"],
                 "others": sample.get("others", {}),
                 "truncation": sample.get("truncation", -1),
