@@ -66,7 +66,7 @@ def infer_model_family(base_model: str) -> tuple[str, str]:
     """Return (model_template_type, tokenizer_family) for the base model."""
     s = base_model.lower()
     if "llama" in s:
-        return "llama-3", "llama"
+        return "meta-llama3", "llama"
     if "qwen3" in s:
         return "qwen-3", "qwen3"
     raise ValueError(
@@ -454,8 +454,13 @@ def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
 
     with open(pred_file, "a", encoding="utf-8", buffering=1) as fout:
         for sample in tqdm(remaining, desc=f"  {task}"):
-            prompt = sample["input"]
-            input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
+            prompt = sample["input"]+sample.get("answer_prefix","")
+            # add_special_tokens=False: the prompt already embeds BOS via the
+            # chat template (meta-llama3 / qwen-3), so we must not let the
+            # tokenizer prepend another one.
+            input_ids = tokenizer(
+                prompt, return_tensors="pt", add_special_tokens=False,
+            ).input_ids.to(model.device)
             input_len = input_ids.shape[1]
 
             with torch.no_grad():
