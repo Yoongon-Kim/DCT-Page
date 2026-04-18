@@ -422,51 +422,65 @@ def load_model_and_tokenizer(args):
 # ---------------------------------------------------------------------------
 # Prediction for a single task
 # ---------------------------------------------------------------------------
-def _build_chat_messages(sample):
-    """Build the chat messages for a RULER sample.
+# Llama-3.1 canonical chat-template tokens ("\n\n" after each header, each
+# closed turn terminated by <|eot_id|>). We construct the prompt manually
+# (rather than calling apply_chat_template) in order to skip Llama-3.1's
+# auto-injected "Cutting Knowledge Date" system preamble, which hurts cwe.
+_H_USER = "<|start_header_id|>user<|end_header_id|>\n\n"
+_H_ASST = "<|start_header_id|>assistant<|end_header_id|>\n\n"
+_EOT = "<|eot_id|>"
 
-    The cwe/vt task scripts embed a one-shot example inside `input`. If we can
-    detect it (by finding the answer_prefix text inside `input`), we split
-    the embedded example into proper user/assistant/user turns instead of
-    flattening everything into one user message. Chat models are trained on
-    alternating turns; this gives the few-shot a clearer structure.
+
+def _build_manual_prompt(sample):
+    """Build the prompt string manually (not via apply_chat_template).
+
+    Structural choices:
+      1. No system turn — skips Llama-3.1's auto-injected "Cutting Knowledge
+         Date" preamble that measurably hurts cwe.
+      2. For few-shot tasks (cwe, vt), split the embedded demo into proper
+         alternating user/assistant/user turns; detection is by substring-
+         matching answer_prefix inside `input` (40-char probe fallback for
+         vt's format-arg variation).
+      3. answer_prefix lives at the end of a partial assistant turn with no
+         trailing `<|eot_id|>`, so the model continues its own response.
+      4. Llama-3.1 canonical "\\n\\n" after each header; `<|eot_id|>` closes
+         every completed turn (including the demo-assistant turn).
+
+    BOS is auto-prepended by the tokenizer (add_bos_token=True default).
     """
     answer_prefix = sample.get("answer_prefix", "")
     inp = sample["input"]
 
-    if not answer_prefix:
-        return [{"role": "user", "content": inp}], False  # no partial assistant
-
-    # Detect embedded few-shot by searching for the answer_prefix text in the
-    # input. Try the full stripped prefix first, then a 40-char prefix (to
-    # tolerate format-arg substitution, e.g. vt's {num_v}/{query}).
-    stripped = answer_prefix.strip()
-    idx = inp.find(stripped)
-    if idx < 0 and len(stripped) > 40:
-        idx = inp.find(stripped[:40])
+    # Detect embedded few-shot (cwe: static prefix; vt: format-arg varies, use 40-char probe)
+    idx = -1
+    if answer_prefix:
+        stripped = answer_prefix.strip()
+        idx = inp.find(stripped)
+        if idx < 0 and len(stripped) > 40:
+            idx = inp.find(stripped[:40])
 
     if idx < 0:
-        # No few-shot detected: single user turn + partial assistant
-        return [
-            {"role": "user", "content": inp},
-            {"role": "assistant", "content": answer_prefix},
-        ], True
+        # No few-shot: single user turn + partial assistant
+        if answer_prefix:
+            return f"{_H_USER}{inp}{_EOT}{_H_ASST}{answer_prefix}"
+        return f"{_H_USER}{inp}{_EOT}{_H_ASST}"
 
-    # Few-shot present: split into three turns + partial assistant.
+    # Few-shot present: split into demo(user)/demo(asst)/real(user) + partial asst
     end = inp.find("\n", idx)
     if end < 0:
-        # Unexpected: no newline after the embedded answer → fall back
-        return [
-            {"role": "user", "content": inp},
-            {"role": "assistant", "content": answer_prefix},
-        ], True
+        if answer_prefix:
+            return f"{_H_USER}{inp}{_EOT}{_H_ASST}{answer_prefix}"
+        return f"{_H_USER}{inp}{_EOT}{_H_ASST}"
 
-    return [
-        {"role": "user", "content": inp[:idx].rstrip()},
-        {"role": "assistant", "content": inp[idx:end].strip()},
-        {"role": "user", "content": inp[end + 1:].lstrip()},
-        {"role": "assistant", "content": answer_prefix},
-    ], True
+    demo_user = inp[:idx].rstrip()
+    demo_asst = inp[idx:end].strip()
+    real_user = inp[end + 1:].lstrip()
+    return (
+        f"{_H_USER}{demo_user}{_EOT}"
+        f"{_H_ASST}{demo_asst}{_EOT}"
+        f"{_H_USER}{real_user}{_EOT}"
+        f"{_H_ASST}{answer_prefix}"
+    )
 
 
 def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
@@ -504,29 +518,19 @@ def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
 
     with open(pred_file, "a", encoding="utf-8", buffering=1) as fout:
         for sample in tqdm(remaining, desc=f"  {task}"):
-            # Data is prepped with --model_template_type base --prepare_for_ns,
-            # so `input` is bare task text. Apply the model's own chat template
-            # at inference time (NeMo-Skills approach). For few-shot tasks
-            # (cwe, vt), _build_chat_messages splits the embedded example into
-            # proper alternating user/assistant/user turns; otherwise it's a
-            # single user turn. answer_prefix (if any) becomes a partial
-            # assistant turn completed by the model via continue_final_message.
-            # date_string is pinned for reproducibility (Llama-3.1 would inject
-            # today's date otherwise).
-            messages, is_partial = _build_chat_messages(sample)
-            input_ids = tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                continue_final_message=is_partial,
-                add_generation_prompt=not is_partial,
-                return_tensors="pt",
-                date_string="26 Jul 2024",
-            )
-            if not isinstance(input_ids, torch.Tensor):
-                input_ids = input_ids["input_ids"]
-            input_ids = input_ids.to(model.device)
+            # NeMo-Skills prep + manually-built prompt. We bypass
+            # apply_chat_template to drop Llama-3.1's always-injected
+            # "Cutting Knowledge Date" system preamble (which hurts cwe).
+            # For cwe/vt the embedded one-shot is split into user/asst/user
+            # turns; answer_prefix is placed at the end of a partial
+            # assistant turn (no trailing <|eot_id|>) so the model continues
+            # its own response. Tokenizer auto-prepends BOS.
+            prompt_str = _build_manual_prompt(sample)
+            input_ids = tokenizer(
+                prompt_str, return_tensors="pt",
+            ).input_ids.to(model.device)
             input_len = input_ids.shape[1]
-            prompt_text = sample["input"] + sample.get("answer_prefix", "")
+            question = sample["input"] + sample.get("answer_prefix", "")
 
             with torch.no_grad():
                 if args.mode == "seer_attention":
@@ -553,7 +557,7 @@ def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
             result = {
                 "index": sample["index"],
                 "pred": pred_text,
-                "input": prompt_text,
+                "input": question,
                 "outputs": sample["outputs"],
                 "others": sample.get("others", {}),
                 "truncation": sample.get("truncation", -1),

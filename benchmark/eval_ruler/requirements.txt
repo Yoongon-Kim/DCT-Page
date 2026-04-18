@@ -1,0 +1,12 @@
+torch
+transformers>=4.54.0,<4.55
+wonderwords
+tenacity
+huggingface-hub
+nltk
+PyYAML
+pandas
+scipy
+numpy
+tqdm
+datasets
