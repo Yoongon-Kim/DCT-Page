@@ -66,7 +66,7 @@ def infer_model_family(base_model: str) -> tuple[str, str]:
     """Return (model_template_type, tokenizer_family) for the base model."""
     s = base_model.lower()
     if "llama" in s:
-        return "meta-llama3", "llama"
+        return "llama-3", "llama"
     if "qwen3" in s:
         return "qwen-3", "qwen3"
     raise ValueError(
@@ -217,7 +217,7 @@ def load_task_configs():
 # ---------------------------------------------------------------------------
 def prepare_data(args):
     """Run eval_ruler/data/prepare.py for tasks that don't have data yet."""
-    _, model_family = infer_model_family(args.base_model)
+    model_template_type, model_family = infer_model_family(args.base_model)
     prepare_script = os.path.join(RULER_DIR, "data", "prepare.py")
 
     for seq_len in args.seq_lengths:
@@ -230,8 +230,6 @@ def prepare_data(args):
             data_file.parent.mkdir(parents=True, exist_ok=True)
             save_dir = str(RULER_DATA_DIR / model_family / str(seq_len))
 
-            # NeMo-Skills-style prep: bare task text, no chat tokens baked in.
-            # The chat template is applied at inference time via apply_chat_template.
             cmd = [
                 sys.executable, prepare_script,
                 "--save_dir", save_dir,
@@ -240,8 +238,7 @@ def prepare_data(args):
                 "--tokenizer_path", args.base_model,
                 "--tokenizer_type", "hf",
                 "--max_seq_length", str(seq_len),
-                "--model_template_type", "base",
-                "--prepare_for_ns",
+                "--model_template_type", model_template_type,
                 "--num_samples", str(args.num_samples),
             ]
             print(f"  Preparing {task} @ seq_len={seq_len}...")
@@ -422,67 +419,6 @@ def load_model_and_tokenizer(args):
 # ---------------------------------------------------------------------------
 # Prediction for a single task
 # ---------------------------------------------------------------------------
-# Llama-3.1 canonical chat-template tokens ("\n\n" after each header, each
-# closed turn terminated by <|eot_id|>). We construct the prompt manually
-# (rather than calling apply_chat_template) in order to skip Llama-3.1's
-# auto-injected "Cutting Knowledge Date" system preamble, which hurts cwe.
-_H_USER = "<|start_header_id|>user<|end_header_id|>\n\n"
-_H_ASST = "<|start_header_id|>assistant<|end_header_id|>\n\n"
-_EOT = "<|eot_id|>"
-
-
-def _build_manual_prompt(sample):
-    """Build the prompt string manually (not via apply_chat_template).
-
-    Structural choices:
-      1. No system turn — skips Llama-3.1's auto-injected "Cutting Knowledge
-         Date" preamble that measurably hurts cwe.
-      2. For few-shot tasks (cwe, vt), split the embedded demo into proper
-         alternating user/assistant/user turns; detection is by substring-
-         matching answer_prefix inside `input` (40-char probe fallback for
-         vt's format-arg variation).
-      3. answer_prefix lives at the end of a partial assistant turn with no
-         trailing `<|eot_id|>`, so the model continues its own response.
-      4. Llama-3.1 canonical "\\n\\n" after each header; `<|eot_id|>` closes
-         every completed turn (including the demo-assistant turn).
-
-    BOS is auto-prepended by the tokenizer (add_bos_token=True default).
-    """
-    answer_prefix = sample.get("answer_prefix", "")
-    inp = sample["input"]
-
-    # Detect embedded few-shot (cwe: static prefix; vt: format-arg varies, use 40-char probe)
-    idx = -1
-    if answer_prefix:
-        stripped = answer_prefix.strip()
-        idx = inp.find(stripped)
-        if idx < 0 and len(stripped) > 40:
-            idx = inp.find(stripped[:40])
-
-    if idx < 0:
-        # No few-shot: single user turn + partial assistant
-        if answer_prefix:
-            return f"{_H_USER}{inp}{_EOT}{_H_ASST}{answer_prefix}"
-        return f"{_H_USER}{inp}{_EOT}{_H_ASST}"
-
-    # Few-shot present: split into demo(user)/demo(asst)/real(user) + partial asst
-    end = inp.find("\n", idx)
-    if end < 0:
-        if answer_prefix:
-            return f"{_H_USER}{inp}{_EOT}{_H_ASST}{answer_prefix}"
-        return f"{_H_USER}{inp}{_EOT}{_H_ASST}"
-
-    demo_user = inp[:idx].rstrip()
-    demo_asst = inp[idx:end].strip()
-    real_user = inp[end + 1:].lstrip()
-    return (
-        f"{_H_USER}{demo_user}{_EOT}"
-        f"{_H_ASST}{demo_asst}{_EOT}"
-        f"{_H_USER}{real_user}{_EOT}"
-        f"{_H_ASST}{answer_prefix}"
-    )
-
-
 def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
     """Generate predictions for one RULER task. Returns list of result dicts."""
     data_file = data_dir / task / "validation.jsonl"
@@ -518,19 +454,9 @@ def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
 
     with open(pred_file, "a", encoding="utf-8", buffering=1) as fout:
         for sample in tqdm(remaining, desc=f"  {task}"):
-            # NeMo-Skills prep + manually-built prompt. We bypass
-            # apply_chat_template to drop Llama-3.1's always-injected
-            # "Cutting Knowledge Date" system preamble (which hurts cwe).
-            # For cwe/vt the embedded one-shot is split into user/asst/user
-            # turns; answer_prefix is placed at the end of a partial
-            # assistant turn (no trailing <|eot_id|>) so the model continues
-            # its own response. Tokenizer auto-prepends BOS.
-            prompt_str = _build_manual_prompt(sample)
-            input_ids = tokenizer(
-                prompt_str, return_tensors="pt",
-            ).input_ids.to(model.device)
+            prompt = sample["input"]
+            input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
             input_len = input_ids.shape[1]
-            question = sample["input"] + sample.get("answer_prefix", "")
 
             with torch.no_grad():
                 if args.mode == "seer_attention":
@@ -557,7 +483,7 @@ def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
             result = {
                 "index": sample["index"],
                 "pred": pred_text,
-                "input": question,
+                "input": prompt,
                 "outputs": sample["outputs"],
                 "others": sample.get("others", {}),
                 "truncation": sample.get("truncation", -1),
