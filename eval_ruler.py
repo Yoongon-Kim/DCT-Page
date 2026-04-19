@@ -97,6 +97,7 @@ def parse_args():
     # Mode
     parser.add_argument("--mode", type=str, required=True,
                         choices=["baseline", "page_attention", "seer_attention",
+                                 "seer_prefill",
                                  "multipole_attention", "quest_attention"])
 
     # Model
@@ -165,6 +166,8 @@ def parse_args():
                              f"_ps{args.page_size}_{args.unselected_mode}_{args.comp_kv_quant}")
         elif args.mode == "seer_attention":
             args.run_name = f"{tag}_seer_attention"
+        elif args.mode == "seer_prefill":
+            args.run_name = f"{tag}_seer_prefill"
         elif args.mode == "multipole_attention":
             args.run_name = f"{tag}_multipole_attention"
         elif args.mode == "quest_attention":
@@ -356,6 +359,18 @@ def load_model_and_tokenizer(args):
         model.eval()
         tokenizer = AutoTokenizer.from_pretrained(args.base_model)
         print(f"Model loaded. Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
+    elif args.mode == "seer_prefill":
+        from seer_attn.prefill_config import SEER_PREFILL_CONFIG, load_seer_prefill_model
+
+        seer_model = SEER_PREFILL_CONFIG["seer_model"]
+        print(f"Loading SeerAttention prefill-sparse: {seer_model}")
+        model, hf_config = load_seer_prefill_model(SEER_PREFILL_CONFIG, torch.bfloat16)
+        model = model.cuda()
+        model.eval()
+        # AttnGates repo contains only gate weights; tokenizer lives on base_model.
+        tokenizer = AutoTokenizer.from_pretrained(hf_config.base_model, padding_side="left")
+        print(f"Model loaded (base={hf_config.base_model}). "
+              f"Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
     elif args.mode == "quest_attention":
         from quest_attn.config import QUEST_ATTN_CONFIG
         from quest_attn import LlamaForCausalLM as QuestLlamaForCausalLM
@@ -671,6 +686,9 @@ def main():
         elif args.mode == "seer_attention":
             from seer_attn.config import SEER_ATTN_CONFIG
             summary["seer_attn_config"] = SEER_ATTN_CONFIG
+        elif args.mode == "seer_prefill":
+            from seer_attn.prefill_config import SEER_PREFILL_CONFIG
+            summary["seer_prefill_config"] = SEER_PREFILL_CONFIG
         elif args.mode == "multipole_attention":
             from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
             summary["multipole_attn_config"] = MULTIPOLE_ATTN_CONFIG

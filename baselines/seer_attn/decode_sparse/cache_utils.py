@@ -6,7 +6,6 @@ from transformers.cache_utils import Cache
 class KCompressionCache(Cache):
 
     def __init__(self, num_layers: int, block_size: int) -> None:
-        super().__init__()
         self.num_layers = num_layers
         self.block_size = block_size
         # initialize caches for each layer
