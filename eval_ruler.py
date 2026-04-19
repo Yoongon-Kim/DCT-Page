@@ -363,7 +363,7 @@ def load_model_and_tokenizer(args):
         yarn_kwargs = {}
         if "qwen3" in args.base_model.lower():
             yarn_kwargs = {
-                "rope_parameters": {
+                "rope_scaling": {
                     "rope_type": "yarn",
                     "rope_theta": 1000000.0,
                     "factor": 4.0,
