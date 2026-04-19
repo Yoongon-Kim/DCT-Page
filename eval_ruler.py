@@ -98,7 +98,9 @@ def parse_args():
     parser.add_argument("--mode", type=str, required=True,
                         choices=["baseline", "page_attention", "seer_attention",
                                  "seer_prefill",
-                                 "multipole_attention", "quest_attention"])
+                                 "multipole_attention", "quest_attention",
+                                 "duo_attention",
+                                 "shadowkv"])
 
     # Model
     parser.add_argument("--base_model", type=str,
@@ -152,6 +154,19 @@ def parse_args():
     parser.add_argument("--comp_kv_quant_granularity", type=str, default="per_page",
                         choices=["per_page", "per_comp_token"],
                         help="Scale granularity for comp_kv_quant")
+
+    # ShadowKV baseline params (only used when --mode shadowkv)
+    parser.add_argument("--shadowkv_cache_mode", type=str, default="shadowkv_cpu",
+                        choices=["shadowkv", "shadowkv_cpu"],
+                        help="ShadowKVCache_CPU offloads V to CPU (production); "
+                             "ShadowKVCache is GPU-only and batch=1 (sanity).")
+    parser.add_argument("--sparse_budget", type=int, default=2192,
+                        help="ShadowKV: tokens attended to per decode step.")
+    parser.add_argument("--rank", type=int, default=160,
+                        help="ShadowKV: SVD rank for compressed key cache.")
+    parser.add_argument("--chunk_size", type=int, default=8,
+                        help="ShadowKV: tokens per landmark chunk.")
+
     parser.add_argument("--skip_existing", action="store_true",
                         help="Skip run if summary.json already exists in output dir")
 
@@ -172,6 +187,12 @@ def parse_args():
             args.run_name = f"{tag}_multipole_attention"
         elif args.mode == "quest_attention":
             args.run_name = f"{tag}_quest_attention"
+        elif args.mode == "duo_attention":
+            args.run_name = f"{tag}_duo_attention"
+        elif args.mode == "shadowkv":
+            args.run_name = (f"{tag}_shadowkv_{args.shadowkv_cache_mode}"
+                             f"_sb{args.sparse_budget}_r{args.rank}"
+                             f"_cs{args.chunk_size}")
 
     if args.skip_existing:
         summary_path = Path(args.output_dir) / args.run_name / "summary.json"
@@ -325,6 +346,10 @@ def apply_monkey_patch(args):
         replace_attn_multipole(MULTIPOLE_ATTN_CONFIG)
     elif args.mode == "quest_attention":
         pass  # Quest uses custom model class, no monkey-patch needed
+    elif args.mode == "duo_attention":
+        pass  # DuoAttention patches per-instance forwards post-load (see load_model_and_tokenizer)
+    elif args.mode == "shadowkv":
+        pass  # ShadowKV uses a custom LLM class; no monkey-patch needed.
     elif args.mode == "baseline":
         print("Baseline mode: full attention (no monkey-patch)")
 
@@ -398,8 +423,24 @@ def load_model_and_tokenizer(args):
         model.eval()
         tokenizer = AutoTokenizer.from_pretrained(base_model)
         print(f"Model loaded. Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
+    elif args.mode == "shadowkv":
+        from shadow_kv import SHADOWKV_CONFIG, build_shadowkv_llm
+
+        SHADOWKV_CONFIG["base_model"] = args.base_model
+        SHADOWKV_CONFIG["cache_mode"] = args.shadowkv_cache_mode
+        SHADOWKV_CONFIG["sparse_budget"] = args.sparse_budget
+        SHADOWKV_CONFIG["rank"] = args.rank
+        SHADOWKV_CONFIG["chunk_size"] = args.chunk_size
+        SHADOWKV_CONFIG["max_length"] = max(args.seq_lengths) + 4096
+        print(f"Loading ShadowKV model: {args.base_model} "
+              f"(cache={args.shadowkv_cache_mode}, sparse_budget={args.sparse_budget}, "
+              f"rank={args.rank}, chunk_size={args.chunk_size})")
+        model = build_shadowkv_llm(SHADOWKV_CONFIG)
+        tokenizer = model.tokenizer
+        print("ShadowKV LLM ready.")
     else:
-        attn_impl = "sdpa"
+        # DuoAttention's replacement forward assumes eager-style Q/K/V signatures.
+        attn_impl = "eager" if args.mode == "duo_attention" else "sdpa"
         print(f"Loading model: {args.base_model} (attn: {attn_impl})")
         tokenizer = AutoTokenizer.from_pretrained(args.base_model)
         yarn_kwargs = {}
@@ -413,9 +454,12 @@ def load_model_and_tokenizer(args):
                 },
                 "max_position_embeddings": 131072,
             }
+        # transformers 4.45 (duo_attention env) only accepts torch_dtype=;
+        # transformers 5.x (main DCT-Page env) only accepts dtype=.
+        dtype_kwarg = {"torch_dtype": torch.bfloat16} if args.mode == "duo_attention" else {"dtype": torch.bfloat16}
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
-            dtype=torch.bfloat16,
+            **dtype_kwarg,
             device_map="auto",
             attn_implementation=attn_impl,
             **yarn_kwargs,
@@ -427,6 +471,13 @@ def load_model_and_tokenizer(args):
             from multipole_attn import init_multipole_layers
             init_multipole_layers(model)
             print("Multipole attention layers initialized.")
+
+        if args.mode == "duo_attention":
+            from duo_attn_baseline import init_duo_attention, assert_llama
+            from duo_attn_baseline.config import DUO_ATTN_CONFIG
+            assert_llama(args.base_model)
+            DUO_ATTN_CONFIG["base_model"] = args.base_model
+            init_duo_attention(model, DUO_ATTN_CONFIG)
 
     return model, tokenizer
 
@@ -481,6 +532,18 @@ def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
                         max_length=input_len + tokens_to_generate,
                         do_sample=False,
                     )
+                elif args.mode == "duo_attention":
+                    # DuoAttention's v4.34 tuple-cache forward is incompatible
+                    # with transformers>=4.37 generate()'s DynamicCache. Use a
+                    # manual greedy loop matching duo-attention/eval/LongBench/pred.py.
+                    from duo_attn_baseline import duo_generate_greedy
+                    _eos = model.generation_config.eos_token_id
+                    eos_ids = _eos if isinstance(_eos, (list, tuple)) else [_eos]
+                    output_ids = duo_generate_greedy(
+                        model, input_ids,
+                        max_new_tokens=tokens_to_generate,
+                        eos_token_ids=eos_ids,
+                    )
                 else:
                     output_ids = model.generate(
                         input_ids,
@@ -494,6 +557,8 @@ def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
 
             if args.mode == "quest_attention":
                 model.quest_clear()
+            elif args.mode == "shadowkv":
+                model.shadowkv_clear()
 
             result = {
                 "index": sample["index"],
@@ -695,6 +760,12 @@ def main():
         elif args.mode == "quest_attention":
             from quest_attn.config import QUEST_ATTN_CONFIG
             summary["quest_attn_config"] = QUEST_ATTN_CONFIG
+        elif args.mode == "duo_attention":
+            from duo_attn_baseline.config import DUO_ATTN_CONFIG
+            summary["duo_attn_config"] = DUO_ATTN_CONFIG
+        elif args.mode == "shadowkv":
+            from shadow_kv.config import SHADOWKV_CONFIG
+            summary["shadowkv_config"] = SHADOWKV_CONFIG
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
         print(f"\nSummary saved to: {summary_path}")

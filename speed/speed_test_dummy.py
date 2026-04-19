@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import json
+import sys
 import time
 import types
 from pathlib import Path
@@ -37,17 +38,17 @@ def model_family(model_name):
     return model_name.split("/")[-1].lower()
 
 
-def load_model_and_tokenizer(model_name):
+def load_model_and_tokenizer(model_name, attn_implementation="sdpa"):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        attn_implementation="sdpa",
+        attn_implementation=attn_implementation,
     )
     model.eval()
     n_params = sum(p.numel() for p in model.parameters()) / 1e9
-    print(f"Loaded: {model_name} ({n_params:.2f}B params)")
+    print(f"Loaded: {model_name} ({n_params:.2f}B params, attn={attn_implementation})")
     return model, tokenizer
 
 
@@ -300,7 +301,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Dummy-input decode speed benchmark")
 
     p.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
-    p.add_argument("--mode", choices=["baseline", "dct", "both"], default="both")
+    p.add_argument("--mode", choices=["baseline", "dct", "both", "duo_attention"], default="both")
     p.add_argument("--context_lengths", type=str, default="4096,8192,16384,32768",
                    help="Comma-separated context lengths to benchmark")
     p.add_argument("--num_repeats", type=int, default=3,
@@ -345,6 +346,8 @@ def make_run_name(label, args):
     family = model_family(args.model)
     if label == "baseline":
         return f"{family}_baseline_dummy"
+    if label == "duo_attention":
+        return f"{family}_duo_attn_dummy"
     rope_tag = "crope" if args.continuous_rope else "nocrope"
     triton_tag = "notriton" if getattr(args, 'no_triton', False) else "triton"
     parts = [
@@ -587,6 +590,45 @@ def main():
     context_lengths = [int(x.strip()) for x in args.context_lengths.split(",")]
     print(f"Context lengths: {context_lengths}")
     print(f"Repeats per length: {args.num_repeats}")
+
+    # DuoAttention's replacement forward assumes eager-style Q/K/V signatures,
+    # and patches per-instance (no clean restore). Give it a dedicated flow.
+    if args.mode == "duo_attention":
+        if "llama" not in args.model.lower():
+            raise ValueError(
+                f"DuoAttention only supports Llama models, got: {args.model}"
+            )
+        model, tokenizer = load_model_and_tokenizer(args.model, attn_implementation="eager")
+
+        # baselines/ is added to sys.path by the eval scripts; do the same here.
+        repo_root = Path(__file__).resolve().parent.parent
+        sys.path.insert(0, str(repo_root / "baselines"))
+        from duo_attn_baseline import init_duo_attention, assert_llama
+        from duo_attn_baseline.config import DUO_ATTN_CONFIG
+        assert_llama(args.model)
+        DUO_ATTN_CONFIG["base_model"] = args.model
+        init_duo_attention(model, DUO_ATTN_CONFIG)
+
+        results = {}
+
+        def run_duo():
+            run_name = args.run_name or make_run_name("duo_attention", args)
+            run_dir = Path(args.output_dir) / run_name
+            run_dir.mkdir(parents=True, exist_ok=True)
+            stats, records = benchmark_dummy(
+                model, tokenizer, args, "duo_attention", context_lengths
+            )
+            save_results(records, run_dir)
+            save_summary(stats, run_dir, args, "duo_attention")
+            results["duo_attention"] = stats
+            print(f"\nResults written to: {run_dir}/")
+
+        print("\n" + "=" * 65)
+        print("DUO ATTENTION")
+        print("=" * 65)
+        run_duo()
+        print_summary(results, context_lengths)
+        return
 
     original_forward = get_original_forward(args.model)
     model, tokenizer = load_model_and_tokenizer(args.model)

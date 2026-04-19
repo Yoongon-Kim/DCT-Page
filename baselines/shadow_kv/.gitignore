@@ -1,0 +1,4 @@
+3rdparty/
+build/
+*.so
+__pycache__/

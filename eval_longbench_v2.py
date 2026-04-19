@@ -56,7 +56,7 @@ def parse_args():
 
     # Mode
     parser.add_argument("--mode", type=str, required=True,
-                        choices=["baseline", "page_attention", "rope_gap", "seer_attention", "multipole_attention", "quest_attention"])
+                        choices=["baseline", "page_attention", "rope_gap", "seer_attention", "multipole_attention", "quest_attention", "duo_attention"])
 
     # Model
     parser.add_argument("--base_model", type=str,
@@ -133,6 +133,8 @@ def parse_args():
             args.run_name = f"{tag}_multipole_attention"
         elif args.mode == "quest_attention":
             args.run_name = f"{tag}_quest_attention"
+        elif args.mode == "duo_attention":
+            args.run_name = f"{tag}_duo_attention"
         else:
             args.run_name = f"{tag}_page_attn_topk{args.top_k}"
 
@@ -418,6 +420,9 @@ def build_summary(results, args):
     elif args.mode == "quest_attention":
         from quest_attn.config import QUEST_ATTN_CONFIG
         summary["quest_attn_config"] = QUEST_ATTN_CONFIG
+    elif args.mode == "duo_attention":
+        from duo_attn_baseline.config import DUO_ATTN_CONFIG
+        summary["duo_attn_config"] = DUO_ATTN_CONFIG
 
     return summary
 
@@ -543,6 +548,8 @@ def main():
         from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
         MULTIPOLE_ATTN_CONFIG["base_model"] = args.base_model
         replace_attn_multipole(MULTIPOLE_ATTN_CONFIG)
+    elif args.mode == "duo_attention":
+        pass  # DuoAttention patches per-instance forwards post-load
     elif args.mode not in ("seer_attention", "quest_attention"):
         print("Baseline mode: full attention (no monkey-patch)")
 
@@ -598,7 +605,8 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(base_model)
         print(f"Model loaded. Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
     else:
-        attn_impl = "sdpa"
+        # DuoAttention's replacement forward assumes eager-style Q/K/V signatures.
+        attn_impl = "eager" if args.mode == "duo_attention" else "sdpa"
         print(f"Loading model: {args.base_model} (attn: {attn_impl})")
         tokenizer = AutoTokenizer.from_pretrained(args.base_model)
         # Multipole attention requires all layers on a single GPU (the original
@@ -630,6 +638,13 @@ def main():
             from multipole_attn import init_multipole_layers
             init_multipole_layers(model)
             print("Multipole attention layers initialized.")
+
+        if args.mode == "duo_attention":
+            from duo_attn_baseline import init_duo_attention, assert_llama
+            from duo_attn_baseline.config import DUO_ATTN_CONFIG
+            assert_llama(args.base_model)
+            DUO_ATTN_CONFIG["base_model"] = args.base_model
+            init_duo_attention(model, DUO_ATTN_CONFIG)
 
     # Evaluate
     results = evaluate(model, tokenizer, dataset, args)
