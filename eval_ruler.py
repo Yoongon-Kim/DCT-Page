@@ -134,7 +134,7 @@ def parse_args():
         elif args.mode == "multipole_attention":
             args.run_name = "multipole_attention"
         elif args.mode == "quest_attention":
-            args.run_name = "quest_attention"
+            args.run_name = f"quest_ps{args.page_size}_pb{args.top_k}"
 
     if args.skip_existing:
         summary_path = Path(args.output_dir) / args.run_name / "summary.json"
@@ -325,7 +325,11 @@ def load_model_and_tokenizer(args):
     elif args.mode == "quest_attention":
         from quest_attn.config import QUEST_ATTN_CONFIG
 
-        base_model = QUEST_ATTN_CONFIG["base_model"]
+        base_model = args.base_model
+        page_size = args.page_size
+        token_budget = args.page_size * args.top_k  # top_k used as page_budget
+        max_seq_len = QUEST_ATTN_CONFIG["max_seq_len"]
+
         model_name_lower = base_model.lower()
         if "qwen3" in model_name_lower:
             from quest_attn import Qwen3ForCausalLM as QuestModel
@@ -336,16 +340,16 @@ def load_model_and_tokenizer(args):
                 f"Quest supports LLaMA-family (Llama-2, Llama-3.x, Mistral) and Qwen3 models, "
                 f"got: {base_model}"
             )
-        print(f"Loading Quest model: {base_model}")
+        print(f"Loading Quest model: {base_model} (page_size={page_size}, page_budget={args.top_k}, token_budget={token_budget})")
         model = QuestModel.from_pretrained(
             base_model,
             device_map="cuda:0",
             torch_dtype=torch.float16,
         )
         model.quest_init(
-            page_size=QUEST_ATTN_CONFIG["page_size"],
-            max_seq_len=QUEST_ATTN_CONFIG["max_seq_len"],
-            token_budget=QUEST_ATTN_CONFIG["token_budget"],
+            page_size=page_size,
+            max_seq_len=max_seq_len,
+            token_budget=token_budget,
             dtype=torch.float16,
             device=torch.device("cuda:0"),
         )
@@ -570,8 +574,12 @@ def _save_summary(args, all_seq_results):
         from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
         summary["multipole_attn_config"] = MULTIPOLE_ATTN_CONFIG
     elif args.mode == "quest_attention":
-        from quest_attn.config import QUEST_ATTN_CONFIG
-        summary["quest_attn_config"] = QUEST_ATTN_CONFIG
+        summary["quest_attn_config"] = {
+            "base_model": args.base_model,
+            "page_size": args.page_size,
+            "page_budget": args.top_k,
+            "token_budget": args.page_size * args.top_k,
+        }
 
     summary_path = Path(args.output_dir) / args.run_name / "summary.json"
     with open(summary_path, "w") as f:
