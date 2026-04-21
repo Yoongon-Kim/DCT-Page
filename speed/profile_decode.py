@@ -629,9 +629,9 @@ def parse_args():
     p.add_argument("--top_k", type=int, default=64)
     p.add_argument("--sink_size", type=int, default=4)
     p.add_argument("--recent_size", type=int, default=128)
-    p.add_argument("--compress_ratio", type=float, default=0.03125)
+    p.add_argument("--compress_ratio", type=float, default=0.125)
     p.add_argument("--scoring_method", default="max", choices=["mean", "max"])
-    p.add_argument("--group_agg_method", default="mean", choices=["mean", "max"])
+    p.add_argument("--group_agg_method", default="max", choices=["mean", "max"])
     p.add_argument("--unselected_mode", default="drop",
                    choices=["drop", "compressed"])
     p.add_argument("--compressed_token_rope", default="mixed", choices=["mixed", "block_center"])
