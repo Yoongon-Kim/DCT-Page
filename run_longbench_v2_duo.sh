@@ -1,6 +1,6 @@
 #!/bin/bash
 # LongBench v2 Evaluation — DuoAttention
-# Sweeps sparsity values by rewriting baselines/duo_attn_baseline/config.py.
+# Sweeps sparsity values by rewriting baselines/duo_attn/config.py.
 set -e
 
 # ---- Conda activation ----
@@ -36,7 +36,7 @@ PATTERN_SUBDIR="${PATTERN_SUBDIR:-Meta-Llama-3.1-8B-Instruct/lr=0.02-reg=0.05-ct
 SINK_SIZE=64
 RECENT_SIZE=256
 
-CONFIG_FILE="baselines/duo_attn_baseline/config.py"
+CONFIG_FILE="baselines/duo_attn/config.py"
 
 write_config() {
     local sparsity="$1"

@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--context_len", type=int, default=32768)
     p.add_argument("--data_root", type=Path, default=Path("benchmark/data/ruler_data"),
                    help="Root dir containing <model_family>/<context_len>/<task>/validation.jsonl. "
-                        "Forwarded to run_ruler_eval.py as --data_root.")
+                        "Forwarded to oracle_ruler.py as --data_root.")
     p.add_argument("--output_root", type=Path, default=Path("results/results_ruler/oracle_hybrid"))
     p.add_argument("--tag", default="oracle_hybrid")
     p.add_argument("--combos", nargs="+", default=["16,8", "32,4", "64,2"],
@@ -54,8 +54,6 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated 0/1 values to sweep --dct_weight_compressed_by_population. "
              "E.g. '0', '1', or '0,1' to run both.",
     )
-    p.add_argument("--compression_method", type=str, default="dct", choices=["haar", "dct"],
-                   help="Compression method for unselected pages: 'haar' (default) or 'dct'.")
     p.add_argument(
         "--comp_kv_quant",
         default="none",
@@ -71,7 +69,7 @@ def parse_args() -> argparse.Namespace:
              "ignored when the mode is 'none').",
     )
     p.add_argument("--scoring_method", type=str, default="max",
-                   help="'mean'|'max'|'sum'|'proxy_dc_ac_{lam}'|'spread_dc_ac_{lam}'")
+                   help="'mean'|'max'|'sum'")
     p.add_argument("--group_agg_method", type=str, default="max", choices=["mean", "max", "topp"],
                    help="Cross-GQA-head aggregation: 'mean' (default), 'max', or 'topp'.")
     p.add_argument("--num_samples", type=int, default=25)
@@ -145,14 +143,13 @@ def make_run_root(
     page_size: int,
     top_k: int,
     compress_ratio: float,
-    compression_method: str,
     weight_pop: bool,
     comp_kv_quant: str,
 ) -> Path:
     pop_tag = "popw" if weight_pop else "nopopw"
     quant_tag = "noquant" if comp_kv_quant == "none" else comp_kv_quant
     run_root = output_root / (
-        f"ps{page_size}_topk{top_k}_cr{compress_ratio}_{compression_method}"
+        f"ps{page_size}_topk{top_k}_cr{compress_ratio}"
         f"_{pop_tag}_{quant_tag}"
     )
     run_root.mkdir(parents=True, exist_ok=True)
@@ -168,7 +165,6 @@ def build_run_cmd(
     page_size: int,
     top_k: int,
     compress_ratio: float,
-    compression_method: str,
     scoring_method: str,
     group_agg_method: str,
     weight_pop: bool,
@@ -217,9 +213,6 @@ def build_run_cmd(
         group_agg_method,
         "--dct_unselected_mode",
         "compressed",
-        "--dct_compression_method",
-        compression_method,
-        *(["--dct_score_use_low_proxy"] if compression_method == "dct" else []),
         "--dct_select_with_oracle_page_scores",
         "--dct_comp_kv_quant",
         comp_kv_quant,
@@ -302,10 +295,10 @@ def write_summary_files(run_root: Path, rows: list[dict]) -> None:
 
 def main() -> None:
     args = parse_args()
-    # Sibling script lives next to us in oracle/, but the child run_ruler_eval.py
+    # Sibling script lives next to us in oracle/, but the child oracle_ruler.py
     # expects to be invoked with cwd at the project root so its relative data
     # paths resolve correctly.
-    script_path = Path(__file__).resolve().parent / "run_ruler_eval.py"
+    script_path = Path(__file__).resolve().parent / "oracle_ruler.py"
     repo_root = Path(__file__).resolve().parent.parent
     combos = parse_combos(args.combos)
     weight_pops = parse_weight_pop(args.weight_pop)
@@ -320,7 +313,6 @@ def main() -> None:
                     page_size,
                     top_k,
                     args.compress_ratio,
-                    args.compression_method,
                     weight_pop,
                     comp_kv_quant,
                 )
@@ -343,7 +335,6 @@ def main() -> None:
                     "top_k": top_k,
                     "compress_ratio": args.compress_ratio,
                     "weight_compressed_by_population": weight_pop,
-                    "compression_method": args.compression_method,
                     "scoring_method": args.scoring_method,
                     "group_agg_method": args.group_agg_method,
                     "unselected_mode": "compressed",
@@ -355,7 +346,7 @@ def main() -> None:
                     "cuda_device": args.cuda_device,
                     "tasks": tasks,
                     "assumption": "Oracle page selection + hybrid mode: selected pages use full tokens, "
-                    f"unselected pages use {args.compression_method} compressed proxy KV cache "
+                    f"unselected pages use DCT-lowpass-IDCT compressed proxy KV cache "
                     f"(comp_kv_quant={comp_kv_quant}, granularity={args.comp_kv_quant_granularity}).",
                 }
                 (run_root / "manifest.json").write_text(
@@ -372,7 +363,6 @@ def main() -> None:
                     page_size=page_size,
                     top_k=top_k,
                     compress_ratio=args.compress_ratio,
-                    compression_method=args.compression_method,
                     scoring_method=args.scoring_method,
                     group_agg_method=args.group_agg_method,
                     weight_pop=weight_pop,

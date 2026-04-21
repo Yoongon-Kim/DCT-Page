@@ -27,11 +27,10 @@ from transformers.cache_utils import Cache, DynamicLayer
 
 from config import DCTPageConfig
 from triton_kernels import (
-    assemble_kv_split_triton, 
-    build_assemble_stride_cache, 
-    build_assemble_drop_stride_cache,
-    topk_sort_triton, 
-    assemble_kv_drop_triton, 
+    assemble_kv_split_triton,
+    build_assemble_stride_cache,
+    topk_sort_triton,
+    assemble_kv_drop_triton,
     score_pages_triton,
     apply_rope_q_direct,
 )
@@ -237,323 +236,32 @@ def dct_compress_page(x, compressed_len):
     return compressed.reshape(bsz, compressed_len, num_heads, head_dim).transpose(1, 2)
 
 
-def dct_project_page(x, compressed_len):
-    """
-    Project a KV tensor to leading DCT coefficients along the sequence dimension.
-
-    Args:
-        x: [bsz, num_heads, seq_len, head_dim], seq_len: sequence length per page
-        compressed_len: number of low-frequency coefficients to keep
-
-    Returns:
-        [bsz, num_heads, min(compressed_len, seq_len), head_dim]
-    """
-    bsz, num_heads, seq_len, head_dim = x.shape
-    keep_len = min(compressed_len, seq_len)
-
-    x_merged = x.transpose(1, 2).reshape(bsz, seq_len, num_heads * head_dim)
-    x_dct = dct(x_merged.transpose(1, 2), norm='ortho')
-    x_dct = x_dct[:, :, :keep_len].transpose(1, 2)
-    spectral = x_dct.to(x.dtype)
-    return spectral.reshape(bsz, keep_len, num_heads, head_dim).transpose(1, 2)
-
-
-def _normalize_frequency_indices(indices, seq_len, comp_size):
-    """Deduplicate/clamp indices while preserving order and filling missing slots."""
-    seen = set()
-    normalized = []
-    for idx in indices:
-        idx = max(0, min(int(idx), seq_len - 1))
-        if idx in seen:
-            continue
-        normalized.append(idx)
-        seen.add(idx)
-        if len(normalized) == comp_size:
-            return normalized
-
-    for idx in range(seq_len):
-        if idx in seen:
-            continue
-        normalized.append(idx)
-        if len(normalized) == comp_size:
-            break
-    return normalized
-
-
-def _resolve_frequency_keep_indices(seq_len, comp_size, layout):
-    """Choose which DCT frequencies to retain for proxy construction."""
-    if comp_size >= seq_len or layout == "low":
-        return list(range(min(comp_size, seq_len)))
-
-    if layout == "low_high":
-        low_count = (comp_size + 1) // 2
-        high_count = comp_size - low_count
-        indices = list(range(low_count)) + list(range(seq_len - high_count, seq_len))
-        return _normalize_frequency_indices(indices, seq_len, comp_size)
-
-    if layout == "low_mid_high":
-        low_count = min(2, comp_size)
-        remaining = comp_size - low_count
-        indices = list(range(low_count))
-        if remaining > 0:
-            tail = np.linspace(seq_len // 2, seq_len - 1, num=remaining, dtype=int).tolist()
-            indices.extend(tail)
-        return _normalize_frequency_indices(indices, seq_len, comp_size)
-
-    if layout == "spread":
-        indices = np.linspace(0, seq_len - 1, num=comp_size, dtype=int).tolist()
-        return _normalize_frequency_indices(indices, seq_len, comp_size)
-
-    raise ValueError(f"Unsupported proxy_frequency_layout: {layout}")
-
-
-def _parse_dc_ac_scoring_method(scoring_method: str):
-    """Parse DC+AC scoring method string.
-
-    Returns (layout, lambda_val, full_spectrum) or None if not a DC+AC method.
-      "proxy_dc_ac_0.5"   -> ("low", 0.5, False)
-      "spread_dc_ac_1.0"  -> ("spread", 1.0, False)
-      "dc_ac_1.0"         -> ("low", 1.0, True)   # full page_size DCT coefficients
-    """
-    for prefix, layout, full in (
-        ("proxy_dc_ac_", "low", False),
-        ("spread_dc_ac_", "spread", False),
-        ("dc_ac_", "low", True),
-    ):
-        if scoring_method.startswith(prefix):
-            return layout, float(scoring_method[len(prefix):]), full
-    return None
-
-
-def _parse_hybrid_multi_scoring_method(scoring_method: str):
-    """Parse hybrid_multi scoring method string.
-
-    Returns (M, alpha) or None if not a hybrid_multi method.
-      "hybrid_multi2_ac_max_a0.5" -> (2, 0.5)
-      "hybrid_multi4_ac_max_a1.0" -> (4, 1.0)
-    """
-    import re
-    m = re.match(r'^hybrid_multi(\d+)_ac_max_a([\d.]+)$', scoring_method)
-    if m:
-        return int(m.group(1)), float(m.group(2))
-    return None
-
-
-def dct_compress_page_with_indices(x, freq_indices):
-    """Compress a page by selecting specific DCT frequencies before IDCT."""
-    comp_size = len(freq_indices)
-    if comp_size >= x.shape[2] and list(freq_indices) == list(range(x.shape[2])):
-        return x
-
-    bsz, num_heads, seq_len, head_dim = x.shape
-    x_merged = x.transpose(1, 2).reshape(bsz, seq_len, num_heads * head_dim)
-    x_dct = dct(x_merged.transpose(1, 2), norm='ortho')
-    index_tensor = torch.tensor(freq_indices, device=x.device, dtype=torch.long)
-    x_dct = x_dct.index_select(2, index_tensor)
-    x_idct = idct(x_dct, norm='ortho').transpose(1, 2) * math.sqrt(comp_size / seq_len)
-    compressed = x_idct.to(x.dtype)
-    return compressed.reshape(bsz, comp_size, num_heads, head_dim).transpose(1, 2)
-
-
 # ---------------------------------------------------------------------------
 # DCT Projection Matrix (replaces FFT with a single matmul)
 # ---------------------------------------------------------------------------
-def _build_dct_projection_matrix(page_size, comp_size, device, dtype, layout):
-    """Precompute the [comp_size, page_size] projection matrix.
+def _build_dct_projection_matrix(page_size, comp_size, device, dtype):
+    """Precompute the [comp_size, page_size] DCT-lowpass-IDCT projection matrix.
 
-    The full DCT compression pipeline (DCT → truncate → IDCT → energy
-    correction) is a linear transform.  We compute it by running the
-    existing dct_compress_page on an identity matrix.
+    The full DCT compression pipeline (DCT → keep leading comp_size
+    coefficients → IDCT → energy correction) is a linear transform. We compute
+    it by running dct_compress_page on an identity matrix.
     """
     I = torch.eye(page_size, device=device, dtype=torch.float32)
     I = I.unsqueeze(0).unsqueeze(0)  # [1, 1, page_size, page_size]
-    freq_indices = _resolve_frequency_keep_indices(page_size, comp_size, layout)
-    M = dct_compress_page_with_indices(I, freq_indices)  # [1, 1, comp_size, page_size]
+    M = dct_compress_page(I, comp_size)  # [1, 1, comp_size, page_size]
     return M.squeeze(0).squeeze(0).to(dtype)  # [comp_size, page_size]
-
-
-def _build_dct_spectral_projection_matrix(page_size, comp_size, device, dtype, layout):
-    """Precompute the [comp_size, page_size] DCT basis for direct spectral proxies."""
-    I = torch.eye(page_size, device=device, dtype=torch.float32)
-    I = I.unsqueeze(0).unsqueeze(0)  # [1, 1, page_size, page_size]
-    freq_indices = _resolve_frequency_keep_indices(page_size, comp_size, layout)
-    M = dct_project_page(I, page_size)
-    index_tensor = torch.tensor(freq_indices, device=device, dtype=torch.long)
-    M = M.index_select(2, index_tensor)  # [1, 1, comp_size, page_size]
-    return M.squeeze(0).squeeze(0).to(dtype)  # [comp_size, page_size]
-
-
-def _build_haar_lowpass_projection_matrix(page_size, comp_size, device, dtype):
-    """Precompute a coarse Haar-style lowpass projection matrix.
-
-    Each proxy is the mean over an evenly partitioned contiguous block. For
-    `page_size=128, comp_size=4`, this yields four 32-token lowpass proxies.
-    """
-    M = torch.zeros(comp_size, page_size, device=device, dtype=torch.float32)
-    for idx in range(comp_size):
-        start = (idx * page_size) // comp_size
-        end = ((idx + 1) * page_size) // comp_size
-        if end <= start:
-            end = min(page_size, start + 1)
-        M[idx, start:end] = 1.0 / float(end - start)
-    return M.to(dtype)
-
-
-def _build_haar_mixed_supports(page_size, comp_size):
-    """Return support intervals for global-plus-detail Haar proxies."""
-    supports = [(0, page_size)]
-    if comp_size <= 1:
-        return supports
-
-    intervals = [(0, page_size)]
-    queue_idx = 0
-    while len(supports) < comp_size and queue_idx < len(intervals):
-        start, end = intervals[queue_idx]
-        queue_idx += 1
-        if end - start < 2:
-            continue
-
-        mid = (start + end) // 2
-        if mid <= start or mid >= end:
-            continue
-
-        supports.append((start, end))
-        intervals.append((start, mid))
-        intervals.append((mid, end))
-
-    fill_idx = 0
-    while len(supports) < comp_size:
-        start = (fill_idx * page_size) // comp_size
-        end = max(((fill_idx + 1) * page_size) // comp_size, start + 1)
-        supports.append((start, min(page_size, end)))
-        fill_idx += 1
-
-    return supports
-
-
-def _build_haar_mixed_projection_matrix(page_size, comp_size, device, dtype):
-    """Precompute global-mean plus coarse-detail Haar proxies.
-
-    Row 0 is a full-page mean. Remaining rows follow a breadth-first Haar
-    detail decomposition, using half-differences over each interval.
-    """
-    supports = _build_haar_mixed_supports(page_size, comp_size)
-    M = torch.zeros(comp_size, page_size, device=device, dtype=torch.float32)
-
-    for idx, (start, end) in enumerate(supports):
-        if idx == 0:
-            M[idx, start:end] = 1.0 / float(max(end - start, 1))
-            continue
-
-        mid = (start + end) // 2
-        if mid <= start or mid >= end:
-            M[idx, start:end] = 1.0 / float(max(end - start, 1))
-            continue
-
-        left_len = mid - start
-        right_len = end - mid
-        # Keep the proxy scale comparable to block means.
-        M[idx, start:mid] = 0.5 / float(left_len)
-        M[idx, mid:end] = -0.5 / float(right_len)
-
-    return M.to(dtype)
-
-
-def _is_power_of_two(value):
-    return value > 0 and (value & (value - 1)) == 0
-
-
-def _build_walsh_hadamard_matrix(size, device, dtype):
-    """Build an orthonormal Walsh-Hadamard matrix in sequency order."""
-    if not _is_power_of_two(size):
-        raise ValueError(f"Hadamard proxy requires power-of-two size, got {size}")
-
-    H = torch.tensor([[1.0]], device=device, dtype=torch.float32)
-    while H.shape[0] < size:
-        H = torch.cat(
-            [
-                torch.cat([H, H], dim=1),
-                torch.cat([H, -H], dim=1),
-            ],
-            dim=0,
-        )
-    H = H / math.sqrt(size)
-    sign_changes = (H[:, 1:] * H[:, :-1] < 0).sum(dim=1)
-    perm = torch.argsort(sign_changes, stable=True)
-    return H.index_select(0, perm).to(dtype)
-
-
-def _build_hadamard_projection_matrix(page_size, comp_size, device, dtype):
-    """Precompute the [comp_size, page_size] Walsh-Hadamard projection matrix."""
-    if not _is_power_of_two(page_size) or not _is_power_of_two(comp_size):
-        raise ValueError(
-            f"Hadamard proxy requires power-of-two page_size/comp_size, got "
-            f"{page_size}/{comp_size}"
-        )
-    H_page = _build_walsh_hadamard_matrix(page_size, device, torch.float32)
-    H_comp = _build_walsh_hadamard_matrix(comp_size, device, torch.float32)
-    M = math.sqrt(comp_size / page_size) * torch.matmul(H_comp.transpose(0, 1), H_page[:comp_size, :])
-    return M.to(dtype)
 
 
 def _get_or_build_projection_matrix(attn_module, page_size, comp_size, device, dtype):
     """Return cached projection matrix, building it on first call."""
     M = getattr(attn_module, '_dct_proj_matrix', None)
-    layout = _dct_page_cfg.proxy_frequency_layout
-    cached_layout = getattr(attn_module, '_dct_proj_matrix_layout', None)
     if (
         M is None
         or M.shape != (comp_size, page_size)
         or M.device != device
-        or cached_layout != layout
     ):
-        M = _build_dct_projection_matrix(page_size, comp_size, device, dtype, layout)
+        M = _build_dct_projection_matrix(page_size, comp_size, device, dtype)
         attn_module._dct_proj_matrix = M
-        attn_module._dct_proj_matrix_layout = layout
-    return M
-
-
-def _get_or_build_spectral_projection_matrix(attn_module, page_size, comp_size, device, dtype):
-    """Return cached DCT basis matrix for direct spectral score proxies."""
-    M = getattr(attn_module, '_dct_spectral_proj_matrix', None)
-    layout = _dct_page_cfg.proxy_frequency_layout
-    cached_layout = getattr(attn_module, '_dct_spectral_proj_matrix_layout', None)
-    if (
-        M is None
-        or M.shape != (comp_size, page_size)
-        or M.device != device
-        or cached_layout != layout
-    ):
-        M = _build_dct_spectral_projection_matrix(page_size, comp_size, device, dtype, layout)
-        attn_module._dct_spectral_proj_matrix = M
-        attn_module._dct_spectral_proj_matrix_layout = layout
-    return M
-
-
-def _get_or_build_haar_projection_matrix(attn_module, page_size, comp_size, device, dtype):
-    """Return cached Haar lowpass projection matrix."""
-    M = getattr(attn_module, '_dct_haar_proj_matrix', None)
-    if M is None or M.shape != (comp_size, page_size) or M.device != device:
-        M = _build_haar_lowpass_projection_matrix(page_size, comp_size, device, dtype)
-        attn_module._dct_haar_proj_matrix = M
-    return M
-
-
-def _get_or_build_haar_mixed_projection_matrix(attn_module, page_size, comp_size, device, dtype):
-    """Return cached mixed Haar projection matrix."""
-    M = getattr(attn_module, '_dct_haar_mixed_proj_matrix', None)
-    if M is None or M.shape != (comp_size, page_size) or M.device != device:
-        M = _build_haar_mixed_projection_matrix(page_size, comp_size, device, dtype)
-        attn_module._dct_haar_mixed_proj_matrix = M
-    return M
-
-
-def _get_or_build_hadamard_projection_matrix(attn_module, page_size, comp_size, device, dtype):
-    """Return cached Hadamard projection matrix."""
-    M = getattr(attn_module, '_dct_hadamard_proj_matrix', None)
-    if M is None or M.shape != (comp_size, page_size) or M.device != device:
-        M = _build_hadamard_projection_matrix(page_size, comp_size, device, dtype)
-        attn_module._dct_hadamard_proj_matrix = M
     return M
 
 
@@ -755,47 +463,73 @@ def segment_kv(key_states, value_states, cfg):
 # ---------------------------------------------------------------------------
 def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg):
     """
-    Incrementally maintain compressed page representations (both K and V).
+    Incrementally maintain compressed page representations using DCT-IDCT
+    projection (via _compress_pages).
 
-    Dispatches to the compression method specified in cfg.compression_method:
-      - "dct": DCT-IDCT projection (via _compress_pages)
-      - "haar": Haar lowpass block means (via _project_pages_to_haar_lowpass)
+    K is always built (used for page scoring). V is built only when
+    cfg.unselected_mode != "drop"; drop mode returns comp_v=None and skips
+    V compression, quant, allocation, and storage. Flipping unselected_mode
+    mid-run invalidates the whole cache.
+
+    Storage: when cfg.comp_kv_quant != "none", the persistent cache holds
+    low-precision quantized values (int8 / fp8_e4m3 / fp8_e5m2 / int4-packed)
+    plus an fp32 scale tensor for dequant-on-read. Values returned to callers
+    are always bf16, so downstream kernels are unchanged.
 
     RoPE handling for compressed K (cfg.compressed_token_rope):
-      - "mixed":        compress post-RoPE keys directly (current behavior — mixed RoPE phases)
-      - "block_center": invert RoPE on raw page → compress → re-rotate at block-center positions
-                        (mirrors multipole's invert/cluster/wRoPE flow but with block-center positions)
+      - "mixed":        compress post-RoPE keys directly.
+      - "block_center": invert RoPE on raw page → compress → re-rotate at block-center positions.
+                        Under real quantization the re-rotation applies on bf16 BEFORE quantize,
+                        so the stored low-precision values are already in their final orientation.
 
     Values are unaffected by RoPE — always compressed as-is.
     """
     bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
+
+    # V is only consumed in compressed mode; skip compress/store entirely for drop.
+    store_v = cfg.unselected_mode != "drop"
 
     cached_k = getattr(attn_module, '_comp_k_cache', None)
     cached_v = getattr(attn_module, '_comp_v_cache', None)
     n_cached = getattr(attn_module, '_comp_n_pages_cached', 0)
     capacity = getattr(attn_module, '_comp_cache_capacity', 0)
     cached_strategy = getattr(attn_module, '_comp_cache_strategy', None)
-    cur_strategy = (cfg.compression_method, cfg.compressed_token_rope)
+    cached_quant = getattr(attn_module, '_comp_cache_quant', None)
+    cached_quant_granularity = getattr(attn_module, '_comp_cache_quant_granularity', None)
+    cached_store_v = getattr(attn_module, '_comp_cache_store_v', None)
+    cur_strategy = cfg.compressed_token_rope
+    cur_quant = cfg.comp_kv_quant
+    cur_quant_granularity = cfg.comp_kv_quant_granularity
 
-    # Invalidate cache when the sequence restarts, shape changes, or RoPE/compression strategy changes
+    # Invalidate cache when the sequence restarts, shape changes, RoPE strategy changes,
+    # quant config changes (requires different storage dtype / scale shape), or the
+    # unselected_mode switch flips whether V is stored.
     if (cached_k is None
-            or cached_v is None
+            or (store_v and cached_v is None)
             or num_pages < n_cached
             or cached_k.shape[0] != bsz
             or cached_k.shape[3] != comp_size
-            or cached_strategy != cur_strategy):
+            or cached_strategy != cur_strategy
+            or cached_quant != cur_quant
+            or cached_quant_granularity != cur_quant_granularity
+            or cached_store_v != store_v):
         attn_module._comp_k_cache = None
         attn_module._comp_v_cache = None
+        attn_module._comp_k_scale_cache = None
+        attn_module._comp_v_scale_cache = None
         attn_module._comp_n_pages_cached = 0
         attn_module._comp_cache_capacity = 0
         n_cached = 0
         capacity = 0
     attn_module._comp_cache_strategy = cur_strategy
+    attn_module._comp_cache_quant = cur_quant
+    attn_module._comp_cache_quant_granularity = cur_quant_granularity
+    attn_module._comp_cache_store_v = store_v
 
     n_new = num_pages - n_cached
     if n_new > 0:
         new_k = paged_k[:, :, n_cached:num_pages]
-        new_v = paged_v[:, :, n_cached:num_pages]
+        new_v = paged_v[:, :, n_cached:num_pages] if store_v else None
 
         # Step A: optionally invert RoPE on new_k to recover raw (un-roped) keys.
         # When continuous_rope=False (current default), the cache stores post-RoPE keys.
@@ -806,7 +540,7 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
         # matrix entries by alpha. Since `_compute_rope_cos_sin` already returns cos/sin
         # pre-multiplied by alpha, we must divide the returned values by alpha**2 (one alpha
         # to remove the forward scaling, another alpha to apply the 1/alpha inverse scaling).
-        if cfg.compressed_token_rope == "block_center":
+        if cur_strategy == "block_center":
             start_pos = cfg.sink_size + n_cached * page_size
             end_pos = cfg.sink_size + num_pages * page_size
             positions = torch.arange(start_pos, end_pos, device=new_k.device)
@@ -821,30 +555,14 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
             flat_raw_k = _apply_rope(flat_k, cos_inv, -sin_inv)
             new_k_for_compress = flat_raw_k.reshape(bsz, num_kv_heads, n_new, page_size, head_dim)
         else:
-            # "mixed": compress post-RoPE keys directly (no inversion)
             new_k_for_compress = new_k
 
-        # Step B: compress K and V with the configured method
-        if cfg.compression_method == "haar":
-            new_comp_k = _project_pages_to_haar_lowpass(attn_module, new_k_for_compress, comp_size)
-            new_comp_v = _project_pages_to_haar_lowpass(attn_module, new_v, comp_size)
-        else:  # "dct"
-            new_comp_k = _compress_pages(attn_module, new_k_for_compress, comp_size)
-            new_comp_v = _compress_pages(attn_module, new_v, comp_size)
+        # Step B: compress K (always — needed for scoring) and V (only when stored).
+        new_comp_k = _compress_pages(attn_module, new_k_for_compress, comp_size)
+        new_comp_v = _compress_pages(attn_module, new_v, comp_size) if store_v else None
 
-        # Step B': fake-quantize compressed K and V to simulate low-precision storage.
-        # No-op when cfg.comp_kv_quant == "none". Runs before block_center RoPE so the
-        # re-rotation applies to the quantized values (matches real fp8-store semantics).
-        if cfg.comp_kv_quant != "none":
-            new_comp_k = _fake_quantize_comp(
-                new_comp_k, cfg.comp_kv_quant, cfg.comp_kv_quant_granularity
-            )
-            new_comp_v = _fake_quantize_comp(
-                new_comp_v, cfg.comp_kv_quant, cfg.comp_kv_quant_granularity
-            )
-
-        # Step C: re-apply RoPE to compressed K at block-center positions
-        if cfg.compressed_token_rope == "block_center":
+        # Step C: re-apply RoPE to compressed K at block-center positions (still bf16).
+        if cur_strategy == "block_center":
             new_positions = _block_center_positions(
                 n_cached, n_new, cfg.page_size, comp_size, cfg.sink_size, new_comp_k.device,
             ).reshape(-1)
@@ -854,79 +572,213 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
             flat_comp_k = new_comp_k.reshape(bsz, num_kv_heads, n_new * comp_size, head_dim)
             flat_comp_k = _apply_rope(flat_comp_k, cos_new, sin_new)
             new_comp_k = flat_comp_k.reshape(bsz, num_kv_heads, n_new, comp_size, head_dim)
-        # else "mixed": leave new_comp_k as-is
 
+        # Step D: quantize for persistent storage (no-op when cur_quant == "none").
+        new_v_store = new_v_scale = None
+        if cur_quant == "none":
+            new_k_store, new_k_scale = new_comp_k, None
+            if store_v:
+                new_v_store = new_comp_v
+        else:
+            new_k_store, new_k_scale = _quantize_for_storage(
+                new_comp_k, cur_quant, cur_quant_granularity,
+            )
+            if store_v:
+                new_v_store, new_v_scale = _quantize_for_storage(
+                    new_comp_v, cur_quant, cur_quant_granularity,
+                )
+
+        # Allocate (or grow) the persistent cache + optional scale cache.
         if num_pages > capacity:
             new_capacity = _next_page_capacity(num_pages, capacity)
+            storage_dtype, storage_d = _comp_cache_spec(cur_quant, head_dim)
             new_k_cache = torch.empty(
-                bsz, num_kv_heads, new_capacity, comp_size, head_dim,
-                dtype=new_comp_k.dtype, device=new_comp_k.device,
+                bsz, num_kv_heads, new_capacity, comp_size, storage_d,
+                dtype=storage_dtype, device=paged_k.device,
             )
-            new_v_cache = torch.empty_like(new_k_cache)
             if n_cached > 0 and attn_module._comp_k_cache is not None:
                 new_k_cache[:, :, :n_cached].copy_(attn_module._comp_k_cache[:, :, :n_cached])
-                new_v_cache[:, :, :n_cached].copy_(attn_module._comp_v_cache[:, :, :n_cached])
             attn_module._comp_k_cache = new_k_cache
-            attn_module._comp_v_cache = new_v_cache
             attn_module._comp_cache_capacity = new_capacity
 
-        attn_module._comp_k_cache[:, :, n_cached:num_pages].copy_(new_comp_k)
-        attn_module._comp_v_cache[:, :, n_cached:num_pages].copy_(new_comp_v)
+            if store_v:
+                new_v_cache = torch.empty_like(new_k_cache)
+                if n_cached > 0 and attn_module._comp_v_cache is not None:
+                    new_v_cache[:, :, :n_cached].copy_(attn_module._comp_v_cache[:, :, :n_cached])
+                attn_module._comp_v_cache = new_v_cache
+            else:
+                attn_module._comp_v_cache = None
+
+            if cur_quant != "none":
+                scale_shape = _comp_scale_shape(
+                    cur_quant_granularity, bsz, num_kv_heads, new_capacity, comp_size,
+                )
+                new_k_scale_cache = torch.empty(
+                    scale_shape, dtype=torch.float32, device=paged_k.device,
+                )
+                if n_cached > 0 and attn_module._comp_k_scale_cache is not None:
+                    new_k_scale_cache[:, :, :n_cached].copy_(
+                        attn_module._comp_k_scale_cache[:, :, :n_cached]
+                    )
+                attn_module._comp_k_scale_cache = new_k_scale_cache
+
+                if store_v:
+                    new_v_scale_cache = torch.empty_like(new_k_scale_cache)
+                    if n_cached > 0 and attn_module._comp_v_scale_cache is not None:
+                        new_v_scale_cache[:, :, :n_cached].copy_(
+                            attn_module._comp_v_scale_cache[:, :, :n_cached]
+                        )
+                    attn_module._comp_v_scale_cache = new_v_scale_cache
+                else:
+                    attn_module._comp_v_scale_cache = None
+            else:
+                attn_module._comp_k_scale_cache = None
+                attn_module._comp_v_scale_cache = None
+
+        attn_module._comp_k_cache[:, :, n_cached:num_pages].copy_(new_k_store)
+        if store_v:
+            attn_module._comp_v_cache[:, :, n_cached:num_pages].copy_(new_v_store)
+        if cur_quant != "none":
+            attn_module._comp_k_scale_cache[:, :, n_cached:num_pages].copy_(new_k_scale)
+            if store_v:
+                attn_module._comp_v_scale_cache[:, :, n_cached:num_pages].copy_(new_v_scale)
         attn_module._comp_n_pages_cached = num_pages
 
-    comp_k = attn_module._comp_k_cache
-    comp_v = attn_module._comp_v_cache
-    if comp_k is None:
+    if attn_module._comp_k_cache is None:
         return None, None
-    return comp_k[:, :, :num_pages], comp_v[:, :, :num_pages]
+
+    k_slice = attn_module._comp_k_cache[:, :, :num_pages]
+    if cur_quant == "none":
+        comp_k = k_slice
+    else:
+        comp_k = _dequantize_comp(
+            k_slice,
+            attn_module._comp_k_scale_cache[:, :, :num_pages],
+            cur_quant, cur_quant_granularity, head_dim,
+        )
+
+    if not store_v or attn_module._comp_v_cache is None:
+        return comp_k, None
+
+    v_slice = attn_module._comp_v_cache[:, :, :num_pages]
+    if cur_quant == "none":
+        comp_v = v_slice
+    else:
+        comp_v = _dequantize_comp(
+            v_slice,
+            attn_module._comp_v_scale_cache[:, :, :num_pages],
+            cur_quant, cur_quant_granularity, head_dim,
+        )
+    return comp_k, comp_v
 
 
 _FP8_MAX = {"fp8_e4m3": 448.0, "fp8_e5m2": 57344.0}
 _FP8_DTYPE = {"fp8_e4m3": torch.float8_e4m3fn, "fp8_e5m2": torch.float8_e5m2}
 
 
-def _fake_quantize_comp(x: torch.Tensor, quant_type: str, granularity: str) -> torch.Tensor:
-    """Quantize→dequantize round-trip for compressed K/V.
+def _comp_cache_spec(quant_type: str, head_dim: int):
+    """Persistent storage dtype + head_dim for the compressed KV cache.
 
-    Returns a tensor with the same shape and dtype as the input, but with
-    precision loss baked in. Used to study whether storing compressed KV in
-    low precision would degrade page selection quality.
+    int4 packs two nibbles per uint8 byte, so the storage head_dim is halved.
+    """
+    if quant_type == "none":     return torch.bfloat16, head_dim
+    if quant_type == "int8":     return torch.int8, head_dim
+    if quant_type == "fp8_e4m3": return torch.float8_e4m3fn, head_dim
+    if quant_type == "fp8_e5m2": return torch.float8_e5m2, head_dim
+    if quant_type == "int4":
+        assert head_dim % 2 == 0, f"int4 storage requires even head_dim, got {head_dim}"
+        return torch.uint8, head_dim // 2
+    raise ValueError(f"Unsupported comp_kv_quant: {quant_type}")
 
-    x shape: [bsz, num_kv_heads, num_pages, comp_size, head_dim]
-    granularity:
-      per_page:       one absmax scale per (bsz, kv_head, page)
-      per_comp_token: one absmax scale per (bsz, kv_head, page, comp_idx)
+
+def _comp_scale_shape(granularity: str, bsz: int, num_kv_heads: int,
+                      capacity: int, comp_size: int):
+    """Fp32 scale cache shape, broadcastable against the comp K/V cache."""
+    if granularity == "per_page":       return (bsz, num_kv_heads, capacity, 1, 1)
+    if granularity == "per_comp_token": return (bsz, num_kv_heads, capacity, comp_size, 1)
+    raise ValueError(f"Unsupported comp_kv_quant_granularity: {granularity}")
+
+
+def _quant_reduce_dims(granularity: str):
+    if granularity == "per_page":       return (-2, -1)
+    if granularity == "per_comp_token": return (-1,)
+    raise ValueError(f"Unsupported comp_kv_quant_granularity: {granularity}")
+
+
+def _pack_int4(x_q_i8: torch.Tensor) -> torch.Tensor:
+    """Pack signed-int4 values (int8 [-8, 7]) into uint8 [..., D//2] (2 nibbles per byte)."""
+    assert x_q_i8.shape[-1] % 2 == 0, f"int4 packing requires even head_dim, got {x_q_i8.shape[-1]}"
+    x_u = (x_q_i8.to(torch.int8) & 0x0F).to(torch.uint8)
+    low = x_u[..., 0::2]
+    high = x_u[..., 1::2]
+    return (low | (high << 4)).contiguous()
+
+
+def _unpack_int4(x_packed: torch.Tensor, head_dim: int) -> torch.Tensor:
+    """Unpack uint8 [..., D//2] into signed int8 [..., D] with sign extension."""
+    low = (x_packed & 0x0F).to(torch.int16)
+    high = ((x_packed >> 4) & 0x0F).to(torch.int16)
+    low = torch.where(low >= 8, low - 16, low).to(torch.int8)
+    high = torch.where(high >= 8, high - 16, high).to(torch.int8)
+    out = torch.empty(
+        x_packed.shape[:-1] + (head_dim,), dtype=torch.int8, device=x_packed.device,
+    )
+    out[..., 0::2] = low
+    out[..., 1::2] = high
+    return out
+
+
+def _quantize_for_storage(x: torch.Tensor, quant_type: str, granularity: str):
+    """Quantize bf16 tensor for persistent low-precision storage.
+
+    Returns (x_q, scale_fp32):
+      x_q:   storage-dtype tensor. Shape matches x except int4 packs last dim to D//2.
+      scale: fp32, shape broadcastable against x per granularity (per_page or per_comp_token).
+
+    Callers must not pass quant_type="none" here (use the raw tensor directly).
     """
     if quant_type == "none":
-        return x
+        raise ValueError("_quantize_for_storage called with quant_type='none'")
 
-    if granularity == "per_page":
-        reduce_dims = (-2, -1)
-    elif granularity == "per_comp_token":
-        reduce_dims = (-1,)
-    else:
-        raise ValueError(f"Unsupported comp_kv_quant_granularity: {granularity}")
-
-    orig_dtype = x.dtype
+    reduce_dims = _quant_reduce_dims(granularity)
     x_fp = x.to(torch.float32)
     abs_max = x_fp.abs().amax(dim=reduce_dims, keepdim=True).clamp(min=1e-8)
 
     if quant_type in ("fp8_e4m3", "fp8_e5m2"):
         fp8_max = _FP8_MAX[quant_type]
-        fp8_dtype = _FP8_DTYPE[quant_type]
         scale = abs_max / fp8_max
-        x_q = (x_fp / scale).to(fp8_dtype)
-        return (x_q.to(torch.float32) * scale).to(orig_dtype)
+        x_q = (x_fp / scale).to(_FP8_DTYPE[quant_type])
+        return x_q, scale
 
     if quant_type == "int8":
         scale = abs_max / 127.0
-        x_q = torch.round(x_fp / scale).clamp(-128.0, 127.0)
-        return (x_q * scale).to(orig_dtype)
+        x_q = torch.round(x_fp / scale).clamp(-128.0, 127.0).to(torch.int8)
+        return x_q, scale
 
     if quant_type == "int4":
         scale = abs_max / 7.0
-        x_q = torch.round(x_fp / scale).clamp(-8.0, 7.0)
-        return (x_q * scale).to(orig_dtype)
+        x_q_i8 = torch.round(x_fp / scale).clamp(-8.0, 7.0).to(torch.int8)
+        return _pack_int4(x_q_i8), scale
+
+    raise ValueError(f"Unsupported comp_kv_quant: {quant_type}")
+
+
+def _dequantize_comp(x_q: torch.Tensor, scale: torch.Tensor,
+                     quant_type: str, granularity: str, head_dim: int,
+                     out_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    """Dequantize stored quantized tensor back to out_dtype (default bf16).
+
+    head_dim is only consulted for int4 (to know the unpacked last-dim size).
+    """
+    if quant_type == "none":
+        return x_q.to(out_dtype) if x_q.dtype != out_dtype else x_q
+
+    if quant_type in ("fp8_e4m3", "fp8_e5m2", "int8"):
+        return (x_q.to(torch.float32) * scale).to(out_dtype)
+
+    if quant_type == "int4":
+        x_i8 = _unpack_int4(x_q, head_dim)
+        return (x_i8.to(torch.float32) * scale).to(out_dtype)
 
     raise ValueError(f"Unsupported comp_kv_quant: {quant_type}")
 
@@ -1020,299 +872,6 @@ def _compress_pages(attn_module, paged_x, comp_size):
         attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
     )
     return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
-
-
-def _project_pages_to_spectral(attn_module, paged_x, comp_size):
-    """Project pages to their leading DCT coefficients without IDCT reconstruction."""
-    page_size = paged_x.shape[3]
-    M = _get_or_build_spectral_projection_matrix(
-        attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
-    )
-    return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
-
-
-def _project_pages_to_haar_lowpass(attn_module, paged_x, comp_size):
-    """Project pages to coarse Haar lowpass block means."""
-    page_size = paged_x.shape[3]
-    if comp_size == 1:
-        return paged_x.mean(dim=3, keepdim=True)
-    # The Haar lowpass projection is exactly a contiguous block mean. When the
-    # page splits evenly into `comp_size` blocks (the default fast paths like
-    # 32->4 and 128->4), avoid the projection-matrix einsum entirely.
-    if page_size % comp_size == 0:
-        block_size = page_size // comp_size
-        return paged_x.reshape(*paged_x.shape[:3], comp_size, block_size, paged_x.shape[4]).mean(dim=4)
-    M = _get_or_build_haar_projection_matrix(
-        attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
-    )
-    return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
-
-def _project_pages_to_haar_mixed(attn_module, paged_x, comp_size):
-    """Project pages to mixed global/detail Haar proxies."""
-    page_size = paged_x.shape[3]
-    M = _get_or_build_haar_mixed_projection_matrix(
-        attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
-    )
-    return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
-
-
-def _project_pages_to_hadamard(attn_module, paged_x, comp_size):
-    """Project pages to Walsh-Hadamard compressed proxies."""
-    page_size = paged_x.shape[3]
-    M = _get_or_build_hadamard_projection_matrix(
-        attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
-    )
-    return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
-
-
-def _get_or_build_dc_ac_spectral_matrix(attn_module, page_size, comp_size, device, dtype, layout):
-    """Return cached DCT basis matrix for DC+AC scoring with explicit layout."""
-    M = getattr(attn_module, '_dc_ac_spectral_proj_matrix', None)
-    cached_layout = getattr(attn_module, '_dc_ac_spectral_proj_layout', None)
-    if (
-        M is None
-        or M.shape != (comp_size, page_size)
-        or M.device != device
-        or cached_layout != layout
-    ):
-        M = _build_dct_spectral_projection_matrix(page_size, comp_size, device, dtype, layout)
-        attn_module._dc_ac_spectral_proj_matrix = M
-        attn_module._dc_ac_spectral_proj_layout = layout
-    return M
-
-
-def _update_spectral_score_cache(attn_module, paged_k, num_pages, comp_size, cfg, layout):
-    """Incrementally maintain spectral (raw DCT) compressed keys for DC+AC scoring.
-
-    Like _update_comp_cache but only builds K (no V needed for scoring) and uses
-    spectral projection (raw DCT coefficients, no IDCT) with an explicit layout.
-    """
-    bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
-
-    cached_k = getattr(attn_module, '_spectral_score_k_cache', None)
-    n_cached = getattr(attn_module, '_spectral_score_n_cached', 0)
-    capacity = getattr(attn_module, '_spectral_score_capacity', 0)
-    cached_layout = getattr(attn_module, '_spectral_score_layout', None)
-
-    if (cached_k is None
-            or num_pages < n_cached
-            or cached_k.shape[0] != bsz
-            or cached_k.shape[3] != comp_size
-            or cached_layout != (layout, cfg.compressed_token_rope)):
-        attn_module._spectral_score_k_cache = None
-        attn_module._spectral_score_n_cached = 0
-        attn_module._spectral_score_capacity = 0
-        n_cached = 0
-        capacity = 0
-    attn_module._spectral_score_layout = (layout, cfg.compressed_token_rope)
-
-    n_new = num_pages - n_cached
-    if n_new > 0:
-        new_k = paged_k[:, :, n_cached:num_pages]
-
-        # Step A: optionally invert RoPE (same as _update_comp_cache)
-        if cfg.compressed_token_rope == "block_center":
-            start_pos = cfg.sink_size + n_cached * page_size
-            end_pos = cfg.sink_size + num_pages * page_size
-            positions = torch.arange(start_pos, end_pos, device=new_k.device)
-            cos, sin = _compute_rope_cos_sin(
-                positions, attn_module.config, new_k.device, new_k.dtype
-            )
-            _, attention_scaling = _get_rope_inv_freq_and_scaling(attn_module.config, new_k.device)
-            inv_factor = 1.0 / (attention_scaling * attention_scaling)
-            cos_inv = cos * inv_factor
-            sin_inv = sin * inv_factor
-            flat_k = new_k.reshape(bsz, num_kv_heads, n_new * page_size, head_dim)
-            flat_raw_k = _apply_rope(flat_k, cos_inv, -sin_inv)
-            new_k_for_compress = flat_raw_k.reshape(bsz, num_kv_heads, n_new, page_size, head_dim)
-        else:
-            new_k_for_compress = new_k
-
-        # Step B: spectral projection with explicit layout
-        M = _get_or_build_dc_ac_spectral_matrix(
-            attn_module, page_size, comp_size, new_k_for_compress.device,
-            new_k_for_compress.dtype, layout,
-        )
-        new_comp_k = torch.einsum('cs,bhnsd->bhncd', M, new_k_for_compress)
-
-        # Step C: re-apply RoPE at block-center positions
-        if cfg.compressed_token_rope == "block_center":
-            new_positions = _block_center_positions(
-                n_cached, n_new, cfg.page_size, comp_size, cfg.sink_size, new_comp_k.device,
-            ).reshape(-1)
-            cos_new, sin_new = _compute_rope_cos_sin(
-                new_positions, attn_module.config, new_comp_k.device, new_comp_k.dtype
-            )
-            flat_comp_k = new_comp_k.reshape(bsz, num_kv_heads, n_new * comp_size, head_dim)
-            flat_comp_k = _apply_rope(flat_comp_k, cos_new, sin_new)
-            new_comp_k = flat_comp_k.reshape(bsz, num_kv_heads, n_new, comp_size, head_dim)
-
-        if num_pages > capacity:
-            new_capacity = _next_page_capacity(num_pages, capacity)
-            new_k_cache = torch.empty(
-                bsz, num_kv_heads, new_capacity, comp_size, head_dim,
-                dtype=new_comp_k.dtype, device=new_comp_k.device,
-            )
-            if n_cached > 0 and attn_module._spectral_score_k_cache is not None:
-                new_k_cache[:, :, :n_cached].copy_(attn_module._spectral_score_k_cache[:, :, :n_cached])
-            attn_module._spectral_score_k_cache = new_k_cache
-            attn_module._spectral_score_capacity = new_capacity
-
-        attn_module._spectral_score_k_cache[:, :, n_cached:num_pages].copy_(new_comp_k)
-        attn_module._spectral_score_n_cached = num_pages
-
-    cache = attn_module._spectral_score_k_cache
-    if cache is None:
-        return None
-    return cache[:, :, :num_pages]
-
-
-def _score_pages_hybrid_multi(
-    query_states,
-    paged_k,
-    spectral_comp_k,
-    M_proj,
-    M_highlight,
-    alpha,
-    num_kv_groups,
-    group_agg_method,
-    out=None,
-):
-    """Score pages with hybrid multi-highlight: M exact tokens + spectral reconstruction.
-
-    Combines top-M AC-energy tokens (exact Q.K) with spectral curve reconstruction
-    from the remaining DCT coefficients.
-
-    Args:
-        query_states:    [bsz, num_heads, 1, head_dim]
-        paged_k:         [bsz, num_kv_heads, num_pages, page_size, head_dim]
-        spectral_comp_k: [bsz, num_kv_heads, num_pages, c_multi, head_dim] or None
-        M_proj:          [c_multi, page_size] DCT spectral projection matrix, or None
-        M_highlight:     number of AC-energy-selected tokens per page
-        alpha:           spectral scaling factor
-        num_kv_groups:   GQA group count
-        group_agg_method: "mean" | "max" | "topp"
-        out:             optional pre-allocated [bsz, num_kv_heads, capacity] float32 buffer
-
-    Returns:
-        page_scores: [bsz, num_kv_heads, num_pages] (float32)
-    """
-    bsz, num_kv_heads, num_pages, page_size, head_dim = paged_k.shape
-    scaling = head_dim ** -0.5
-
-    # Reshape query for GQA: [bsz, num_kv_heads, G, head_dim]
-    q = query_states.squeeze(2).float()
-    q = q.reshape(bsz, num_kv_heads, num_kv_groups, head_dim) * scaling
-
-    k_f = paged_k.float()
-
-    # --- AC energy selection: pick top-M tokens per page ---
-    k_mean = k_f.mean(dim=-2, keepdim=True)                     # [B,H,N,1,D]
-    ac_energy = (k_f - k_mean).pow(2).sum(dim=-1)               # [B,H,N,P]
-    _, topM_idx = ac_energy.topk(M_highlight, dim=-1)            # [B,H,N,M]
-
-    idx_exp = topM_idx.unsqueeze(-1).expand(
-        bsz, num_kv_heads, num_pages, M_highlight, head_dim
-    )
-    K_multi = k_f.gather(dim=-2, index=idx_exp)                  # [B,H,N,M,D]
-
-    # Exact Q.K for selected tokens
-    multi_scores = torch.einsum(
-        'bhgd,bhnmd->bhgnm', q, K_multi
-    )                                                             # [B,H,G,N,M]
-    multi_hi = multi_scores.max(dim=-1).values                   # [B,H,G,N]
-
-    if spectral_comp_k is not None and M_proj is not None:
-        # --- Spectral reconstruction from c_multi DCT coefficients ---
-        a = torch.einsum(
-            'bhgd,bhncd->bhgnc', q, spectral_comp_k.float()
-        )                                                         # [B,H,G,N,c_multi]
-
-        Phi_T = M_proj.T.float().contiguous()                    # [P, c_multi]
-        shat = torch.einsum(
-            'tc,bhgnc->bhgnt', Phi_T, a
-        )                                                         # [B,H,G,N,P]
-        spectral_max = shat.max(dim=-1).values                   # [B,H,G,N]
-
-        # Combine: max(alpha * spectral_max, multi_hi)
-        combined = torch.maximum(alpha * spectral_max, multi_hi)  # [B,H,G,N]
-    else:
-        # No DCT budget: degenerate to multi-highlight only
-        combined = multi_hi                                       # [B,H,G,N]
-
-    # Group aggregation
-    if group_agg_method == "mean":
-        page_scores = combined.mean(dim=2)
-    elif group_agg_method == "max":
-        page_scores = combined.max(dim=2).values
-    elif group_agg_method == "topp":
-        k_top = min(2, num_kv_groups)
-        page_scores = combined.topk(k_top, dim=2).values.mean(dim=2)
-    else:
-        raise ValueError(f"Unsupported group_agg_method: {group_agg_method}")
-
-    if out is not None:
-        out_view = out[:, :, :num_pages]
-        out_view.copy_(page_scores)
-        return out_view
-    return page_scores.contiguous()
-
-
-def _score_pages_spectral_recon_max(
-    query_states,
-    spectral_comp_k,
-    M_proj,
-    num_kv_groups,
-    group_agg_method,
-    out=None,
-):
-    """Score pages via spectral reconstruction of per-token Q·K scores.
-
-    Dot-products the scaled query with the (already DCT'd) compressed keys to get
-    frequency-domain score coefficients, then reconstructs them back to `page_size`
-    per-token scores using the IDCT-style synthesis matrix. Takes the max across
-    tokens in each page, then aggregates across GQA groups.
-
-    Args:
-        query_states:    [bsz, num_heads, 1, head_dim]
-        spectral_comp_k: [bsz, num_kv_heads, num_pages, comp_size, head_dim]
-                         (raw DCT coefficients of keys; from _update_spectral_score_cache)
-        M_proj:          [comp_size, page_size] DCT spectral projection matrix
-        num_kv_groups:   GQA group count
-        group_agg_method: "mean" | "max" | "topp"
-        out:             optional pre-allocated [bsz, num_kv_heads, capacity] float32 buffer
-
-    Returns:
-        page_scores: [bsz, num_kv_heads, num_pages] (float32)
-    """
-    bsz, num_kv_heads, num_pages, comp_size, head_dim = spectral_comp_k.shape
-    scaling = head_dim ** -0.5
-    q = query_states.squeeze(2).float()
-    q = q.reshape(bsz, num_kv_heads, num_kv_groups, head_dim) * scaling
-
-    a = torch.einsum(
-        'bhgd,bhncd->bhgnc', q, spectral_comp_k.float()
-    )                                                             # [B,H,G,N,c]
-
-    Phi_T = M_proj.T.float().contiguous()                        # [P, c]
-    shat = torch.einsum('tc,bhgnc->bhgnt', Phi_T, a)             # [B,H,G,N,P]
-    per_group = shat.max(dim=-1).values                          # [B,H,G,N]
-
-    if group_agg_method == "mean":
-        page_scores = per_group.mean(dim=2)
-    elif group_agg_method == "max":
-        page_scores = per_group.max(dim=2).values
-    elif group_agg_method == "topp":
-        k_top = min(2, num_kv_groups)
-        page_scores = per_group.topk(k_top, dim=2).values.mean(dim=2)
-    else:
-        raise ValueError(f"Unsupported group_agg_method: {group_agg_method}")
-
-    if out is not None:
-        out_view = out[:, :, :num_pages]
-        out_view.copy_(page_scores)
-        return out_view
-    return page_scores.contiguous()
 
 
 def _block_center_positions(start_page_idx, n_pages, page_size, comp_size, sink_size, device):
@@ -1438,14 +997,19 @@ def _apply_original_position_rope_to_final_k(
 _DCT_RUNTIME_STATE_ATTRS = (
     "_comp_k_cache",
     "_comp_v_cache",
+    "_comp_k_scale_cache",
+    "_comp_v_scale_cache",
     "_comp_n_pages_cached",
     "_comp_cache_capacity",
+    "_comp_cache_strategy",
+    "_comp_cache_quant",
+    "_comp_cache_quant_granularity",
+    "_comp_cache_store_v",
     "_page_scores_buf",
     "_page_scores_np",
     "_page_scores_capacity",
     "_topk_out_buf",
     "_assemble_stride_cache",
-    "_assemble_drop_stride_cache",
     "_final_k_buf",
     "_final_v_buf",
     "_final_bias_buf",
@@ -1455,12 +1019,6 @@ _DCT_RUNTIME_STATE_ATTRS = (
     "_orig_pos_rope_sin_2d",
     "_orig_pos_rope_cache_len",
     "_q_rope_buf",
-    "_spectral_score_k_cache",
-    "_spectral_score_n_cached",
-    "_spectral_score_capacity",
-    "_spectral_score_layout",
-    "_dc_ac_spectral_proj_matrix",
-    "_dc_ac_spectral_proj_layout",
 )
 
 
@@ -1495,19 +1053,6 @@ def dct_page_attention_forward(
     - Decode (q_len == 1, long KV cache): DCT page attention.
     """
     cfg = _dct_page_cfg
-    num_score_proxy_modes = sum(
-        int(flag)
-        for flag in (
-            cfg.score_use_direct_spectral_proxy,
-            cfg.score_use_haar_proxy,
-            cfg.score_use_haar_mixed_proxy,
-            cfg.score_use_hadamard_proxy,
-        )
-    )
-    if num_score_proxy_modes > 1:
-        raise ValueError(
-            "Only one score-time proxy rope mode may be enabled at once."
-    )
     if cfg.continuous_rope:
         raise NotImplementedError(
             "continuous_rope=True is temporarily disabled. "
@@ -1566,6 +1111,8 @@ def dct_page_attention_forward(
         # TODO: Verify if this is needed or not
         self._comp_k_cache = None
         self._comp_v_cache = None
+        self._comp_k_scale_cache = None
+        self._comp_v_scale_cache = None
         self._comp_n_pages_cached = 0
 
         extra_tokens = cfg.page_size * 2
@@ -1625,8 +1172,9 @@ def dct_page_attention_forward(
         recent_k, recent_v, num_pages, actual_recent) = segment_kv(
         key_states, value_states, cfg
     )
-    # Step 4: Compressed cache maintenance (K+V).
-    # Always built — comp_k used for scoring, comp_v used for assembly in compressed mode.
+    # Step 4: Compressed cache maintenance.
+    # comp_k is always built (used for scoring). comp_v is built only in
+    # compressed mode (used for assembly); drop mode returns comp_v=None.
     comp_k, comp_v = _update_comp_cache(
         self, paged_k, paged_v, num_pages, comp_size, cfg,
     )
@@ -1654,59 +1202,10 @@ def dct_page_attention_forward(
             out=self._page_scores_buf,
         )
     else:
-        hybrid_multi_parsed = _parse_hybrid_multi_scoring_method(cfg.scoring_method)
-        if hybrid_multi_parsed is not None:
-            hm_M, hm_alpha = hybrid_multi_parsed
-            c_multi = comp_size
-            if c_multi > 0:
-                spectral_comp_k = _update_spectral_score_cache(
-                    self, paged_k, num_pages, c_multi, cfg, "low",
-                )
-                hm_proj = _get_or_build_dc_ac_spectral_matrix(
-                    self, cfg.page_size, c_multi, paged_k.device, paged_k.dtype, "low",
-                )
-            else:
-                spectral_comp_k = None
-                hm_proj = None
-            page_scores = _score_pages_hybrid_multi(
-                score_query_states, paged_k[:, :, :num_pages], spectral_comp_k, hm_proj,
-                hm_M, hm_alpha, self.num_key_value_groups, cfg.group_agg_method,
-                out=self._page_scores_buf,
+        page_scores = score_pages_triton(
+            score_query_states, comp_k, cfg.scoring_method, cfg.group_agg_method, self.num_key_value_groups,
+            out=self._page_scores_buf,
         )
-        elif cfg.scoring_method == "spectral_recon_max":
-            # Lowpass spectral reconstruction scoring (layout hardcoded to "low").
-            if comp_size > 0:
-                sr_spectral_comp_k = _update_spectral_score_cache(
-                    self, paged_k, num_pages, comp_size, cfg, "low",
-                )
-                sr_proj = _get_or_build_dc_ac_spectral_matrix(
-                    self, cfg.page_size, comp_size, paged_k.device, paged_k.dtype, "low",
-                )
-                page_scores = _score_pages_spectral_recon_max(
-                    score_query_states,
-                    sr_spectral_comp_k[:, :, :num_pages],
-                    sr_proj,
-                    self.num_key_value_groups,
-                    cfg.group_agg_method,
-                    out=self._page_scores_buf,
-                    )
-            else:
-                page_scores = self._page_scores_buf[:, :, :num_pages].zero_()
-        else:
-            dc_ac_parsed = _parse_dc_ac_scoring_method(cfg.scoring_method)
-            if dc_ac_parsed is not None:
-                dc_ac_layout, _, dc_ac_full = dc_ac_parsed
-                score_cache_size = cfg.page_size if dc_ac_full else comp_size
-                score_comp_k = _update_spectral_score_cache(
-                    self, paged_k, num_pages, score_cache_size, cfg, dc_ac_layout,
-                )
-            else:
-                score_comp_k = comp_k
-
-            page_scores = score_pages_triton(
-                score_query_states, score_comp_k, cfg.scoring_method, cfg.group_agg_method, self.num_key_value_groups,
-                out=self._page_scores_buf,
-            )
     debug_hook = _dct_page_debug_hook
     oracle_page_scores = None
     if debug_hook is not None or cfg.select_with_oracle_page_scores:
@@ -1743,11 +1242,6 @@ def dct_page_attention_forward(
                 "page_size": int(cfg.page_size),
                 "sink_size": int(cfg.sink_size),
                 "recent_size": int(cfg.recent_size),
-                "proxy_frequency_layout": str(cfg.proxy_frequency_layout),
-                "score_use_direct_spectral_proxy": bool(cfg.score_use_direct_spectral_proxy),
-                "score_use_haar_proxy": bool(cfg.score_use_haar_proxy),
-                "score_use_haar_mixed_proxy": bool(cfg.score_use_haar_mixed_proxy),
-                "score_use_hadamard_proxy": bool(cfg.score_use_hadamard_proxy),
 
                 "cache_position": None
                 if cache_position is None
@@ -1867,7 +1361,6 @@ def dct_page_attention_forward(
             # Population weighting
             weight_pop = (
                 cfg.weight_compressed_by_population
-                and not cfg.score_use_direct_spectral_proxy
                 and effective_num_comp > 0
                 and comp_size < cfg.page_size
             )
@@ -1949,7 +1442,6 @@ def dct_page_attention_forward(
             # Population weighting
             weight_pop = (
                 cfg.weight_compressed_by_population
-                and not cfg.score_use_direct_spectral_proxy
                 and num_unselected > 0
                 and comp_size < cfg.page_size
             )
@@ -2062,17 +1554,11 @@ def replace_qwen2_attn(
     recent_size=128,
     compress_ratio=0.03125,
     min_decode_kv_len_for_paging=8192,
-    proxy_frequency_layout="low",
     scoring_method="max",
     group_agg_method="mean",
     unselected_mode="drop",
-    compression_method="haar",
     compressed_token_rope="mixed",
     continuous_rope=False,
-    score_use_direct_spectral_proxy=False,
-    score_use_haar_proxy=True,
-    score_use_haar_mixed_proxy=False,
-    score_use_hadamard_proxy=False,
     score_use_quest_minmax=False,
     select_with_oracle_page_scores=False,
     use_triton=True,
@@ -2094,17 +1580,11 @@ def replace_qwen2_attn(
         recent_size=recent_size,
         compress_ratio=compress_ratio,
         min_decode_kv_len_for_paging=min_decode_kv_len_for_paging,
-        proxy_frequency_layout=proxy_frequency_layout,
         scoring_method=scoring_method,
         group_agg_method=group_agg_method,
         unselected_mode=unselected_mode,
-        compression_method=compression_method,
         compressed_token_rope=compressed_token_rope,
         continuous_rope=continuous_rope,
-        score_use_direct_spectral_proxy=score_use_direct_spectral_proxy,
-        score_use_haar_proxy=score_use_haar_proxy,
-        score_use_haar_mixed_proxy=score_use_haar_mixed_proxy,
-        score_use_hadamard_proxy=score_use_hadamard_proxy,
         score_use_quest_minmax=score_use_quest_minmax,
         select_with_oracle_page_scores=select_with_oracle_page_scores,
         use_triton=use_triton,
@@ -2119,15 +1599,10 @@ def replace_qwen2_attn(
     print(f"  page_size={page_size}, top_k={top_k}")
     print(f"  sink_size={sink_size}, recent_size={recent_size}")
     print(f"  compress_ratio={compress_ratio} ({page_size} -> {comp_size} tokens)")
-    print(f"  proxy_frequency_layout={proxy_frequency_layout}")
     print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}")
-    print(f"  unselected_mode={unselected_mode}, compression_method={compression_method}, compressed_token_rope={compressed_token_rope}")
+    print(f"  unselected_mode={unselected_mode}, compressed_token_rope={compressed_token_rope}")
     print(
         f"  continuous_rope={continuous_rope}, "
-        f"score_use_direct_spectral_proxy={score_use_direct_spectral_proxy}, "
-        f"score_use_haar_proxy={score_use_haar_proxy}, "
-        f"score_use_haar_mixed_proxy={score_use_haar_mixed_proxy}, "
-        f"score_use_hadamard_proxy={score_use_hadamard_proxy}, "
         f"select_with_oracle_page_scores={select_with_oracle_page_scores}, "
         f"use_triton={use_triton}, "
         f"weight_compressed_by_population={weight_compressed_by_population}, "
@@ -2147,17 +1622,11 @@ def replace_qwen3_attn(
     recent_size=128,
     compress_ratio=0.03125,
     min_decode_kv_len_for_paging=8192,
-    proxy_frequency_layout="low",
     scoring_method="max",
     group_agg_method="mean",
     unselected_mode="drop",
-    compression_method="haar",
     compressed_token_rope="mixed",
     continuous_rope=False,
-    score_use_direct_spectral_proxy=False,
-    score_use_haar_proxy=True,
-    score_use_haar_mixed_proxy=False,
-    score_use_hadamard_proxy=False,
     score_use_quest_minmax=False,
     select_with_oracle_page_scores=False,
     use_triton=True,
@@ -2181,17 +1650,11 @@ def replace_qwen3_attn(
         recent_size=recent_size,
         compress_ratio=compress_ratio,
         min_decode_kv_len_for_paging=min_decode_kv_len_for_paging,
-        proxy_frequency_layout=proxy_frequency_layout,
         scoring_method=scoring_method,
         group_agg_method=group_agg_method,
         unselected_mode=unselected_mode,
-        compression_method=compression_method,
         compressed_token_rope=compressed_token_rope,
         continuous_rope=continuous_rope,
-        score_use_direct_spectral_proxy=score_use_direct_spectral_proxy,
-        score_use_haar_proxy=score_use_haar_proxy,
-        score_use_haar_mixed_proxy=score_use_haar_mixed_proxy,
-        score_use_hadamard_proxy=score_use_hadamard_proxy,
         score_use_quest_minmax=score_use_quest_minmax,
         select_with_oracle_page_scores=select_with_oracle_page_scores,
         use_triton=use_triton,
@@ -2206,15 +1669,10 @@ def replace_qwen3_attn(
     print(f"  page_size={page_size}, top_k={top_k}")
     print(f"  sink_size={sink_size}, recent_size={recent_size}")
     print(f"  compress_ratio={compress_ratio} ({page_size} -> {comp_size} tokens)")
-    print(f"  proxy_frequency_layout={proxy_frequency_layout}")
     print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}")
-    print(f"  unselected_mode={unselected_mode}, compression_method={compression_method}, compressed_token_rope={compressed_token_rope}")
+    print(f"  unselected_mode={unselected_mode}, compressed_token_rope={compressed_token_rope}")
     print(
         f"  continuous_rope={continuous_rope}, "
-        f"score_use_direct_spectral_proxy={score_use_direct_spectral_proxy}, "
-        f"score_use_haar_proxy={score_use_haar_proxy}, "
-        f"score_use_haar_mixed_proxy={score_use_haar_mixed_proxy}, "
-        f"score_use_hadamard_proxy={score_use_hadamard_proxy}, "
         f"select_with_oracle_page_scores={select_with_oracle_page_scores}, "
         f"use_triton={use_triton}, "
         f"weight_compressed_by_population={weight_compressed_by_population}, "
@@ -2234,17 +1692,11 @@ def replace_llama_attn(
     recent_size=128,
     compress_ratio=0.03125,
     min_decode_kv_len_for_paging=8192,
-    proxy_frequency_layout="low",
     scoring_method="max",
     group_agg_method="mean",
     unselected_mode="drop",
-    compression_method="haar",
     compressed_token_rope="mixed",
     continuous_rope=False,
-    score_use_direct_spectral_proxy=False,
-    score_use_haar_proxy=True,
-    score_use_haar_mixed_proxy=False,
-    score_use_hadamard_proxy=False,
     score_use_quest_minmax=False,
     select_with_oracle_page_scores=False,
     use_triton=True,
@@ -2268,17 +1720,11 @@ def replace_llama_attn(
         recent_size=recent_size,
         compress_ratio=compress_ratio,
         min_decode_kv_len_for_paging=min_decode_kv_len_for_paging,
-        proxy_frequency_layout=proxy_frequency_layout,
         scoring_method=scoring_method,
         group_agg_method=group_agg_method,
         unselected_mode=unselected_mode,
-        compression_method=compression_method,
         compressed_token_rope=compressed_token_rope,
         continuous_rope=continuous_rope,
-        score_use_direct_spectral_proxy=score_use_direct_spectral_proxy,
-        score_use_haar_proxy=score_use_haar_proxy,
-        score_use_haar_mixed_proxy=score_use_haar_mixed_proxy,
-        score_use_hadamard_proxy=score_use_hadamard_proxy,
         score_use_quest_minmax=score_use_quest_minmax,
         select_with_oracle_page_scores=select_with_oracle_page_scores,
         use_triton=use_triton,
@@ -2293,15 +1739,10 @@ def replace_llama_attn(
     print(f"  page_size={page_size}, top_k={top_k}")
     print(f"  sink_size={sink_size}, recent_size={recent_size}")
     print(f"  compress_ratio={compress_ratio} ({page_size} -> {comp_size} tokens)")
-    print(f"  proxy_frequency_layout={proxy_frequency_layout}")
     print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}")
-    print(f"  unselected_mode={unselected_mode}, compression_method={compression_method}, compressed_token_rope={compressed_token_rope}")
+    print(f"  unselected_mode={unselected_mode}, compressed_token_rope={compressed_token_rope}")
     print(
         f"  continuous_rope={continuous_rope}, "
-        f"score_use_direct_spectral_proxy={score_use_direct_spectral_proxy}, "
-        f"score_use_haar_proxy={score_use_haar_proxy}, "
-        f"score_use_haar_mixed_proxy={score_use_haar_mixed_proxy}, "
-        f"score_use_hadamard_proxy={score_use_hadamard_proxy}, "
         f"select_with_oracle_page_scores={select_with_oracle_page_scores}, "
         f"use_triton={use_triton}, "
         f"weight_compressed_by_population={weight_compressed_by_population}, "

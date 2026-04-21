@@ -214,17 +214,15 @@ def parse_args():
     parser.add_argument("--sink_size", type=int, default=4)
     parser.add_argument("--recent_size", type=int, default=128)
     parser.add_argument("--compress_ratio", type=float, default=0.03125)
-    parser.add_argument("--scoring_method", type=str, default="max")
+    parser.add_argument("--scoring_method", type=str, default="max",
+                        choices=["mean", "max"])
     parser.add_argument("--group_agg_method", type=str, default="mean",
-                        choices=["mean", "max", "topp"])
+                        choices=["mean", "max"])
     parser.add_argument("--unselected_mode", type=str, default="drop",
                         choices=["drop", "compressed"])
-    parser.add_argument("--compression_method", type=str, default="haar",
-                        choices=["haar", "dct"])
     parser.add_argument("--compressed_token_rope", type=str, default="mixed",
                         choices=["mixed", "block_center"])
     parser.add_argument("--continuous_rope", action="store_true")
-    parser.add_argument("--weight_compressed_by_population", action="store_true")
     parser.add_argument("--no_triton", action="store_true")
     parser.add_argument("--comp_kv_quant", type=str, default="none",
                         choices=["none", "fp8_e4m3", "fp8_e5m2", "int8", "int4"])
@@ -406,7 +404,6 @@ def build_summary(results, args):
         summary["scoring_method"] = args.scoring_method
         summary["group_agg_method"] = args.group_agg_method
         summary["unselected_mode"] = args.unselected_mode
-        summary["compression_method"] = args.compression_method
         summary["comp_kv_quant"] = args.comp_kv_quant
     elif args.mode == "seer_attention":
         from seer_attn.config import SEER_ATTN_CONFIG

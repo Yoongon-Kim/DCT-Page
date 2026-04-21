@@ -66,12 +66,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from eval_ruler import infer_model_family
 from oracle.attention_mass_recall_ruler import (
+    ALL_TASKS,
     compute_output_fidelity,
     compute_per_page_mass,
     compute_quest_scores,
-)
-from oracle.compare_proxy_oracle_slices import (
-    ALL_TASKS,
     load_task_configs,
 )
 

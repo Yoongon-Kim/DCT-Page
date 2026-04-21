@@ -1,11 +1,11 @@
 """
-Fused Triton kernels for DCT Page Attention (v2).
+Fused Triton kernels for DCT Page Attention.
 
-Kernel 1: _score_pages_fused_kernel  — scores all pages
-Kernel 2: _assemble_kv_full_kernel   — assemble + sink/recent + K-RoPE (topk done by torch.topk)
-Kernel 3: _apply_rope_q_kernel       — RoPE for single decode query token
-
-Total decode-path launches: Score(1) + torch.topk(1) + Assemble(1) + Q-RoPE(1) + SDPA(1) = 5
+Score:    _score_pages_fused_kernel (+ specialized c4/g4, c1/g4 variants)
+TopK:     _topk_sort_kernel (fused topk + ascending sort)
+Assemble: _copy_full_segments_kernel (sink + selected + recent + fused Q-RoPE)
+          _copy_unselected_pages_kernel (unselected compressed pages)
+Q-RoPE:   _apply_rope_q_kernel (standalone decode query RoPE)
 """
 
 import torch
@@ -207,90 +207,6 @@ def _score_pages_c1_g4_kernel(
     tl.store(out_ptrs, agg_scores, mask=p_mask)
 
 
-# ---------------------------------------------------------------------------
-# Kernel 1d: DC+AC scoring (group-aggregate per coefficient, then DC + λ·AC)
-# ---------------------------------------------------------------------------
-@triton.jit
-def _score_pages_dc_ac_kernel(
-    # --- pointers ---
-    query_ptr,         # [bsz, num_kv_heads, num_kv_groups, head_dim]
-    comp_keys_ptr,     # [bsz, num_kv_heads, num_pages, comp_size, head_dim]
-    out_scores_ptr,    # [bsz, num_kv_heads, num_pages]
-    # --- query strides ---
-    q_stride_b, q_stride_h, q_stride_g,
-    # --- comp keys strides ---
-    ck_stride_b, ck_stride_h, ck_stride_p, ck_stride_c,
-    # --- output strides ---
-    os_stride_b, os_stride_h,
-    # --- runtime dims ---
-    num_kv_heads,
-    num_pages,
-    head_dim,
-    scaling,
-    dc_ac_lambda,
-    # --- compile-time constants ---
-    NUM_KV_GROUPS: tl.constexpr,
-    COMP_SIZE: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_P: tl.constexpr,
-    GROUP_AGG_METHOD: tl.constexpr,  # 0=mean, 1=max
-):
-    """DC+AC scoring: group-agg per coefficient, then score = DC + lambda * sqrt(sum(AC^2))."""
-    pid_bh = tl.program_id(0)
-    pid_pt = tl.program_id(1)
-
-    h = pid_bh % num_kv_heads
-    b = pid_bh // num_kv_heads
-
-    p_start = pid_pt * BLOCK_P
-    p_offsets = tl.arange(0, BLOCK_P)
-    p_indices = p_start + p_offsets
-    p_mask = p_indices < num_pages
-
-    d_idx = tl.arange(0, BLOCK_D)
-    d_mask = d_idx < head_dim
-
-    q_base = query_ptr + b * q_stride_b + h * q_stride_h
-    ck_base = comp_keys_ptr + b * ck_stride_b + h * ck_stride_h
-
-    g_idx = tl.arange(0, NUM_KV_GROUPS)[:, None]
-
-    dc = tl.zeros([BLOCK_P], dtype=tl.float32)
-    ac_sq = tl.zeros([BLOCK_P], dtype=tl.float32)
-
-    for c in range(COMP_SIZE):
-        k_ptrs = ck_base + p_indices[:, None] * ck_stride_p + c * ck_stride_c + d_idx[None, :]
-        mask_2d = p_mask[:, None] & d_mask[None, :]
-        k = tl.load(k_ptrs, mask=mask_2d, other=0.0).to(tl.float32)
-
-        # Compute per-group dots and group-aggregate for this coefficient
-        group_dots = tl.zeros([NUM_KV_GROUPS, BLOCK_P], dtype=tl.float32)
-        for g in range(NUM_KV_GROUPS):
-            q = tl.load(q_base + g * q_stride_g + d_idx, mask=d_mask, other=0.0).to(tl.float32)
-            q = q * scaling
-            dots = tl.sum(k * q[None, :], axis=1)
-            g_mask = (g_idx == g)
-            group_dots = tl.where(g_mask, dots[None, :], group_dots)
-
-        # Group aggregate for this coefficient
-        if GROUP_AGG_METHOD == 0:
-            coeff_score = tl.sum(group_dots, axis=0) / NUM_KV_GROUPS
-        else:
-            coeff_score = tl.max(group_dots, axis=0)
-
-        # Accumulate DC (c==0) and AC (c>0)
-        if c == 0:
-            dc = coeff_score
-        else:
-            ac_sq += coeff_score * coeff_score
-
-    ac = tl.sqrt(ac_sq)
-    agg_scores = dc + dc_ac_lambda * ac
-
-    out_ptrs = out_scores_ptr + b * os_stride_b + h * os_stride_h + p_indices
-    tl.store(out_ptrs, agg_scores, mask=p_mask)
-
-
 _SCORING_MAP = {"max": 0, "mean": 1, "sum": 2}
 _GROUP_AGG_MAP = {"mean": 0, "max": 1, "topp": 1}
 
@@ -316,32 +232,6 @@ def _score_pages_torch_fallback(
     q = query.to(torch.float32) * (head_dim ** -0.5)
     k = compressed_keys.to(torch.float32)
     group_token_scores = torch.einsum("bhgd,bhpcd->bhgpc", q, k)
-
-    # DC+AC scoring: group-aggregate per coefficient FIRST, then DC + lambda * AC
-    from dct_page_attention import _parse_dc_ac_scoring_method
-    dc_ac_parsed = _parse_dc_ac_scoring_method(scoring_method)
-    if dc_ac_parsed is not None:
-        _, dc_ac_lambda, _ = dc_ac_parsed
-        # group_token_scores: [bsz, kv_heads, groups, pages, comp_size]
-        if group_agg_method == "mean":
-            coeff_scores = group_token_scores.mean(dim=2)
-        elif group_agg_method == "max":
-            coeff_scores = group_token_scores.max(dim=2).values
-        elif group_agg_method == "topp":
-            k_top = min(2, num_kv_groups)
-            coeff_scores = group_token_scores.topk(k_top, dim=2).values.mean(dim=2)
-        else:
-            raise ValueError(f"Unsupported group_agg_method: {group_agg_method}")
-        # coeff_scores: [bsz, kv_heads, pages, comp_size]
-        dc = coeff_scores[..., 0]
-        ac = coeff_scores[..., 1:].pow(2).sum(-1).sqrt()
-        page_scores = dc + dc_ac_lambda * ac
-
-        if out is not None:
-            out_view = out[:, :, :num_pages]
-            out_view.copy_(page_scores)
-            return out_view
-        return page_scores.contiguous()
 
     if scoring_method == "max":
         group_page_scores = group_token_scores.max(dim=-1).values
@@ -434,32 +324,6 @@ def score_pages_triton(
             num_kv_groups,
             out=out,
         )
-
-    # DC+AC scoring: dispatch to dedicated kernel
-    from dct_page_attention import _parse_dc_ac_scoring_method
-    dc_ac_parsed = _parse_dc_ac_scoring_method(scoring_method)
-    if dc_ac_parsed is not None:
-        _, dc_ac_lambda, _ = dc_ac_parsed
-        GROUP_AGG = _GROUP_AGG_MAP[group_agg_method]
-        BLOCK_P = 32
-        num_page_tiles = (num_pages + BLOCK_P - 1) // BLOCK_P
-        grid = (bsz * num_kv_heads, num_page_tiles)
-        with torch.cuda.device(query.device):
-            _score_pages_dc_ac_kernel[grid](
-                query, compressed_keys, page_scores,
-                q_stride_0, q_stride_1, q_stride_2,
-                ck_stride_0, ck_stride_1, ck_stride_2, ck_stride_3,
-                ps_stride_0, ps_stride_bh,
-                num_kv_heads, num_pages, head_dim,
-                scaling,
-                dc_ac_lambda,
-                NUM_KV_GROUPS=num_kv_groups,
-                COMP_SIZE=comp_size,
-                BLOCK_D=BLOCK_D,
-                BLOCK_P=BLOCK_P,
-                GROUP_AGG_METHOD=GROUP_AGG,
-            )
-        return page_scores
 
     SCORING = _SCORING_MAP[scoring_method]
     GROUP_AGG = _GROUP_AGG_MAP[group_agg_method]
@@ -635,311 +499,7 @@ def topk_sort_triton(
 
 
 # ---------------------------------------------------------------------------
-# Kernel 2: Fused Assemble + K-RoPE + sink/recent
-# ---------------------------------------------------------------------------
-@triton.jit
-def _assemble_kv_full_kernel(
-    # --- K/V source pointers ---
-    paged_k_ptr, comp_k_ptr, sink_k_ptr, recent_k_ptr,
-    paged_v_ptr, comp_v_ptr, sink_v_ptr, recent_v_ptr,
-    # --- output pointers ---
-    out_k_ptr, out_v_ptr,
-    # --- RoPE tables ---
-    cos_ptr, sin_ptr,
-    # --- pre-sorted selected page indices ---
-    sel_indices_ptr,
-    # --- strides for paged [bsz, kv_heads, num_pages, page_size, head_dim] ---
-    paged_stride_b, paged_stride_h, paged_stride_p, paged_stride_t,
-    # --- strides for comp [bsz, kv_heads, num_pages, comp_size, head_dim] ---
-    comp_stride_b, comp_stride_h, comp_stride_p, comp_stride_t,
-    # --- strides for sink [bsz, kv_heads, sink_len, head_dim] ---
-    sink_stride_b, sink_stride_h, sink_stride_t,
-    # --- strides for recent [bsz, kv_heads, recent_len, head_dim] ---
-    recent_stride_b, recent_stride_h, recent_stride_t,
-    # --- strides for output [bsz, kv_heads, total_len, head_dim] ---
-    out_stride_b, out_stride_h, out_stride_t,
-    # --- strides for cos/sin [total_len, head_dim] ---
-    rope_stride_t,
-    # --- strides for sel_indices [bsz, kv_heads, top_k] ---
-    si_stride_b, si_stride_h,
-    # --- runtime dims ---
-    num_kv_heads,
-    num_pages,
-    head_dim,
-    sink_len,
-    recent_len,
-    total_len,
-    # --- compile-time constants ---
-    PAGE_SIZE: tl.constexpr,
-    COMP_SIZE: tl.constexpr,
-    TOP_K: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_T: tl.constexpr,
-    APPLY_ROPE: tl.constexpr,   # 1 = apply K-RoPE, 0 = straight copy
-):
-    """One program per (batch, kv_head, segment, token-tile).
-
-    Segments: 0=sink, 1..num_pages=pages, num_pages+1=recent.
-    Each program:
-      1. Loads pre-sorted selected_indices (TOP_K int32s) from L2
-      2. Copies a [BLOCK_T, head_dim] tile from the correct source
-      3. For K: applies RoPE during store (if APPLY_ROPE)
-      4. For V: straight copy
-    """
-    pid_bhs = tl.program_id(0)   # (batch, head, segment)
-    pid_tile = tl.program_id(1)  # token tile within segment
-
-    num_segments = num_pages + 2
-    seg = pid_bhs % num_segments
-    tmp = pid_bhs // num_segments
-    h = tmp % num_kv_heads
-    b = tmp // num_kv_heads
-
-    # ---- Load pre-sorted selected indices (tiny: TOP_K int32s) ----
-    si_base = sel_indices_ptr + b * si_stride_b + h * si_stride_h
-    k_idx = tl.arange(0, BLOCK_K)
-    k_mask = k_idx < TOP_K
-    sel_indices = tl.load(si_base + k_idx, mask=k_mask, other=2147483647).to(tl.int32)
-
-    # ---- Determine segment type and source ----
-    is_sink = (seg == 0)
-    is_recent = (seg == num_pages + 1)
-    page_idx = seg - 1  # only valid when not sink/recent
-
-    # Check if this page is selected (linear scan over TOP_K elements)
-    is_selected = tl.sum((sel_indices == page_idx).to(tl.int32)) > 0
-    count_before = tl.sum((sel_indices < page_idx).to(tl.int32))
-
-    # Token count and write offset for this segment
-    if is_sink:
-        num_tokens = sink_len
-        write_start = 0
-    elif is_recent:
-        num_tokens = recent_len
-        write_start = total_len - recent_len
-    else:
-        num_tokens = tl.where(is_selected, PAGE_SIZE, COMP_SIZE)
-        write_start = sink_len + page_idx * COMP_SIZE + count_before * (PAGE_SIZE - COMP_SIZE)
-
-    # Early exit for tiles beyond this segment's token count
-    t_start = pid_tile * BLOCK_T
-    if t_start >= num_tokens:
-        return
-
-    # ---- 2D tile indices ----
-    t_idx = tl.arange(0, BLOCK_T)
-    d_idx = tl.arange(0, BLOCK_D)
-    mask = ((t_start + t_idx) < num_tokens)[:, None] & (d_idx < head_dim)[None, :]
-
-    # ---- Destination offsets ----
-    dst_offsets = (write_start + t_start + t_idx)[:, None] * out_stride_t + d_idx[None, :]
-    k_dst = out_k_ptr + b * out_stride_b + h * out_stride_h
-    v_dst = out_v_ptr + b * out_stride_b + h * out_stride_h
-
-    # ---- RoPE setup (precompute outside branches) ----
-    if APPLY_ROPE == 1:
-        out_pos = (write_start + t_start + t_idx)  # [BLOCK_T]
-        half_d = head_dim // 2
-        cos_offsets = out_pos[:, None] * rope_stride_t + d_idx[None, :]
-        cos_vals = tl.load(cos_ptr + cos_offsets, mask=mask, other=0.0).to(tl.float32)
-        sin_vals = tl.load(sin_ptr + cos_offsets, mask=mask, other=0.0).to(tl.float32)
-        d_rot = tl.where(d_idx < half_d, d_idx + half_d, d_idx - half_d)
-        rot_sign = tl.where(d_idx[None, :] < half_d, -1.0, 1.0)
-
-    # ---- Load from source, apply K-RoPE, store ----
-    if is_sink:
-        sk_base = sink_k_ptr + b * sink_stride_b + h * sink_stride_h
-        sv_base = sink_v_ptr + b * sink_stride_b + h * sink_stride_h
-        src_offsets = (t_start + t_idx)[:, None] * sink_stride_t + d_idx[None, :]
-        k_vals = tl.load(sk_base + src_offsets, mask=mask, other=0.0)
-        v_vals = tl.load(sv_base + src_offsets, mask=mask, other=0.0)
-        if APPLY_ROPE == 1:
-            rot_offsets = (t_start + t_idx)[:, None] * sink_stride_t + d_rot[None, :]
-            k_rot_raw = tl.load(sk_base + rot_offsets, mask=mask, other=0.0)
-            k_rotated = rot_sign * k_rot_raw.to(tl.float32)
-            k_vals = (k_vals.to(tl.float32) * cos_vals + k_rotated * sin_vals).to(k_vals.dtype)
-    elif is_recent:
-        rk_base = recent_k_ptr + b * recent_stride_b + h * recent_stride_h
-        rv_base = recent_v_ptr + b * recent_stride_b + h * recent_stride_h
-        src_offsets = (t_start + t_idx)[:, None] * recent_stride_t + d_idx[None, :]
-        k_vals = tl.load(rk_base + src_offsets, mask=mask, other=0.0)
-        v_vals = tl.load(rv_base + src_offsets, mask=mask, other=0.0)
-        if APPLY_ROPE == 1:
-            rot_offsets = (t_start + t_idx)[:, None] * recent_stride_t + d_rot[None, :]
-            k_rot_raw = tl.load(rk_base + rot_offsets, mask=mask, other=0.0)
-            k_rotated = rot_sign * k_rot_raw.to(tl.float32)
-            k_vals = (k_vals.to(tl.float32) * cos_vals + k_rotated * sin_vals).to(k_vals.dtype)
-    elif is_selected:
-        src_off = (b * paged_stride_b + h * paged_stride_h
-                   + page_idx * paged_stride_p + t_start * paged_stride_t)
-        src_offsets = t_idx[:, None] * paged_stride_t + d_idx[None, :]
-        k_vals = tl.load(paged_k_ptr + src_off + src_offsets, mask=mask, other=0.0)
-        v_vals = tl.load(paged_v_ptr + src_off + src_offsets, mask=mask, other=0.0)
-        if APPLY_ROPE == 1:
-            rot_offsets = t_idx[:, None] * paged_stride_t + d_rot[None, :]
-            k_rot_raw = tl.load(paged_k_ptr + src_off + rot_offsets, mask=mask, other=0.0)
-            k_rotated = rot_sign * k_rot_raw.to(tl.float32)
-            k_vals = (k_vals.to(tl.float32) * cos_vals + k_rotated * sin_vals).to(k_vals.dtype)
-    else:
-        src_off = (b * comp_stride_b + h * comp_stride_h
-                   + page_idx * comp_stride_p + t_start * comp_stride_t)
-        src_offsets = t_idx[:, None] * comp_stride_t + d_idx[None, :]
-        k_vals = tl.load(comp_k_ptr + src_off + src_offsets, mask=mask, other=0.0)
-        v_vals = tl.load(comp_v_ptr + src_off + src_offsets, mask=mask, other=0.0)
-        if APPLY_ROPE == 1:
-            rot_offsets = t_idx[:, None] * comp_stride_t + d_rot[None, :]
-            k_rot_raw = tl.load(comp_k_ptr + src_off + rot_offsets, mask=mask, other=0.0)
-            k_rotated = rot_sign * k_rot_raw.to(tl.float32)
-            k_vals = (k_vals.to(tl.float32) * cos_vals + k_rotated * sin_vals).to(k_vals.dtype)
-
-    # Store K (with RoPE if applied above) and V (always straight copy)
-    tl.store(k_dst + dst_offsets, k_vals, mask=mask)
-    tl.store(v_dst + dst_offsets, v_vals, mask=mask)
-
-
-def assemble_kv_full_triton(
-    paged_k: torch.Tensor,
-    paged_v: torch.Tensor,
-    comp_k: torch.Tensor,
-    comp_v: torch.Tensor,
-    sink_k: torch.Tensor,
-    sink_v: torch.Tensor,
-    recent_k: torch.Tensor,
-    recent_v: torch.Tensor,
-    selected_indices: torch.Tensor,
-    cos_table: torch.Tensor = None,
-    sin_table: torch.Tensor = None,
-    out_k: torch.Tensor = None,
-    out_v: torch.Tensor = None,
-    out_sel_idx: torch.Tensor = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused assemble: sink/middle/recent copy + K-RoPE in one kernel.
-
-    TopK is done externally via torch.topk before calling this function.
-
-    Args:
-        paged_k/v:        [bsz, num_kv_heads, num_pages, page_size, head_dim]
-        comp_k/v:         [bsz, num_kv_heads, num_pages, comp_size, head_dim]
-        sink_k/v:         [bsz, num_kv_heads, sink_len, head_dim]
-        recent_k/v:       [bsz, num_kv_heads, recent_len, head_dim]
-        selected_indices: [bsz, num_kv_heads, top_k] (int64, sorted ascending)
-        cos_table:        [total_len, head_dim] (optional, for K-RoPE)
-        sin_table:        [total_len, head_dim] (optional, for K-RoPE)
-        out_k/v:          Pre-allocated output buffers (optional)
-        out_sel_idx:      Pre-allocated int32 index buffer (optional)
-
-    Returns:
-        final_k, final_v: [bsz, num_kv_heads, total_len, head_dim]
-    """
-    bsz, num_kv_heads, num_pages, page_size, head_dim = paged_k.shape
-    comp_size = comp_k.shape[3]
-    sink_len = sink_k.shape[2]
-    recent_len = recent_k.shape[2]
-    top_k = selected_indices.shape[2]
-    num_unselected = num_pages - top_k
-    middle_len = top_k * page_size + num_unselected * comp_size
-    total_len = sink_len + middle_len + recent_len
-
-    # Ensure contiguous (DCT compression can produce transposed tensors)
-    if not comp_k.is_contiguous():
-        comp_k = comp_k.contiguous()
-    if not comp_v.is_contiguous():
-        comp_v = comp_v.contiguous()
-
-    apply_rope = cos_table is not None and sin_table is not None
-    device = paged_k.device
-    dtype = paged_k.dtype
-
-    # Reuse pre-allocated output buffers if provided and large enough
-    if out_k is not None and out_k.shape[2] >= total_len:
-        final_k = out_k[:, :, :total_len, :]
-        final_v = out_v[:, :, :total_len, :]
-    else:
-        final_k = torch.empty(bsz, num_kv_heads, total_len, head_dim,
-                               dtype=dtype, device=device)
-        final_v = torch.empty_like(final_k)
-
-    # Use selected_indices directly if already int32; avoid unnecessary copy
-    if selected_indices.dtype == torch.int32:
-        sel_idx = selected_indices
-    elif out_sel_idx is not None and out_sel_idx.shape[2] >= top_k:
-        sel_idx = out_sel_idx[:, :, :top_k]
-        sel_idx.copy_(selected_indices)
-    else:
-        sel_idx = selected_indices.to(torch.int32)
-
-    # --- Diagnostic: time wrapper vs kernel ---
-    _diag = getattr(assemble_kv_full_triton, '_diag', False)
-    if _diag:
-        _ev_pre = torch.cuda.Event(enable_timing=True)
-        _ev_post = torch.cuda.Event(enable_timing=True)
-        _ev_pre.record()
-
-    BLOCK_D = triton.next_power_of_2(head_dim)
-    BLOCK_T = 32
-
-    # Segments: sink(1) + pages(num_pages) + recent(1)
-    num_segments = num_pages + 2
-    max_seg_len = max(sink_len, page_size, recent_len)
-    num_tiles = (max_seg_len + BLOCK_T - 1) // BLOCK_T
-    grid = (bsz * num_kv_heads * num_segments, num_tiles)
-
-    # RoPE strides (or dummy if not applying)
-    if apply_rope:
-        rope_stride_t = cos_table.stride(0)
-        cos_ptr = cos_table
-        sin_ptr = sin_table
-    else:
-        # Pass dummy pointers and stride
-        cos_ptr = final_k  # won't be accessed
-        sin_ptr = final_k
-        rope_stride_t = 0
-
-    # Ensure correct CUDA device context for Triton kernel launch (multi-GPU)
-    with torch.cuda.device(paged_k.device):
-        _assemble_kv_full_kernel[grid](
-            paged_k, comp_k, sink_k, recent_k,
-            paged_v, comp_v, sink_v, recent_v,
-            final_k, final_v,
-            cos_ptr, sin_ptr,
-            sel_idx,
-            # paged strides
-            paged_k.stride(0), paged_k.stride(1), paged_k.stride(2), paged_k.stride(3),
-            # comp strides
-            comp_k.stride(0), comp_k.stride(1), comp_k.stride(2), comp_k.stride(3),
-            # sink strides
-            sink_k.stride(0), sink_k.stride(1), sink_k.stride(2),
-            # recent strides
-            recent_k.stride(0), recent_k.stride(1), recent_k.stride(2),
-            # output strides
-            final_k.stride(0), final_k.stride(1), final_k.stride(2),
-            # rope stride
-            rope_stride_t,
-            # sel_indices strides
-            sel_idx.stride(0), sel_idx.stride(1),
-            # runtime dims
-            num_kv_heads, num_pages, head_dim,
-            sink_len, recent_len, total_len,
-            # constexprs
-            PAGE_SIZE=page_size, COMP_SIZE=comp_size, TOP_K=top_k,
-            BLOCK_K=triton.next_power_of_2(top_k),
-            BLOCK_D=BLOCK_D, BLOCK_T=BLOCK_T,
-            APPLY_ROPE=1 if apply_rope else 0,
-        )
-
-    if _diag:
-        _ev_post.record()
-        # Deferred: don't synchronize here — collect events for later
-        _diag_events = getattr(assemble_kv_full_triton, '_diag_events', [])
-        _diag_events.append((_ev_pre, _ev_post))
-        assemble_kv_full_triton._diag_events = _diag_events
-
-    return final_k, final_v
-
-
-# ---------------------------------------------------------------------------
-# Kernel 2b: Copy sink + selected pages + recent (pure Triton, no PyTorch mixing)
+# Kernel 2a: Copy sink + selected pages + recent (+ fused Q-RoPE)
 # ---------------------------------------------------------------------------
 @triton.jit
 def _copy_full_segments_kernel(
@@ -1124,7 +684,7 @@ def _copy_full_segments_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Kernel 2c: Copy unselected compressed pages (batched: multiple pages per program)
+# Kernel 2b: Copy unselected compressed pages (batched: multiple pages per program)
 # ---------------------------------------------------------------------------
 @triton.jit
 def _copy_unselected_pages_kernel(
@@ -1259,12 +819,11 @@ def assemble_kv_split_triton(
     q_rope_cos: torch.Tensor = None,
     q_rope_sin: torch.Tensor = None,
     q_rope_buf: torch.Tensor = None,
-    cached_params: dict = None,
     stride_cache: dict = None,
     bias_out: torch.Tensor = None,
     log_pop_weight: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Assemble KV using split kernels. Same API as assemble_kv_full_triton.
+    """Assemble KV using split kernels.
 
     Kernel A: sink + selected pages + recent (all inside Triton)
     Kernel B: unselected compressed pages (branch-free)
@@ -1273,24 +832,10 @@ def assemble_kv_split_triton(
     Optional pre-allocated buffers (out_k, out_v, out_sel_idx) can be passed
     to avoid per-step memory allocation.
 
-    If cached_params is provided, skips all Python overhead (shape lookups,
-    stride computations, grid calculations) and launches kernels directly.
-    Use build_assemble_cache() to create the cache on first call.
-
     If stride_cache is provided, skips stride computations but recomputes
     shape-dependent values (num_pages, total_len, grids) each call.
     Use build_assemble_stride_cache() to create. Safe with changing seq lengths.
     """
-    if cached_params is not None:
-        return _assemble_kv_split_cached(
-            paged_k, paged_v, comp_k, comp_v,
-            sink_k, sink_v, recent_k, recent_v,
-            selected_indices, cos_table, sin_table,
-            out_k, out_v, query_states, q_rope_cos, q_rope_sin, q_rope_buf,
-            cached_params,
-            bias_out=bias_out, log_pop_weight=log_pop_weight,
-        )
-
     if stride_cache is not None:
         return _assemble_kv_split_stride_cached(
             paged_k, paged_v, comp_k, comp_v,
@@ -1451,9 +996,8 @@ def build_assemble_stride_cache(
 ):
     """Precompute tensor strides and fixed constants only.
 
-    Unlike build_assemble_cache(), this does NOT cache shape-dependent values
-    (num_pages, total_len, grids) that change as sequence length grows.
-    Safe to reuse across all decode steps.
+    Shape-dependent values (num_pages, total_len, grids) are recomputed
+    each call, so this cache is safe to reuse across all decode steps.
     """
     bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
     comp_size = comp_k.shape[3]
@@ -1613,293 +1157,9 @@ def _assemble_kv_split_stride_cached(
     return final_k, final_v
 
 
-def build_assemble_cache(
-    paged_k, comp_k, sink_k, recent_k, selected_indices,
-    cos_table, out_k, out_v, query_states=None,
-):
-    """Precompute all strides, grid dims, and constants for assemble_kv_split_triton.
-
-    Call once when shapes are known (first decode step). Pass the returned dict
-    as cached_params= on all subsequent calls to skip Python overhead.
-    """
-    bsz, num_kv_heads, num_pages, page_size, head_dim = paged_k.shape
-    comp_size = comp_k.shape[3]
-    sink_len = sink_k.shape[2]
-    recent_len = recent_k.shape[2]
-    top_k = selected_indices.shape[2]
-    num_unselected = num_pages - top_k
-    middle_len = top_k * page_size + num_unselected * comp_size
-    total_len = sink_len + middle_len + recent_len
-
-    BLOCK_D = triton.next_power_of_2(head_dim)
-    BLOCK_T_FULL = min(128, max(64, triton.next_power_of_2(page_size)))
-    sink_tiles = (sink_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
-    page_tiles = (page_size + BLOCK_T_FULL - 1) // BLOCK_T_FULL
-    recent_tiles = (recent_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
-    tiles_per_head = sink_tiles + top_k * page_tiles + recent_tiles
-    BLOCK_T_COMP = max(triton.next_power_of_2(comp_size), 4)
-    PAGES_PER_PROG = 16
-    num_groups = (num_pages + PAGES_PER_PROG - 1) // PAGES_PER_PROG
-
-    apply_rope = cos_table is not None
-    rope_stride_t = cos_table.stride(0) if apply_rope else 0
-
-    fuse_q_rope = query_states is not None
-    num_q_heads = query_states.shape[1] if fuse_q_rope else 0
-    q_stride_h = head_dim if fuse_q_rope else 0  # contiguous view stride
-
-    return {
-        # Device
-        'device': paged_k.device,
-        # Shapes
-        'bsz': bsz, 'num_kv_heads': num_kv_heads, 'num_pages': num_pages,
-        'page_size': page_size, 'head_dim': head_dim, 'comp_size': comp_size,
-        'sink_len': sink_len, 'recent_len': recent_len, 'top_k': top_k,
-        'num_unselected': num_unselected, 'total_len': total_len,
-        # Strides (these don't change if tensor shapes/layout are fixed)
-        'paged_strides': (paged_k.stride(0), paged_k.stride(1), paged_k.stride(2), paged_k.stride(3)),
-        'sink_strides': (sink_k.stride(0), sink_k.stride(1), sink_k.stride(2)),
-        'recent_strides': (recent_k.stride(0), recent_k.stride(1), recent_k.stride(2)),
-        'out_strides': (out_k.stride(0), out_k.stride(1), out_k.stride(2)),
-        # comp_strides NOT cached — comp_k from torch.cat changes strides every step
-        'sel_strides': (selected_indices.stride(0), selected_indices.stride(1)),
-        'rope_stride_t': rope_stride_t,
-        'q_stride_h': q_stride_h,
-        # Grid dims
-        'grid_full': (bsz * num_kv_heads, tiles_per_head),
-        'grid_comp': (bsz * num_kv_heads * num_groups,),
-        'num_groups': num_groups,
-        # Constexprs
-        'BLOCK_D': BLOCK_D, 'BLOCK_T_FULL': BLOCK_T_FULL,
-        'BLOCK_T_COMP': BLOCK_T_COMP, 'PAGES_PER_PROG': PAGES_PER_PROG,
-        'APPLY_ROPE': 1 if apply_rope else 0,
-        'FUSE_Q_ROPE': 1 if fuse_q_rope else 0,
-        'NUM_Q_HEADS': num_q_heads,
-        # Flags
-        'fuse_q_rope': fuse_q_rope,
-    }
-
-
-def _assemble_kv_split_cached(
-    paged_k, paged_v, comp_k, comp_v,
-    sink_k, sink_v, recent_k, recent_v,
-    selected_indices, cos_table, sin_table,
-    out_k, out_v, query_states, q_rope_cos, q_rope_sin, q_rope_buf,
-    c,
-    bias_out=None, log_pop_weight=0.0,
-):
-    """Fast path: launch kernels using precomputed params. Minimal Python overhead."""
-    total_len = c['total_len']
-    head_dim = c['head_dim']
-
-    final_k = out_k[:, :, :total_len, :]
-    final_v = out_v[:, :, :total_len, :]
-    sel_idx = selected_indices  # assumed int32 from caller
-
-    cos_ptr = cos_table if cos_table is not None else final_k
-    sin_ptr = sin_table if sin_table is not None else final_k
-
-    if c['fuse_q_rope']:
-        q_flat = query_states.view(-1, head_dim)
-        q_out_flat = q_rope_buf.view(-1, head_dim)
-    else:
-        q_flat = final_k
-        q_out_flat = final_k
-        q_rope_cos = final_k
-        q_rope_sin = final_k
-
-    ps = c['paged_strides']
-    ss = c['sink_strides']
-    rs = c['recent_strides']
-    os = c['out_strides']
-    cs = (comp_k.stride(0), comp_k.stride(1), comp_k.stride(2), comp_k.stride(3))
-    si = c['sel_strides']
-
-    # Ensure correct CUDA device context for Triton kernel launch (multi-GPU)
-    with torch.cuda.device(c['device']):
-        # Kernel A
-        _copy_full_segments_kernel[c['grid_full']](
-            paged_k, paged_v,
-            sink_k, sink_v,
-            recent_k, recent_v,
-            final_k, final_v,
-            cos_ptr, sin_ptr,
-            sel_idx,
-            q_flat, q_out_flat, q_rope_cos, q_rope_sin,
-            c['q_stride_h'],
-            ps[0], ps[1], ps[2], ps[3],
-            ss[0], ss[1], ss[2],
-            rs[0], rs[1], rs[2],
-            os[0], os[1], os[2],
-            c['rope_stride_t'],
-            si[0], si[1],
-            c['num_kv_heads'], c['num_pages'], c['top_k'], head_dim, c['sink_len'], c['recent_len'], total_len,
-            COMP_SIZE=c['comp_size'], PAGE_SIZE=c['page_size'],
-            BLOCK_D=c['BLOCK_D'], BLOCK_T=c['BLOCK_T_FULL'],
-            APPLY_ROPE=c['APPLY_ROPE'],
-            ORIGINAL_POS_ROPE=0,
-            FUSE_Q_ROPE=c['FUSE_Q_ROPE'],
-            NUM_Q_HEADS=c['NUM_Q_HEADS'],
-        )
-
-        # Kernel B
-        if c['num_unselected'] > 0:
-            write_bias = 1 if bias_out is not None else 0
-            if write_bias == 1:
-                bs = c.get('bias_strides', (bias_out.stride(0), bias_out.stride(1), bias_out.stride(2)))
-                bias_ptr = bias_out
-            else:
-                bs = (0, 0, 0)
-                bias_ptr = final_k  # dummy, not accessed
-            _copy_unselected_pages_kernel[c['grid_comp']](
-                comp_k, comp_v, final_k, final_v,
-                cos_ptr, sin_ptr,
-                sel_idx,
-                bias_ptr,
-                cs[0], cs[1], cs[2], cs[3],
-                os[0], os[1], os[2],
-                c['rope_stride_t'],
-                si[0], si[1],
-                bs[0], bs[1], bs[2],
-                c['num_kv_heads'], c['num_pages'], head_dim, c['sink_len'], c['num_groups'],
-                COMP_SIZE=c['comp_size'], PAGE_SIZE=c['page_size'], TOP_K=c['top_k'],
-                BLOCK_K=triton.next_power_of_2(c['top_k']),
-                PAGES_PER_PROG=c['PAGES_PER_PROG'],
-                BLOCK_D=c['BLOCK_D'], BLOCK_T=c['BLOCK_T_COMP'],
-                APPLY_ROPE=c['APPLY_ROPE'],
-                WRITE_BIAS=write_bias,
-                LOG_POP_WEIGHT=float(log_pop_weight),
-            )
-
-    if c['fuse_q_rope']:
-        return final_k, final_v, q_rope_buf
-    return final_k, final_v
-
-
 # ---------------------------------------------------------------------------
 # Wrapper: Drop-mode assemble (Kernel A only, COMP_SIZE=0)
 # ---------------------------------------------------------------------------
-def build_assemble_drop_stride_cache(
-    paged_k,
-    sink_k,
-    recent_k,
-    selected_indices,
-    out_k,
-    cos_table=None,
-    original_position_rope=False,
-):
-    """Precompute tensor strides and fixed constants for drop-mode assembly."""
-    bsz, num_kv_heads, _, page_size, head_dim = paged_k.shape
-    sink_len = sink_k.shape[2]
-
-    BLOCK_D = triton.next_power_of_2(head_dim)
-    BLOCK_T_FULL = min(128, max(64, triton.next_power_of_2(page_size)))
-    sink_tiles = (sink_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
-    page_tiles = (page_size + BLOCK_T_FULL - 1) // BLOCK_T_FULL
-
-    apply_rope = cos_table is not None
-    rope_stride_t = cos_table.stride(0) if apply_rope else 0
-
-    return {
-        "device": paged_k.device,
-        "bsz": bsz,
-        "num_kv_heads": num_kv_heads,
-        "page_size": page_size,
-        "head_dim": head_dim,
-        "sink_len": sink_len,
-        "paged_strides": (
-            paged_k.stride(0),
-            paged_k.stride(1),
-            paged_k.stride(2),
-            paged_k.stride(3),
-        ),
-        "sink_strides": (sink_k.stride(0), sink_k.stride(1), sink_k.stride(2)),
-        "recent_strides": (recent_k.stride(0), recent_k.stride(1), recent_k.stride(2)),
-        "out_strides": (out_k.stride(0), out_k.stride(1), out_k.stride(2)),
-        "sel_strides": (selected_indices.stride(0), selected_indices.stride(1)),
-        "rope_stride_t": rope_stride_t,
-        "BLOCK_D": BLOCK_D,
-        "BLOCK_T_FULL": BLOCK_T_FULL,
-        "sink_tiles": sink_tiles,
-        "page_tiles": page_tiles,
-        "APPLY_ROPE": 1 if apply_rope else 0,
-        "ORIGINAL_POS_ROPE": 1 if original_position_rope else 0,
-    }
-
-
-def _assemble_kv_drop_stride_cached(
-    paged_k,
-    paged_v,
-    sink_k,
-    sink_v,
-    recent_k,
-    recent_v,
-    selected_indices,
-    cos_table,
-    sin_table,
-    out_k,
-    out_v,
-    out_sel_idx,
-    num_pages,
-    c,
-):
-    """Fast path using cached strides for drop-mode assembly."""
-    recent_len = recent_k.shape[2]
-    top_k = selected_indices.shape[2]
-    total_len = c["sink_len"] + top_k * c["page_size"] + recent_len
-
-    final_k = out_k[:, :, :total_len, :]
-    final_v = out_v[:, :, :total_len, :]
-
-    if selected_indices.dtype == torch.int32:
-        sel_idx = selected_indices
-    elif out_sel_idx is not None and out_sel_idx.shape[2] >= top_k:
-        sel_idx = out_sel_idx[:, :, :top_k]
-        sel_idx.copy_(selected_indices)
-    else:
-        sel_idx = selected_indices.to(torch.int32)
-
-    ps = c["paged_strides"]
-    ss = c["sink_strides"]
-    rs = c["recent_strides"]
-    os = c["out_strides"]
-    si = c["sel_strides"]
-
-    cos_ptr = cos_table if cos_table is not None else final_k
-    sin_ptr = sin_table if sin_table is not None else final_k
-
-    recent_tiles = (recent_len + c["BLOCK_T_FULL"] - 1) // c["BLOCK_T_FULL"]
-    tiles_per_head = c["sink_tiles"] + top_k * c["page_tiles"] + recent_tiles
-    grid_full = (c["bsz"] * c["num_kv_heads"], tiles_per_head)
-
-    with torch.cuda.device(c["device"]):
-        _copy_full_segments_kernel[grid_full](
-            paged_k, paged_v,
-            sink_k, sink_v,
-            recent_k, recent_v,
-            final_k, final_v,
-            cos_ptr, sin_ptr,
-            sel_idx,
-            final_k, final_k, final_k, final_k,
-            0,
-            ps[0], ps[1], ps[2], ps[3],
-            ss[0], ss[1], ss[2],
-            rs[0], rs[1], rs[2],
-            os[0], os[1], os[2],
-            c["rope_stride_t"],
-            si[0], si[1],
-            c["num_kv_heads"], num_pages, top_k, c["head_dim"], c["sink_len"], recent_len, total_len,
-            COMP_SIZE=0, PAGE_SIZE=c["page_size"],
-            BLOCK_D=c["BLOCK_D"], BLOCK_T=c["BLOCK_T_FULL"],
-            APPLY_ROPE=c["APPLY_ROPE"],
-            ORIGINAL_POS_ROPE=c["ORIGINAL_POS_ROPE"],
-            FUSE_Q_ROPE=0,
-            NUM_Q_HEADS=0,
-        )
-
-    return final_k, final_v
-
-
 def assemble_kv_drop_triton(
     paged_k: torch.Tensor,
     paged_v: torch.Tensor,
@@ -1913,7 +1173,6 @@ def assemble_kv_drop_triton(
     out_k: torch.Tensor = None,
     out_v: torch.Tensor = None,
     out_sel_idx: torch.Tensor = None,
-    stride_cache: dict = None,
     num_pages: int = None,
     original_position_rope: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1934,24 +1193,6 @@ def assemble_kv_drop_triton(
     apply_rope = cos_table is not None and sin_table is not None
     device = paged_k.device
     dtype = paged_k.dtype
-
-    if stride_cache is not None:
-        return _assemble_kv_drop_stride_cached(
-            paged_k,
-            paged_v,
-            sink_k,
-            sink_v,
-            recent_k,
-            recent_v,
-            selected_indices,
-            cos_table,
-            sin_table,
-            out_k,
-            out_v,
-            out_sel_idx,
-            num_pages,
-            stride_cache,
-        )
 
     if out_k is not None and out_k.shape[2] >= total_len:
         final_k = out_k[:, :, :total_len, :]
@@ -2050,47 +1291,6 @@ def _apply_rope_q_kernel(
     tl.store(out_base + d_idx, out.to(tl.bfloat16), mask=d_mask)
 
 
-def apply_rope_q_triton(
-    query: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> torch.Tensor:
-    """Apply RoPE to decode query [bsz, num_heads, 1, head_dim].
-
-    Args:
-        query: [bsz, num_heads, 1, head_dim]
-        cos:   [1, 1, 1, head_dim]
-        sin:   [1, 1, 1, head_dim]
-
-    Returns:
-        query_roped: [bsz, num_heads, 1, head_dim]
-    """
-    bsz, num_heads, _, head_dim = query.shape
-    out = torch.empty_like(query)
-
-    BLOCK_D = triton.next_power_of_2(head_dim)
-
-    # Flatten cos/sin to [head_dim]
-    cos_flat = cos.view(-1)[:head_dim].contiguous()
-    sin_flat = sin.view(-1)[:head_dim].contiguous()
-
-    # query is [bsz, num_heads, 1, head_dim] — stride over heads
-    q_flat = query.view(bsz * num_heads, head_dim)
-    o_flat = out.view(bsz * num_heads, head_dim)
-
-    # Ensure correct CUDA device context for Triton kernel launch (multi-GPU)
-    with torch.cuda.device(query.device):
-        grid = (bsz * num_heads,)
-        _apply_rope_q_kernel[grid](
-            q_flat, cos_flat, sin_flat, o_flat,
-            q_flat.stride(0),
-            head_dim,
-            BLOCK_D=BLOCK_D,
-        )
-
-    return out
-
-
 def apply_rope_q_direct(
     query: torch.Tensor,
     cos_flat: torch.Tensor,
@@ -2099,9 +1299,9 @@ def apply_rope_q_direct(
 ) -> torch.Tensor:
     """Apply RoPE to decode query — zero-overhead wrapper.
 
-    Unlike apply_rope_q_triton, this expects pre-flattened cos/sin
-    and a pre-allocated output buffer to avoid .contiguous() copies
-    and torch.empty_like allocation on every call.
+    Expects pre-flattened cos/sin and a pre-allocated output buffer
+    to avoid .contiguous() copies and torch.empty_like allocation on
+    every call.
 
     Args:
         query:    [bsz, num_heads, 1, head_dim]

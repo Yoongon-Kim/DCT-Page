@@ -2,7 +2,7 @@
 """
 Run RULER oracle-selection upper-bound sweeps and summarize results.
 
-This orchestrates flat per-page-size runs built on run_ruler_eval.py.
+This orchestrates flat per-page-size runs built on oracle_ruler.py.
 """
 
 from __future__ import annotations
@@ -199,10 +199,10 @@ def write_summary_files(run_root: Path, rows: list[dict]) -> None:
 
 def main() -> None:
     args = parse_args()
-    # Sibling script lives next to us in oracle/, but the child run_ruler_eval.py
+    # Sibling script lives next to us in oracle/, but the child oracle_ruler.py
     # expects to be invoked with cwd at the project root so its relative data
     # paths resolve correctly.
-    script_path = Path(__file__).resolve().parent / "run_ruler_eval.py"
+    script_path = Path(__file__).resolve().parent / "oracle_ruler.py"
     repo_root = Path(__file__).resolve().parent.parent
     page_sizes = parse_csv_ints(args.page_sizes)
     tasks = resolve_tasks(args.tasks)

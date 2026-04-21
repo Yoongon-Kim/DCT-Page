@@ -38,11 +38,18 @@ def model_family(model_name):
     return model_name.split("/")[-1].lower()
 
 
-def load_model_and_tokenizer(model_name, attn_implementation="sdpa"):
+def load_model_and_tokenizer(model_name, attn_implementation="sdpa", use_legacy_dtype_kwarg=False):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # Old transformers envs (duo_attention) only accept torch_dtype=;
+    # transformers 5.x (main DCT-Page env) only accepts dtype=.
+    dtype_kwarg = (
+        {"torch_dtype": torch.bfloat16}
+        if use_legacy_dtype_kwarg
+        else {"dtype": torch.bfloat16}
+    )
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16,
+        **dtype_kwarg,
         device_map="auto",
         attn_implementation=attn_implementation,
     )
@@ -87,11 +94,10 @@ def apply_dct_patch(args, model=None):
         scoring_method=args.scoring_method,
         group_agg_method=args.group_agg_method,
         unselected_mode=args.unselected_mode,
-        compression_method=args.compression_method,
         compressed_token_rope=args.compressed_token_rope,
         continuous_rope=args.continuous_rope,
         use_triton=not getattr(args, 'no_triton', False),
-        weight_compressed_by_population=getattr(args, 'weight_compressed_by_population', False),
+        weight_compressed_by_population=True,
     )
     if "llama" in args.model.lower():
         import transformers
@@ -321,17 +327,14 @@ def parse_args():
     dct.add_argument("--recent_size", type=int, default=128)
     dct.add_argument("--compress_ratio", type=float, default=0.03125)
     dct.add_argument("--scoring_method", default="max",
-                     help="'mean'|'max'|'sum'|'proxy_dc_ac_{lam}'|'spread_dc_ac_{lam}'")
+                     choices=["mean", "max"])
     dct.add_argument("--group_agg_method", default="mean",
-                     choices=["mean", "max", "meanmax", "top2mean", "topp"])
+                     choices=["mean", "max"])
     dct.add_argument("--unselected_mode", default="drop",
                      choices=["drop", "compressed"])
-    dct.add_argument("--compression_method", default="haar", choices=["haar", "dct"])
     dct.add_argument("--compressed_token_rope", default="mixed", choices=["mixed", "block_center"])
     dct.add_argument("--continuous_rope", action="store_true",
                      help="Temporarily disabled — raises error if used")
-    dct.add_argument("--weight_compressed_by_population", action="store_true",
-                     help="Multipole-style population weighting in compressed mode (no-op for drop mode).")
     dct.add_argument("--no_triton", action="store_true",
                      help="Disable Triton kernels (use pure PyTorch for comparison)")
 
@@ -598,13 +601,16 @@ def main():
             raise ValueError(
                 f"DuoAttention only supports Llama models, got: {args.model}"
             )
-        model, tokenizer = load_model_and_tokenizer(args.model, attn_implementation="eager")
+        # DuoAttention runs in an old transformers env that only accepts torch_dtype=.
+        model, tokenizer = load_model_and_tokenizer(
+            args.model, attn_implementation="eager", use_legacy_dtype_kwarg=True
+        )
 
         # baselines/ is added to sys.path by the eval scripts; do the same here.
         repo_root = Path(__file__).resolve().parent.parent
         sys.path.insert(0, str(repo_root / "baselines"))
-        from duo_attn_baseline import init_duo_attention, assert_llama
-        from duo_attn_baseline.config import DUO_ATTN_CONFIG
+        from duo_attn import init_duo_attention, assert_llama
+        from duo_attn.config import DUO_ATTN_CONFIG
         assert_llama(args.model)
         DUO_ATTN_CONFIG["base_model"] = args.model
         init_duo_attention(model, DUO_ATTN_CONFIG)

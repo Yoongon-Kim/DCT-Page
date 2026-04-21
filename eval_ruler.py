@@ -128,14 +128,11 @@ def parse_args():
     parser.add_argument("--recent_size", type=int, default=128)
     parser.add_argument("--compress_ratio", type=float, default=0.125)
     parser.add_argument("--scoring_method", type=str, default="max",
-                        help="'mean'|'max'|'sum'|'proxy_dc_ac_{lam}'|'spread_dc_ac_{lam}'|'spectral_recon_max'")
+                        choices=["mean", "max"])
     parser.add_argument("--group_agg_method", type=str, default="max",
-                        choices=["mean", "max", "topp"])
+                        choices=["mean", "max"])
     parser.add_argument("--unselected_mode", type=str, default="drop",
                         choices=["drop", "compressed"])
-    parser.add_argument("--compression_method", type=str, default="dct",
-                        choices=["haar", "dct"],
-                        help="Compression method for unselected pages (used when unselected_mode=compressed)")
     parser.add_argument("--compressed_token_rope", type=str, default="mixed",
                         choices=["mixed", "block_center"],
                         help="RoPE handling for compressed tokens. "
@@ -143,14 +140,8 @@ def parse_args():
                              "'block_center': invert RoPE, compress raw keys, re-rotate at block-center positions.")
     parser.add_argument("--continuous_rope", action="store_true",
                         help="Temporarily disabled — raises error if used")
-    parser.add_argument("--weight_compressed_by_population", action="store_true",
-                        help="In compressed mode, scale each unselected-page rep's softmax mass "
-                             "by page_size/comp_size via a log(n) bias on QK logits "
-                             "(multipole-style population weighting). No-op for drop mode.")
     parser.add_argument("--score_use_quest_minmax", action="store_true",
                         help="Use QUEST-style min/max key metadata scoring instead of compressed proxy scoring")
-    parser.add_argument("--max_unselected_compressed", type=int, default=-1,
-                        help="Max unselected pages to keep as compressed KV (-1=all, 0=drop all, N=top-N by score)")
     parser.add_argument("--no_triton", action="store_true")
     parser.add_argument("--comp_kv_quant", type=str, default="none",
                         choices=["none", "fp8_e4m3", "fp8_e5m2", "int8", "int4"],
@@ -310,15 +301,13 @@ def apply_monkey_patch(args):
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
-                compression_method=args.compression_method,
                 compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
-                weight_compressed_by_population=args.weight_compressed_by_population,
+                weight_compressed_by_population=True,
                 comp_kv_quant=args.comp_kv_quant,
                 comp_kv_quant_granularity=args.comp_kv_quant_granularity,
                 score_use_quest_minmax=args.score_use_quest_minmax,
-                max_unselected_compressed=args.max_unselected_compressed,
             )
         elif "qwen3" in model_name_lower:
             from dct_page_attention import replace_qwen3_attn
@@ -331,15 +320,13 @@ def apply_monkey_patch(args):
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
-                compression_method=args.compression_method,
                 compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
-                weight_compressed_by_population=args.weight_compressed_by_population,
+                weight_compressed_by_population=True,
                 comp_kv_quant=args.comp_kv_quant,
                 comp_kv_quant_granularity=args.comp_kv_quant_granularity,
                 score_use_quest_minmax=args.score_use_quest_minmax,
-                max_unselected_compressed=args.max_unselected_compressed,
             )
         else:
             from dct_page_attention import replace_qwen2_attn
@@ -352,15 +339,13 @@ def apply_monkey_patch(args):
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
-                compression_method=args.compression_method,
                 compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
-                weight_compressed_by_population=args.weight_compressed_by_population,
+                weight_compressed_by_population=True,
                 comp_kv_quant=args.comp_kv_quant,
                 comp_kv_quant_granularity=args.comp_kv_quant_granularity,
                 score_use_quest_minmax=args.score_use_quest_minmax,
-                max_unselected_compressed=args.max_unselected_compressed,
             )
     elif args.mode == "multipole_attention":
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "baselines"))
@@ -479,11 +464,11 @@ def load_model_and_tokenizer(args):
         tokenizer = AutoTokenizer.from_pretrained(args.base_model)
         yarn_kwargs = {}
         # InfLLM replaces RoPE with its own RotaryEmbeddingESM and is Llama-only,
-        # so the Qwen3-yarn rope_scaling injection is irrelevant (and the old
+        # so the Qwen3-yarn rope_parameters injection is irrelevant (and the old
         # transformers env it runs in does not accept rope_parameters=).
         if "qwen3" in args.base_model.lower() and args.mode != "inf_llm":
             yarn_kwargs = {
-                "rope_scaling": {
+                "rope_parameters": {
                     "rope_type": "yarn",
                     "rope_theta": 1000000.0,
                     "factor": 4.0,
@@ -502,7 +487,7 @@ def load_model_and_tokenizer(args):
         # strip rope_scaling up front (InfLLM replaces RoPE anyway).
         inf_llm_config_override = {}
         if args.mode == "inf_llm":
-            from inf_llm_baseline import load_llama_config_stripped_rope
+            from inf_llm import load_llama_config_stripped_rope
             inf_llm_config_override["config"] = load_llama_config_stripped_rope(args.base_model)
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
@@ -521,19 +506,19 @@ def load_model_and_tokenizer(args):
             print("Multipole attention layers initialized.")
 
         if args.mode == "duo_attention":
-            from duo_attn_baseline import init_duo_attention, assert_llama
-            from duo_attn_baseline.config import DUO_ATTN_CONFIG
+            from duo_attn import init_duo_attention, assert_llama
+            from duo_attn.config import DUO_ATTN_CONFIG
             assert_llama(args.base_model)
             DUO_ATTN_CONFIG["base_model"] = args.base_model
             init_duo_attention(model, DUO_ATTN_CONFIG)
 
         if args.mode == "inf_llm":
-            from inf_llm_baseline import (
+            from inf_llm import (
                 assert_llama_only,
                 build_inf_llm_generator,
                 init_inf_llm,
             )
-            from inf_llm_baseline.config import INF_LLM_CONFIG
+            from inf_llm.config import INF_LLM_CONFIG
             assert_llama_only(args.base_model)
             INF_LLM_CONFIG["base_model"] = args.base_model
             INF_LLM_CONFIG["n_init"] = args.inf_llm_n_init
@@ -600,7 +585,7 @@ def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
                     # DuoAttention's v4.34 tuple-cache forward is incompatible
                     # with transformers>=4.37 generate()'s DynamicCache. Use a
                     # manual greedy loop matching duo-attention/eval/LongBench/pred.py.
-                    from duo_attn_baseline import duo_generate_greedy
+                    from duo_attn import duo_generate_greedy
                     _eos = model.generation_config.eos_token_id
                     eos_ids = _eos if isinstance(_eos, (list, tuple)) else [_eos]
                     output_ids = duo_generate_greedy(

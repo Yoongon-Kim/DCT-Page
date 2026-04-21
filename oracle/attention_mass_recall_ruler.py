@@ -121,8 +121,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -134,15 +136,49 @@ if str(_REPO_ROOT) not in sys.path:
 
 import torch
 import torch.nn.functional as F
+import yaml
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from eval_ruler import infer_model_family
-from oracle.compare_proxy_oracle_slices import (
-    ALL_TASKS,
-    _indices_to_mask,
-    load_task_configs,
-)
+
+
+ALL_TASKS = [
+    "niah_single_1", "niah_single_2", "niah_single_3",
+    "niah_multikey_1", "niah_multikey_2", "niah_multikey_3",
+    "niah_multivalue", "niah_multiquery",
+    "vt", "cwe", "fwe", "qa_1", "qa_2",
+]
+
+
+def _indices_to_mask(indices: torch.Tensor, num_pages: int) -> torch.Tensor:
+    """indices: [..., M] → bool mask [..., num_pages]."""
+    shape = list(indices.shape[:-1]) + [num_pages]
+    mask = torch.zeros(shape, dtype=torch.bool, device=indices.device)
+    mask.scatter_(-1, indices.long(), True)
+    return mask
+
+
+def load_task_configs() -> dict[str, dict]:
+    ruler_dir = str(_REPO_ROOT / "benchmark" / "eval_ruler")
+    sys.path.insert(0, os.path.join(ruler_dir, "data"))
+    data_constants = importlib.import_module("synthetic.constants")
+    data_tasks = data_constants.TASKS
+    if "synthetic.constants" in sys.modules:
+        del sys.modules["synthetic.constants"]
+    sys.path.insert(0, os.path.join(ruler_dir, "eval"))
+    eval_constants = importlib.import_module("synthetic.constants")
+    eval_tasks = eval_constants.TASKS
+    with open(os.path.join(ruler_dir, "synthetic.yaml"), "r") as f:
+        yaml_tasks = yaml.safe_load(f)
+    configs = {}
+    for task_name, yaml_cfg in yaml_tasks.items():
+        base_task = yaml_cfg["task"]
+        cfg = dict(yaml_cfg)
+        cfg.update(data_tasks[base_task])
+        cfg.update(eval_tasks[base_task])
+        configs[task_name] = cfg
+    return configs
 
 # Dense recording forward + model helpers live in the Quest sibling script.
 # Imported lazily at call sites to avoid a circular import (that module
@@ -264,24 +300,24 @@ def compute_per_page_mass(
     )
 
 
-_dct_proj_cache: dict[tuple[int, int, str, torch.device, torch.dtype], torch.Tensor] = {}
+_dct_proj_cache: dict[tuple[int, int, torch.device, torch.dtype], torch.Tensor] = {}
 
 
 def _get_dct_lowpass_projection_matrix(
-    page_size: int, comp_size: int, layout: str,
+    page_size: int, comp_size: int,
     device: torch.device, dtype: torch.dtype,
 ) -> torch.Tensor:
     """Return the [comp_size, page_size] DCT → lowpass truncate → IDCT →
     energy-correction projection matrix, matching DCT-Page's default pipeline.
 
     Built by ``_build_dct_projection_matrix`` in ``dct_page_attention.py``
-    (imported lazily). Cached per (shape, layout, device, dtype).
+    (imported lazily). Cached per (shape, device, dtype).
     """
-    key = (page_size, comp_size, layout, device, dtype)
+    key = (page_size, comp_size, device, dtype)
     M = _dct_proj_cache.get(key)
     if M is None:
         from dct_page_attention import _build_dct_projection_matrix
-        M = _build_dct_projection_matrix(page_size, comp_size, device, dtype, layout)
+        M = _build_dct_projection_matrix(page_size, comp_size, device, dtype)
         _dct_proj_cache[key] = M
     return M
 
@@ -293,21 +329,20 @@ def compute_dct_lowpass_proxy_scores(
     num_kv_groups: int,
     group_agg_method: str,
     scoring_method: str,
-    proxy_frequency_layout: str = "low",
     comp_kv_quant: str = "none",
     comp_kv_quant_granularity: str = "per_page",
 ) -> torch.Tensor:
     """DCT → lowpass truncate → IDCT → energy-correction proxy page scores,
-    matching the default ``eval_ruler.py`` pipeline (compression_method="dct",
-    proxy_frequency_layout="low").
+    matching the default ``eval_ruler.py`` pipeline.
 
     For each page p of S tokens, apply the DCT-Page projection matrix
     ``M ∈ R^{comp_size × S}`` that bakes in the full DCT-lowpass-IDCT with
     ``√(comp_size/S)`` energy correction:
         comp_k[p, c, :] = Σ_s M[c, s] · paged_k[p, s, :]
-    Optionally fake-quantize comp_k to simulate low-precision compressed-KV
-    storage (``_fake_quantize_comp`` from ``dct_page_attention.py``), then
-    score = reduce_c (q[h] · comp_k[p, c]) / √d, GQA group-aggregated.
+    Optionally quantize→dequantize comp_k to simulate low-precision compressed-KV
+    storage (``_quantize_for_storage`` + ``_dequantize_comp`` from
+    ``dct_page_attention.py``), then score = reduce_c (q[h] · comp_k[p, c]) / √d,
+    GQA group-aggregated.
 
     Args:
         query_states: [bsz=1, H_q, 1, d] — post-RoPE / post-QK-norm.
@@ -316,8 +351,6 @@ def compute_dct_lowpass_proxy_scores(
         num_kv_groups: H_q // H_kv.
         group_agg_method: "mean" | "max".
         scoring_method: "max" | "mean" | "sum" over the comp_size axis.
-        proxy_frequency_layout: "low" (default) or other layouts supported
-            by DCT-Page's ``_resolve_frequency_keep_indices``.
         comp_kv_quant: "none" | "fp8_e4m3" | "fp8_e5m2" | "int8" | "int4".
         comp_kv_quant_granularity: "per_page" | "per_comp_token".
 
@@ -331,14 +364,18 @@ def compute_dct_lowpass_proxy_scores(
     scale = 1.0 / math.sqrt(d)
 
     M = _get_dct_lowpass_projection_matrix(
-        S, comp_size, proxy_frequency_layout, paged_k.device, paged_k.dtype,
+        S, comp_size, paged_k.device, paged_k.dtype,
     )                                                                         # [C, S]
     # Project paged_k along the page-size axis: [..., P, S, d] @ M.T -> [..., P, C, d]
     comp_k = torch.einsum("bhpsd,cs->bhpcd", paged_k, M)                      # [1, H_kv, P, C, d]
 
     if comp_kv_quant != "none":
-        from dct_page_attention import _fake_quantize_comp
-        comp_k = _fake_quantize_comp(comp_k, comp_kv_quant, comp_kv_quant_granularity)
+        from dct_page_attention import _quantize_for_storage, _dequantize_comp
+        x_q, scale_q = _quantize_for_storage(comp_k, comp_kv_quant, comp_kv_quant_granularity)
+        comp_k = _dequantize_comp(
+            x_q, scale_q, comp_kv_quant, comp_kv_quant_granularity,
+            comp_k.shape[-1], out_dtype=comp_k.dtype,
+        )
 
     comp_k_q = comp_k.repeat_interleave(num_kv_groups, dim=1).float()         # [1, H_q, P, C, d]
 
@@ -860,7 +897,6 @@ class MassRecallRecorder:
             proxy_scores_gpu = compute_dct_lowpass_proxy_scores(
                 query_states, paged_k, self.comp_size, num_kv_groups,
                 self.group_agg_method, self.scoring_method,
-                proxy_frequency_layout="low",
                 comp_kv_quant=self.comp_kv_quant,
                 comp_kv_quant_granularity=self.comp_kv_quant_granularity,
             )

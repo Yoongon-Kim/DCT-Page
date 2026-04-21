@@ -1,5 +1,5 @@
 torch==2.10.0
-transformers==4.54.1
+transformers==5.2.0
 datasets==4.8.3
 accelerate==1.13.0
 triton==3.6.0

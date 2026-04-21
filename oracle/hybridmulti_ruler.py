@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Evaluate dc_ac or proxy_dc_ac scoring on RULER benchmark.
+Evaluate hybrid_multi scoring on RULER benchmark.
 
-Sweeps over lambda values and optionally (page_size, top_k) combos.
-Each combination is run as a subprocess via oracle/run_ruler_eval.py.
+Sweeps over M (number of AC-energy highlight tokens) and alpha (spectral
+scaling factor), and optionally (page_size, top_k) combos.
+Each combination is run as a subprocess via oracle/oracle_ruler.py.
 
-Scoring methods (selected via --scoring_prefix):
-  - dc_ac (default): uses ALL page_size DCT coefficients for scoring.
-      score = DC + lambda * sqrt(sum(AC[1:]^2))
-  - proxy_dc_ac: uses only the first comp_size DCT coefficients.
-      score = DC + lambda * sqrt(sum(AC[1:comp_size]^2))
+The hybrid_multi{M}_ac_max_a{alpha} scoring method allocates the scoring
+budget as (page_size - M) DCT coefficients + M AC-energy-selected tokens:
+    spectral_max = max_t( sum_{j=1..c_multi} a_j * phi_j(t) )
+    multi_hi     = max_m( Q . K_m )   for top-M AC-energy tokens
+    page_score   = max(alpha * spectral_max, multi_hi)
 
 Modes:
   - drop (default): unselected pages are discarded entirely.
@@ -47,7 +48,8 @@ TASKS = [
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Run RULER evaluation with dc_ac or proxy_dc_ac scoring"
+        description="Run RULER evaluation with hybrid_multi scoring "
+        "(M AC-energy tokens + spectral reconstruction)"
     )
     p.add_argument("--model_name_or_path", default="Qwen/Qwen3-8B")
     p.add_argument("--context_len", type=int, default=32768)
@@ -56,19 +58,24 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("benchmark/data/ruler_data"),
         help="Root dir containing <model_family>/<context_len>/<task>/validation.jsonl. "
-        "Forwarded to run_ruler_eval.py as --data_root.",
+        "Forwarded to oracle_ruler.py as --data_root.",
     )
     p.add_argument(
         "--output_root",
         type=Path,
-        default=None,
-        help="Output root dir. Defaults to results/results_ruler/{scoring_prefix}.",
+        default=Path("results/results_ruler/hybrid_multi"),
     )
     p.add_argument(
-        "--lambdas",
+        "--m_values",
+        nargs="+",
+        default=["1", "2", "3", "4"],
+        help="M values (number of highlight tokens) to sweep.",
+    )
+    p.add_argument(
+        "--alphas",
         nargs="+",
         default=["0.25", "0.5", "1.0", "2.0", "4.0"],
-        help="Lambda values to sweep for dc_ac scoring.",
+        help="Alpha (spectral scaling) values to sweep.",
     )
     p.add_argument(
         "--combos",
@@ -99,9 +106,16 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--weight_pop",
-        default="0",
+        default="1",
         help="Comma-separated 0/1 values to sweep --dct_weight_compressed_by_population. "
         "E.g. '0', '1', or '0,1' to run both. Only effective in compressed mode.",
+    )
+    p.add_argument(
+        "--max_unselected_compressed",
+        type=int,
+        default=-1,
+        help="Max unselected pages contributing compressed tokens "
+        "(-1 = unlimited, 0 = drop all unselected, N = keep top-N by score).",
     )
     p.add_argument(
         "--group_agg_method",
@@ -115,14 +129,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cuda_device", type=int, default=0)
     p.add_argument("--local_files_only", action="store_true")
     p.add_argument("--dry_run", action="store_true")
-    p.add_argument(
-        "--scoring_prefix",
-        type=str,
-        default="dc_ac",
-        choices=["dc_ac", "proxy_dc_ac"],
-        help="'dc_ac' uses all page_size DCT coefficients; "
-             "'proxy_dc_ac' uses only first comp_size coefficients.",
-    )
     return p.parse_args()
 
 
@@ -164,17 +170,20 @@ def make_run_dir(
     output_root: Path,
     page_size: int,
     top_k: int,
-    lam: str,
-    scoring_prefix: str,
+    M: str,
+    alpha: str,
     unselected_mode: str,
     compress_ratio: float = 0.0,
     compression_method: str = "",
     weight_pop: bool = False,
+    max_unselected_compressed: int = -1,
 ) -> Path:
-    name = f"ps{page_size}_topk{top_k}_{scoring_prefix}_{lam}"
+    name = f"ps{page_size}_topk{top_k}_hybrid_multi{M}_ac_max_a{alpha}_cr{compress_ratio}"
     if unselected_mode == "compressed":
         pop_tag = "popw" if weight_pop else "nopopw"
-        name += f"_cr{compress_ratio}_{compression_method}_{pop_tag}"
+        name += f"_{compression_method}_{pop_tag}"
+        if max_unselected_compressed >= 0:
+            name += f"_muc{max_unselected_compressed}"
     run_dir = output_root / name
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
@@ -188,8 +197,8 @@ def build_run_cmd(
     tasks: list[str],
     page_size: int,
     top_k: int,
-    lam: str,
-    scoring_prefix: str,
+    M: str,
+    alpha: str,
     group_agg_method: str,
     unselected_mode: str,
     compress_ratio: float,
@@ -200,7 +209,9 @@ def build_run_cmd(
     max_new_tokens: int,
     cuda_device: int,
     local_files_only: bool,
+    max_unselected_compressed: int = -1,
 ) -> list[str]:
+    scoring_method = f"hybrid_multi{M}_ac_max_a{alpha}"
     cmd = [
         sys.executable,
         str(script_path),
@@ -217,18 +228,22 @@ def build_run_cmd(
         "--dct_top_k", str(top_k),
         "--dct_sink_size", "4",
         "--dct_recent_size", "128",
-        "--dct_scoring_method", f"{scoring_prefix}_{lam}",
+        "--dct_scoring_method", scoring_method,
         "--dct_group_agg_method", group_agg_method,
         "--dct_unselected_mode", unselected_mode,
+        "--dct_compress_ratio", str(compress_ratio),
         "--dct_no_select_with_oracle_page_scores",
     ]
-    cmd.extend(["--dct_compress_ratio", str(compress_ratio)])
     if unselected_mode == "compressed":
-        cmd.extend(["--dct_compression_method", compression_method])
+        cmd.extend([
+            "--dct_compression_method", compression_method,
+        ])
         if compression_method == "dct":
             cmd.append("--dct_score_use_low_proxy")
         if weight_pop:
             cmd.append("--dct_weight_compressed_by_population")
+        if max_unselected_compressed >= 0:
+            cmd.extend(["--dct_max_unselected_compressed", str(max_unselected_compressed)])
     if local_files_only:
         cmd.append("--local_files_only")
     return cmd
@@ -237,7 +252,8 @@ def build_run_cmd(
 def collect_run_summary(
     page_size: int,
     top_k: int,
-    lam: str,
+    M: str,
+    alpha: str,
     run_dir: Path,
     unselected_mode: str,
     compress_ratio: float,
@@ -252,14 +268,15 @@ def collect_run_summary(
             "task": row["task"],
             "page_size": page_size,
             "top_k": top_k,
-            "lambda": lam,
+            "M": M,
+            "alpha": alpha,
+            "compress_ratio": compress_ratio,
             "unselected_mode": unselected_mode,
             "score": float(row["score"]),
             "output_jsonl": row["output_jsonl"],
             "run_dir": str(run_dir),
         }
         if unselected_mode == "compressed":
-            entry["compress_ratio"] = compress_ratio
             entry["compression_method"] = compression_method
             entry["weight_pop"] = int(weight_pop)
         rows.append(entry)
@@ -273,13 +290,15 @@ def write_summary_files(output_root: Path, all_rows: list[dict]) -> None:
             r["page_size"],
             r["unselected_mode"],
             r.get("weight_pop", 0),
-            float(r["lambda"]),
+            float(r["compress_ratio"]),
+            int(r["M"]),
+            float(r["alpha"]),
             TASKS.index(r["task"]),
         ),
     )
 
     fieldnames = [
-        "task", "page_size", "top_k", "lambda", "unselected_mode",
+        "task", "page_size", "top_k", "M", "alpha", "unselected_mode",
         "compress_ratio", "compression_method", "weight_pop",
         "score", "output_jsonl", "run_dir",
     ]
@@ -292,31 +311,32 @@ def write_summary_files(output_root: Path, all_rows: list[dict]) -> None:
     avg_rows = []
     seen = set()
     for r in all_rows:
-        key = (r["page_size"], r["top_k"], r["lambda"],
-               r["unselected_mode"], r.get("weight_pop", 0))
+        key = (r["page_size"], r["top_k"], r["M"], r["alpha"],
+               r["compress_ratio"], r["unselected_mode"], r.get("weight_pop", 0))
         if key in seen:
             continue
         seen.add(key)
         group = [
             x for x in all_rows
-            if (x["page_size"], x["top_k"], x["lambda"],
-                x["unselected_mode"], x.get("weight_pop", 0)) == key
+            if (x["page_size"], x["top_k"], x["M"], x["alpha"],
+                x["compress_ratio"], x["unselected_mode"], x.get("weight_pop", 0)) == key
         ]
         entry = {
             "page_size": r["page_size"],
             "top_k": r["top_k"],
-            "lambda": r["lambda"],
+            "M": r["M"],
+            "alpha": r["alpha"],
+            "compress_ratio": r["compress_ratio"],
             "unselected_mode": r["unselected_mode"],
             "score_avg": sum(x["score"] for x in group) / len(group),
         }
         if r["unselected_mode"] == "compressed":
-            entry["compress_ratio"] = r.get("compress_ratio")
             entry["compression_method"] = r.get("compression_method")
             entry["weight_pop"] = r.get("weight_pop")
         avg_rows.append(entry)
 
     avg_fieldnames = [
-        "page_size", "top_k", "lambda", "unselected_mode",
+        "page_size", "top_k", "M", "alpha", "unselected_mode",
         "compress_ratio", "compression_method", "weight_pop", "score_avg",
     ]
     with (output_root / "summary_avg.tsv").open("w", encoding="utf-8", newline="") as fp:
@@ -333,10 +353,7 @@ def write_summary_files(output_root: Path, all_rows: list[dict]) -> None:
 
 def main() -> None:
     args = parse_args()
-    if args.output_root is None:
-        args.output_root = Path(f"results/results_ruler/{args.scoring_prefix}")
-    scoring_prefix = args.scoring_prefix
-    script_path = Path(__file__).resolve().parent / "run_ruler_eval.py"
+    script_path = Path(__file__).resolve().parent / "oracle_ruler.py"
     repo_root = Path(__file__).resolve().parent.parent
     combos = parse_combos(args.combos)
     tasks = resolve_tasks(args.tasks)
@@ -349,116 +366,123 @@ def main() -> None:
     all_rows: list[dict] = []
 
     for page_size, top_k in combos:
-        for lam in args.lambdas:
-            for weight_pop in weight_pops:
-                run_dir = make_run_dir(
-                    args.output_root, page_size, top_k, lam,
-                    scoring_prefix, args.unselected_mode,
-                    args.compress_ratio, args.compression_method,
-                    weight_pop,
-                )
-
-                mode_tag = args.unselected_mode
-                if args.unselected_mode == "compressed":
-                    pop_str = "popw" if weight_pop else "nopopw"
-                    mode_tag = (
-                        f"compressed cr={args.compress_ratio} "
-                        f"{args.compression_method} {pop_str}"
+        for M in args.m_values:
+            for alpha in args.alphas:
+                for weight_pop in weight_pops:
+                    run_dir = make_run_dir(
+                        args.output_root, page_size, top_k, M, alpha,
+                        args.unselected_mode, args.compress_ratio,
+                        args.compression_method, weight_pop,
+                        args.max_unselected_compressed,
                     )
 
-                if (run_dir / "summary.json").exists():
+                    mode_tag = args.unselected_mode
+                    if args.unselected_mode == "compressed":
+                        pop_str = "popw" if weight_pop else "nopopw"
+                        muc_str = (
+                            f" muc={args.max_unselected_compressed}"
+                            if args.max_unselected_compressed >= 0 else ""
+                        )
+                        mode_tag = (
+                            f"compressed cr={args.compress_ratio} "
+                            f"{args.compression_method} {pop_str}{muc_str}"
+                        )
+
+                    scoring_method = f"hybrid_multi{M}_ac_max_a{alpha}"
+
+                    if (run_dir / "summary.json").exists():
+                        print(
+                            f"\n[hybrid_multi] SKIP page_size={page_size} top_k={top_k} "
+                            f"M={M} alpha={alpha} cr={args.compress_ratio} {mode_tag} "
+                            f"-- summary already exists in {run_dir}",
+                            flush=True,
+                        )
+                        all_rows.extend(collect_run_summary(
+                            page_size, top_k, M, alpha, run_dir,
+                            args.unselected_mode, args.compress_ratio,
+                            args.compression_method, weight_pop,
+                        ))
+                        continue
+
+                    manifest = {
+                        "model_name_or_path": args.model_name_or_path,
+                        "context_len": args.context_len,
+                        "page_size": page_size,
+                        "top_k": top_k,
+                        "M": M,
+                        "alpha": alpha,
+                        "scoring_method": scoring_method,
+                        "group_agg_method": args.group_agg_method,
+                        "compress_ratio": args.compress_ratio,
+                        "unselected_mode": args.unselected_mode,
+                        "num_samples": args.num_samples,
+                        "max_new_tokens": args.max_new_tokens,
+                        "cuda_device": args.cuda_device,
+                        "tasks": tasks,
+                        "note": "Hybrid multi-highlight scoring: M AC-energy tokens + "
+                        f"c=page_size*compress_ratio={int(page_size * args.compress_ratio)} "
+                        "DCT coefficients.",
+                    }
+                    if args.unselected_mode == "compressed":
+                        manifest.update({
+                            "compression_method": args.compression_method,
+                            "weight_compressed_by_population": weight_pop,
+                            "max_unselected_compressed": args.max_unselected_compressed,
+                        })
+                    (run_dir / "manifest.json").write_text(
+                        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+
+                    cmd = build_run_cmd(
+                        script_path=script_path,
+                        model_name_or_path=args.model_name_or_path,
+                        run_dir=run_dir,
+                        context_len=args.context_len,
+                        tasks=tasks,
+                        page_size=page_size,
+                        top_k=top_k,
+                        M=M,
+                        alpha=alpha,
+                        group_agg_method=args.group_agg_method,
+                        unselected_mode=args.unselected_mode,
+                        compress_ratio=args.compress_ratio,
+                        compression_method=args.compression_method,
+                        weight_pop=weight_pop,
+                        data_root=args.data_root,
+                        num_samples=args.num_samples,
+                        max_new_tokens=args.max_new_tokens,
+                        cuda_device=args.cuda_device,
+                        local_files_only=args.local_files_only,
+                        max_unselected_compressed=args.max_unselected_compressed,
+                    )
+                    (run_dir / "command.sh").write_text(
+                        "#!/usr/bin/env bash\nset -euo pipefail\n\n"
+                        + " ".join(shlex.quote(part) for part in cmd)
+                        + "\n",
+                        encoding="utf-8",
+                    )
                     print(
-                        f"\n[{scoring_prefix}] SKIP page_size={page_size} top_k={top_k} "
-                        f"lambda={lam} {mode_tag} "
-                        f"-- summary already exists in {run_dir}",
+                        f"\n[hybrid_multi] page_size={page_size} top_k={top_k} "
+                        f"M={M} alpha={alpha} cr={args.compress_ratio} {mode_tag} -> {run_dir}",
                         flush=True,
                     )
+                    print("  cmd: " + " ".join(shlex.quote(part) for part in cmd), flush=True)
+                    if args.dry_run:
+                        print(f"  Dry run: skipping execution", flush=True)
+                        continue
+                    subprocess.run(cmd, cwd=repo_root, check=True)
                     all_rows.extend(collect_run_summary(
-                        page_size, top_k, lam, run_dir,
+                        page_size, top_k, M, alpha, run_dir,
                         args.unselected_mode, args.compress_ratio,
                         args.compression_method, weight_pop,
                     ))
-                    continue
-
-                manifest = {
-                    "model_name_or_path": args.model_name_or_path,
-                    "context_len": args.context_len,
-                    "page_size": page_size,
-                    "top_k": top_k,
-                    "lambda": lam,
-                    "scoring_method": f"{scoring_prefix}_{lam}",
-                    "group_agg_method": args.group_agg_method,
-                    "unselected_mode": args.unselected_mode,
-                    "num_samples": args.num_samples,
-                    "max_new_tokens": args.max_new_tokens,
-                    "cuda_device": args.cuda_device,
-                    "tasks": tasks,
-                    "note": (
-                        "Full dc_ac scoring: uses all page_size DCT coefficients."
-                        if scoring_prefix == "dc_ac"
-                        else f"Proxy dc_ac scoring: uses first comp_size DCT coefficients "
-                             f"(compress_ratio={args.compress_ratio})."
-                    ),
-                }
-                if args.unselected_mode == "compressed":
-                    manifest.update({
-                        "compress_ratio": args.compress_ratio,
-                        "compression_method": args.compression_method,
-                        "weight_compressed_by_population": weight_pop,
-                    })
-                (run_dir / "manifest.json").write_text(
-                    json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
-                )
-
-                cmd = build_run_cmd(
-                    script_path=script_path,
-                    model_name_or_path=args.model_name_or_path,
-                    run_dir=run_dir,
-                    context_len=args.context_len,
-                    tasks=tasks,
-                    page_size=page_size,
-                    top_k=top_k,
-                    lam=lam,
-                    scoring_prefix=scoring_prefix,
-                    group_agg_method=args.group_agg_method,
-                    unselected_mode=args.unselected_mode,
-                    compress_ratio=args.compress_ratio,
-                    compression_method=args.compression_method,
-                    weight_pop=weight_pop,
-                    data_root=args.data_root,
-                    num_samples=args.num_samples,
-                    max_new_tokens=args.max_new_tokens,
-                    cuda_device=args.cuda_device,
-                    local_files_only=args.local_files_only,
-                )
-                (run_dir / "command.sh").write_text(
-                    "#!/usr/bin/env bash\nset -euo pipefail\n\n"
-                    + " ".join(shlex.quote(part) for part in cmd)
-                    + "\n",
-                    encoding="utf-8",
-                )
-                print(
-                    f"\n[{scoring_prefix}] page_size={page_size} top_k={top_k} "
-                    f"lambda={lam} {mode_tag} -> {run_dir}",
-                    flush=True,
-                )
-                print("  cmd: " + " ".join(shlex.quote(part) for part in cmd), flush=True)
-                if args.dry_run:
-                    print(f"  Dry run: skipping execution", flush=True)
-                    continue
-                subprocess.run(cmd, cwd=repo_root, check=True)
-                all_rows.extend(collect_run_summary(
-                    page_size, top_k, lam, run_dir,
-                    args.unselected_mode, args.compress_ratio,
-                    args.compression_method, weight_pop,
-                ))
 
     if all_rows:
         write_summary_files(args.output_root, all_rows)
-        print(f"\nCross-lambda summary written to: {args.output_root}")
+        print(f"\nCross-sweep summary written to: {args.output_root}")
 
-    print(f"\n[{scoring_prefix}] All runs finished.", flush=True)
+    print("\n[hybrid_multi] All runs finished.", flush=True)
 
 
 if __name__ == "__main__":

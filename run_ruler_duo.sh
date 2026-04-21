@@ -1,6 +1,6 @@
 #!/bin/bash
 # RULER Evaluation — DuoAttention
-# Sweeps sparsity values by rewriting baselines/duo_attn_baseline/config.py.
+# Sweeps sparsity values by rewriting baselines/duo_attn/config.py.
 #
 # DuoAttention requires a dedicated conda env with transformers==4.45.2,
 # flash-attn==2.6.3, and `pip install -e /home/yoongonkim/duo-attention/`.
@@ -46,7 +46,7 @@ PATTERN_SUBDIR="${PATTERN_SUBDIR:-Meta-Llama-3.1-8B-Instruct/lr=0.02-reg=0.05-ct
 SINK_SIZE=64
 RECENT_SIZE=256
 
-CONFIG_FILE="baselines/duo_attn_baseline/config.py"
+CONFIG_FILE="baselines/duo_attn/config.py"
 
 write_config() {
     local sparsity="$1"

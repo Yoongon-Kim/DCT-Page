@@ -47,17 +47,14 @@ def parse_args():
     parser.add_argument("--dct_recent_size", type=int, default=128)
     parser.add_argument("--dct_compress_ratio", type=float, default=0.03125)
     parser.add_argument("--dct_scoring_method", type=str, default="max",
-                        choices=["mean", "max", "sum"])
+                        choices=["mean", "max"])
     parser.add_argument("--dct_group_agg_method", type=str, default="mean",
-                        choices=["mean", "max", "topp"])
+                        choices=["mean", "max"])
     parser.add_argument("--dct_unselected_mode", type=str, default="drop",
                         choices=["drop", "compressed"])
-    parser.add_argument("--dct_compression_method", type=str, default="haar", choices=["haar", "dct"])
     parser.add_argument("--dct_compressed_token_rope", type=str, default="mixed", choices=["mixed", "block_center"])
     parser.add_argument("--dct_continuous_rope", action="store_true",
                         help="Temporarily disabled — raises error if used")
-    parser.add_argument("--dct_weight_compressed_by_population", action="store_true",
-                        help="Multipole-style population weighting in compressed mode (no-op for drop mode).")
     parser.add_argument("--dct_no_triton", action="store_true")
 
     return parser.parse_args()
@@ -100,11 +97,10 @@ def main():
             scoring_method=args.dct_scoring_method,
             group_agg_method=args.dct_group_agg_method,
             unselected_mode=args.dct_unselected_mode,
-            compression_method=args.dct_compression_method,
             compressed_token_rope=args.dct_compressed_token_rope,
             continuous_rope=args.dct_continuous_rope,
             use_triton=not args.dct_no_triton,
-            weight_compressed_by_population=args.dct_weight_compressed_by_population,
+            weight_compressed_by_population=True,
         )
     else:
         from dct_page_attention import replace_qwen2_attn
@@ -117,11 +113,10 @@ def main():
             scoring_method=args.dct_scoring_method,
             group_agg_method=args.dct_group_agg_method,
             unselected_mode=args.dct_unselected_mode,
-            compression_method=args.dct_compression_method,
             compressed_token_rope=args.dct_compressed_token_rope,
             continuous_rope=args.dct_continuous_rope,
             use_triton=not args.dct_no_triton,
-            weight_compressed_by_population=args.dct_weight_compressed_by_population,
+            weight_compressed_by_population=True,
         )
 
     # Load model directly (same pattern as eval_longbench_v1.py)
@@ -131,7 +126,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map="auto",
         attn_implementation="sdpa",
     )

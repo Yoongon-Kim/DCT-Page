@@ -88,7 +88,7 @@ def load_model(args: argparse.Namespace):
         }
     return AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map={"": args.cuda_device},
         attn_implementation="sdpa",
         local_files_only=args.local_files_only,
@@ -135,21 +135,14 @@ def apply_dct_patch(args: argparse.Namespace) -> None:
         sink_size=args.dct_sink_size,
         recent_size=args.dct_recent_size,
         compress_ratio=args.dct_compress_ratio,
-        proxy_frequency_layout=args.dct_proxy_frequency_layout,
         scoring_method=args.dct_scoring_method,
         group_agg_method=args.dct_group_agg_method,
         unselected_mode=args.dct_unselected_mode,
-        compression_method=args.dct_compression_method,
         compressed_token_rope=args.dct_compressed_token_rope,
         continuous_rope=args.dct_continuous_rope,
-        score_use_direct_spectral_proxy=args.dct_score_use_direct_spectral_proxy,
-        score_use_haar_proxy=args.dct_score_use_haar_proxy,
-        score_use_haar_mixed_proxy=args.dct_score_use_haar_mixed_proxy,
-        score_use_hadamard_proxy=args.dct_score_use_hadamard_proxy,
         select_with_oracle_page_scores=args.dct_select_with_oracle_page_scores,
         use_triton=not args.dct_no_triton,
-        weight_compressed_by_population=args.dct_weight_compressed_by_population,
-        max_unselected_compressed=args.dct_max_unselected_compressed,
+        weight_compressed_by_population=True,
         comp_kv_quant=args.dct_comp_kv_quant,
         comp_kv_quant_granularity=args.dct_comp_kv_quant_granularity,
     )
@@ -207,19 +200,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dct_sink_size", type=int, default=4)
     p.add_argument("--dct_recent_size", type=int, default=128)
     p.add_argument("--dct_compress_ratio", type=float, default=0.125)
-    p.add_argument(
-        "--dct_proxy_frequency_layout",
-        type=str,
-        default="low",
-        choices=["low", "low_high", "low_mid_high", "spread"],
-    )
     p.add_argument("--dct_scoring_method", type=str, default="max",
-                   help="'mean'|'max'|'sum'|'dc_ac_{lam}'|'proxy_dc_ac_{lam}'|'spread_dc_ac_{lam}'|'hybrid_multi{M}_ac_max_a{alpha}'")
+                   choices=["mean", "max"])
     p.add_argument(
         "--dct_group_agg_method",
         type=str,
         default="max",
-        choices=["mean", "max", "topp"],
+        choices=["mean", "max"],
     )
     p.add_argument(
         "--dct_unselected_mode",
@@ -227,34 +214,11 @@ def parse_args() -> argparse.Namespace:
         default="drop",
         choices=["drop", "compressed"],
     )
-    p.add_argument("--dct_compression_method", type=str, default="dct", choices=["haar", "dct"])
     p.add_argument("--dct_compressed_token_rope", type=str, default="mixed", choices=["mixed", "block_center"])
-    p.add_argument("--dct_score_use_direct_spectral_proxy", action="store_true")
-    p.add_argument(
-        "--dct_score_use_haar_proxy",
-        dest="dct_score_use_haar_proxy",
-        action="store_true",
-        help="Use Haar lowpass score proxies (default).",
-    )
-    p.add_argument(
-        "--dct_score_use_low_proxy",
-        dest="dct_score_use_haar_proxy",
-        action="store_false",
-        help="Use the original low-frequency DCT IDCT score proxy instead of Haar.",
-    )
-    p.add_argument("--dct_score_use_haar_mixed_proxy", action="store_true")
-    p.add_argument("--dct_score_use_hadamard_proxy", action="store_true")
     p.add_argument("--dct_select_with_oracle_page_scores", action="store_true", default=True)
     p.add_argument("--dct_no_select_with_oracle_page_scores", dest="dct_select_with_oracle_page_scores", action="store_false")
     p.add_argument("--dct_continuous_rope", action="store_true",
                    help="Temporarily disabled — raises error if used")
-    p.add_argument("--dct_weight_compressed_by_population", action="store_true",
-                   help="In compressed mode, scale each unselected-page rep's softmax mass "
-                        "by page_size/comp_size via a log(n) bias on QK logits "
-                        "(multipole-style population weighting). No-op for drop mode.")
-    p.add_argument("--dct_max_unselected_compressed", type=int, default=-1,
-                   help="Max unselected pages contributing compressed tokens "
-                        "(-1 = unlimited, 0 = drop all unselected, N = keep top-N by score)")
     p.add_argument("--dct_comp_kv_quant", type=str, default="none",
                    choices=["none", "fp8_e4m3", "fp8_e5m2", "int8", "int4"],
                    help="Fake-quantization of compressed K/V at write time "
@@ -267,7 +231,6 @@ def parse_args() -> argparse.Namespace:
                    help="Space-separated page_size,top_k pairs to sweep. "
                         "E.g. --sweep_combos 16,128 32,64 64,32. "
                         "Each combo runs as a separate subprocess with its own run directory.")
-    p.set_defaults(dct_score_use_haar_proxy=True)
     return p.parse_args()
 
 
@@ -455,20 +418,13 @@ def main() -> None:
             "sink_size": args.dct_sink_size,
             "recent_size": args.dct_recent_size,
             "compress_ratio": args.dct_compress_ratio,
-            "proxy_frequency_layout": args.dct_proxy_frequency_layout,
             "scoring_method": args.dct_scoring_method,
             "group_agg_method": args.dct_group_agg_method,
             "unselected_mode": args.dct_unselected_mode,
-            "compression_method": args.dct_compression_method,
             "compressed_token_rope": args.dct_compressed_token_rope,
             "continuous_rope": args.dct_continuous_rope,
-            "score_use_direct_spectral_proxy": args.dct_score_use_direct_spectral_proxy,
-            "score_use_haar_proxy": args.dct_score_use_haar_proxy,
-            "score_use_haar_mixed_proxy": args.dct_score_use_haar_mixed_proxy,
-            "score_use_hadamard_proxy": args.dct_score_use_hadamard_proxy,
             "select_with_oracle_page_scores": args.dct_select_with_oracle_page_scores,
             "use_triton": not args.dct_no_triton,
-            "weight_compressed_by_population": args.dct_weight_compressed_by_population,
             "comp_kv_quant": args.dct_comp_kv_quant,
             "comp_kv_quant_granularity": args.dct_comp_kv_quant_granularity,
         },

@@ -87,24 +87,17 @@ def parse_args():
     parser.add_argument("--recent_size", type=int, default=128)
     parser.add_argument("--compress_ratio", type=float, default=0.03125)
     parser.add_argument("--scoring_method", type=str, default="max",
-                        help="'mean'|'max'|'sum'|'proxy_dc_ac_{lam}'|'spread_dc_ac_{lam}'")
+                        choices=["mean", "max"])
     parser.add_argument("--group_agg_method", type=str, default="mean",
-                        choices=["mean", "max", "topp"],
+                        choices=["mean", "max"],
                         help="How to aggregate per-head scores within a GQA group")
     parser.add_argument("--unselected_mode", type=str, default="drop",
                         choices=["drop", "compressed"])
-    parser.add_argument("--compression_method", type=str, default="haar",
-                        choices=["haar", "dct"],
-                        help="Compression method for unselected pages (used when unselected_mode=compressed)")
     parser.add_argument("--compressed_token_rope", type=str, default="mixed",
                         choices=["mixed", "block_center"],
                         help="RoPE handling for compressed tokens")
     parser.add_argument("--continuous_rope", action="store_true",
                         help="Temporarily disabled — raises error if used")
-    parser.add_argument("--weight_compressed_by_population", action="store_true",
-                        help="In compressed mode, scale each unselected-page rep's softmax mass "
-                             "by page_size/comp_size via a log(n) bias on QK logits "
-                             "(multipole-style population weighting). No-op for drop mode.")
     parser.add_argument("--no_triton", action="store_true",
                         help="Disable Triton kernels (use pure PyTorch for comparison)")
     parser.add_argument("--comp_kv_quant", type=str, default="none",
@@ -444,10 +437,10 @@ def build_summary(results, args):
         from quest_attn.config import QUEST_ATTN_CONFIG
         summary["quest_attn_config"] = QUEST_ATTN_CONFIG
     elif args.mode == "duo_attention":
-        from duo_attn_baseline.config import DUO_ATTN_CONFIG
+        from duo_attn.config import DUO_ATTN_CONFIG
         summary["duo_attn_config"] = DUO_ATTN_CONFIG
     elif args.mode == "inf_llm":
-        from inf_llm_baseline.config import INF_LLM_CONFIG
+        from inf_llm.config import INF_LLM_CONFIG
         summary["inf_llm_config"] = INF_LLM_CONFIG
 
     return summary
@@ -517,11 +510,10 @@ def main():
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
-                compression_method=args.compression_method,
                 compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
-                weight_compressed_by_population=args.weight_compressed_by_population,
+                weight_compressed_by_population=True,
                 comp_kv_quant=args.comp_kv_quant,
                 comp_kv_quant_granularity=args.comp_kv_quant_granularity,
             )
@@ -536,11 +528,10 @@ def main():
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
-                compression_method=args.compression_method,
                 compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
-                weight_compressed_by_population=args.weight_compressed_by_population,
+                weight_compressed_by_population=True,
                 comp_kv_quant=args.comp_kv_quant,
                 comp_kv_quant_granularity=args.comp_kv_quant_granularity,
             )
@@ -555,11 +546,10 @@ def main():
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,
                 unselected_mode=args.unselected_mode,
-                compression_method=args.compression_method,
                 compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
                 use_triton=not args.no_triton,
-                weight_compressed_by_population=args.weight_compressed_by_population,
+                weight_compressed_by_population=True,
                 comp_kv_quant=args.comp_kv_quant,
                 comp_kv_quant_granularity=args.comp_kv_quant_granularity,
             )
@@ -661,11 +651,18 @@ def main():
         # strip rope_scaling up front (InfLLM replaces RoPE anyway).
         inf_llm_config_override = {}
         if args.mode == "inf_llm":
-            from inf_llm_baseline import load_llama_config_stripped_rope
+            from inf_llm import load_llama_config_stripped_rope
             inf_llm_config_override["config"] = load_llama_config_stripped_rope(args.base_model)
+        # Old transformers envs (duo_attention, inf_llm) only accept torch_dtype=;
+        # transformers 5.x (main DCT-Page env) only accepts dtype=.
+        dtype_kwarg = (
+            {"torch_dtype": torch.bfloat16}
+            if args.mode in {"duo_attention", "inf_llm"}
+            else {"dtype": torch.bfloat16}
+        )
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
-            torch_dtype=torch.bfloat16,
+            **dtype_kwarg,
             device_map=device_map,
             attn_implementation=attn_impl,
             **yarn_kwargs,
@@ -680,19 +677,19 @@ def main():
             print("Multipole attention layers initialized.")
 
         if args.mode == "duo_attention":
-            from duo_attn_baseline import init_duo_attention, assert_llama
-            from duo_attn_baseline.config import DUO_ATTN_CONFIG
+            from duo_attn import init_duo_attention, assert_llama
+            from duo_attn.config import DUO_ATTN_CONFIG
             assert_llama(args.base_model)
             DUO_ATTN_CONFIG["base_model"] = args.base_model
             init_duo_attention(model, DUO_ATTN_CONFIG)
 
         if args.mode == "inf_llm":
-            from inf_llm_baseline import (
+            from inf_llm import (
                 assert_llama_only,
                 build_inf_llm_generator,
                 init_inf_llm,
             )
-            from inf_llm_baseline.config import INF_LLM_CONFIG
+            from inf_llm.config import INF_LLM_CONFIG
             assert_llama_only(args.base_model)
             INF_LLM_CONFIG["base_model"] = args.base_model
             INF_LLM_CONFIG["n_init"] = args.inf_llm_n_init

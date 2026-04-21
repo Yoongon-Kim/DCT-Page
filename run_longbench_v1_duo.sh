@@ -1,6 +1,6 @@
 #!/bin/bash
 # LongBench v1 Evaluation — DuoAttention
-# Sweeps sparsity values by rewriting baselines/duo_attn_baseline/config.py.
+# Sweeps sparsity values by rewriting baselines/duo_attn/config.py.
 set -e
 
 # ---- Conda activation ----
@@ -43,7 +43,7 @@ if [ -n "$TASKS" ]; then
     TASK_ARGS="--tasks $TASKS"
 fi
 
-CONFIG_FILE="baselines/duo_attn_baseline/config.py"
+CONFIG_FILE="baselines/duo_attn/config.py"
 
 write_config() {
     local sparsity="$1"

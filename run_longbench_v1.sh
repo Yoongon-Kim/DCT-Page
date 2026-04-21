@@ -47,10 +47,9 @@ for PS_TK in "32,64" "32,32" "16,124" "16,64"; do
         for SCORING_METHOD in mean max; do
             for GAM in max mean; do
                 for MODE in drop compressed; do
-                  for COMP_METHOD in haar dct; do
                     echo ""
                     echo "===================================================================="
-                    echo "PAGE ATTENTION: ps=${PAGE_SIZE}, top_k=${TOP_K}, cr=${COMPRESS_RATIO}, scoring_method=${SCORING_METHOD}, group_agg=${GAM}, mode=${MODE}, comp=${COMP_METHOD}"
+                    echo "PAGE ATTENTION: ps=${PAGE_SIZE}, top_k=${TOP_K}, cr=${COMPRESS_RATIO}, scoring_method=${SCORING_METHOD}, group_agg=${GAM}, mode=${MODE}"
                     echo "===================================================================="
                     python eval_longbench_v1.py \
                         --mode page_attention \
@@ -58,7 +57,7 @@ for PS_TK in "32,64" "32,32" "16,124" "16,64"; do
                         --max_input_len "$MAX_INPUT_LEN" \
                         --num_samples "$NUM_SAMPLES" \
                         --output_dir "$OUTPUT_DIR" \
-                        --run_name "qwen3_page_attn_ps${PAGE_SIZE}_topk${TOP_K}_cr${COMPRESS_RATIO}_${SCORING_METHOD}_${GAM}_${MODE}_${COMP_METHOD}" \
+                        --run_name "qwen3_page_attn_ps${PAGE_SIZE}_topk${TOP_K}_cr${COMPRESS_RATIO}_${SCORING_METHOD}_${GAM}_${MODE}" \
                         --page_size "$PAGE_SIZE" \
                         --top_k "$TOP_K" \
                         --sink_size "$SINK_SIZE" \
@@ -67,9 +66,7 @@ for PS_TK in "32,64" "32,32" "16,124" "16,64"; do
                         --scoring_method "$SCORING_METHOD" \
                         --group_agg_method "$GAM" \
                         --unselected_mode "$MODE" \
-                        --compression_method "$COMP_METHOD" \
                         $TASK_ARGS
-                  done
                 done
             done
         done

@@ -53,11 +53,12 @@ def apply_dct_patch(args, model=None):
         scoring_method=args.scoring_method,
         group_agg_method=args.group_agg_method,
         unselected_mode=args.unselected_mode,
-        compression_method=getattr(args, 'compression_method', 'haar'),
         compressed_token_rope=getattr(args, 'compressed_token_rope', 'mixed'),
         continuous_rope=args.continuous_rope,
         use_triton=not getattr(args, 'no_triton', False),
-        weight_compressed_by_population=getattr(args, 'weight_compressed_by_population', False),
+        weight_compressed_by_population=True,
+        comp_kv_quant=args.comp_kv_quant,
+        comp_kv_quant_granularity=args.comp_kv_quant_granularity,
     )
     if "llama" in args.model.lower():
         from dct_page_attention import replace_llama_attn, dct_page_attention_forward
@@ -79,11 +80,6 @@ from dct_page_attention import (
     _dct_page_cfg,
     segment_kv,
     _update_comp_cache as _update_comp_cache_original,
-    _update_score_key_cache,
-    _update_score_spectral_key_cache,
-    _update_score_haar_key_cache,
-    _update_score_haar_mixed_key_cache,
-    _update_score_hadamard_key_cache,
     repeat_kv,
     apply_rotary_pos_emb,
     _apply_rope,
@@ -357,9 +353,9 @@ def profiled_dct_page_attention_forward(
     if _enabled:
         _rec(3)
 
-    # Step 4: compress/cache maintenance. The default path uses a separate
-    # score-time cache and drop-mode assembly, so comp_k/comp_v are only
-    # needed for compatibility paths.
+    # Step 4: compress/cache maintenance. comp_k is needed for scoring;
+    # comp_v is skipped internally by _update_comp_cache when
+    # cfg.unselected_mode == "drop" (returns comp_v=None).
     need_comp_cache = not (cfg.continuous_rope and cfg.unselected_mode == "drop")
     comp_k = comp_v = None
     if need_comp_cache:
@@ -369,7 +365,7 @@ def profiled_dct_page_attention_forward(
             paged_v,
             num_pages,
             comp_size,
-            need_values=(cfg.unselected_mode != "drop"),
+            cfg,
         )
 
     if _enabled:
@@ -393,20 +389,6 @@ def profiled_dct_page_attention_forward(
 
     score_query_states = query_states
     score_comp_k = comp_k
-    if cfg.continuous_rope:
-        if query_states_rope is None:
-            query_states_rope = _apply_decode_query_rope(self, query_states, cos, sin, cfg)
-        score_query_states = query_states_rope
-        if cfg.score_use_direct_spectral_proxy:
-            score_comp_k = _update_score_spectral_key_cache(self, paged_k, num_pages, comp_size, cfg)
-        elif cfg.score_use_haar_mixed_proxy:
-            score_comp_k = _update_score_haar_mixed_key_cache(self, paged_k, num_pages, comp_size, cfg)
-        elif cfg.score_use_hadamard_proxy:
-            score_comp_k = _update_score_hadamard_key_cache(self, paged_k, num_pages, comp_size, cfg)
-        elif cfg.score_use_haar_proxy:
-            score_comp_k = _update_score_haar_key_cache(self, paged_k, num_pages, comp_size, cfg)
-        else:
-            score_comp_k = _update_score_key_cache(self, paged_k, num_pages, comp_size, cfg)
 
     if _enabled:
         _rec(5)
@@ -648,18 +630,22 @@ def parse_args():
     p.add_argument("--sink_size", type=int, default=4)
     p.add_argument("--recent_size", type=int, default=128)
     p.add_argument("--compress_ratio", type=float, default=0.03125)
-    p.add_argument("--scoring_method", default="max")
-    p.add_argument("--group_agg_method", default="mean")
+    p.add_argument("--scoring_method", default="max", choices=["mean", "max"])
+    p.add_argument("--group_agg_method", default="mean", choices=["mean", "max"])
     p.add_argument("--unselected_mode", default="drop",
                    choices=["drop", "compressed"])
-    p.add_argument("--compression_method", default="haar", choices=["haar", "dct"])
     p.add_argument("--compressed_token_rope", default="mixed", choices=["mixed", "block_center"])
     p.add_argument("--continuous_rope", action="store_true",
                    help="Temporarily disabled — raises error if used")
-    p.add_argument("--weight_compressed_by_population", action="store_true",
-                   help="Multipole-style population weighting in compressed mode (no-op for drop mode).")
     p.add_argument("--no_triton", action="store_true",
                    help="Disable Triton kernels (use pure PyTorch for comparison)")
+    p.add_argument("--comp_kv_quant", type=str, default="none",
+                   choices=["none", "fp8_e4m3", "fp8_e5m2", "int8", "int4"],
+                   help="Fake-quantization of compressed K/V at write time "
+                        "(precision study; no real byte-level storage change)")
+    p.add_argument("--comp_kv_quant_granularity", type=str, default="per_page",
+                   choices=["per_page", "per_comp_token"],
+                   help="Scale granularity for comp_kv_quant")
     p.add_argument("--sync", action="store_true",
                    help="Add torch.cuda.synchronize() between steps to get CPU timing breakdown")
     p.add_argument("--chunk_size", type=int, default=0,
