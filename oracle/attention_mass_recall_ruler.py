@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-Attention-mass recall on RULER.
+Attention-mass recall on RULER — dense-trajectory reference.
+
+Generation runs under the **unmodified full-KV forward** (no DCT patch, no
+selector drives decoding). A recording hook mirrors HF's own attention
+forward 1:1 and only observes (Q, K, V) post-RoPE / post-cache-update, so
+every selector — DCT Haar proxy, Quest, ShadowKV, oracle_max — is evaluated
+against the same neutral Q at each decode step. This removes the
+"home-field" bias of scoring Quest/oracle on a Q already shaped by DCT's
+earlier page choices.
 
 For each decode step, applies a single softmax over the **entire KV sequence**
 (sink + paged + recent) to compute a per-token mass distribution. Sink and
@@ -14,7 +22,8 @@ Reports per-query-head metrics grouped into three families.
 
 (A) FULL-KV MASS metrics (all include the sink + recent floor):
 
-  mass_recall_sink_recent = sink + recent                                  (floor only — shared by every selector)
+  mass_recall_sink        = sink                                           (floor component)
+  mass_recall_recent      = recent                                         (floor component)
   mass_recall_proxy       = sink + recent + Σ m[p] over DCT proxy's top-K
   mass_recall_quest       = sink + recent + Σ m[p] over Quest's top-K
   mass_recall_shadowkv    = sink + recent + Σ m[p] over ShadowKV's top-K
@@ -22,7 +31,20 @@ Reports per-query-head metrics grouped into three families.
   mass_recall_mass_topk   = sink + recent + Σ m[p] over top-K by page mass  (ceiling)
   set_recall              = |DCT ∩ oracle_max| / K                         (page-set baseline)
 
-(B) PAGED-ONLY MASS metrics (no sink/recent floor; denominator = total
+(B) SELECTED-PAGE MASS metrics (fraction of total softmax mass that lands
+    on the selector's chosen pages; denominator = 1):
+
+  selected_mass_proxy       = Σ_{p∈DCT topK} m[p]        = 1 − sink − recent − Σ_{unselected} m[p]
+  selected_mass_quest       = Σ_{p∈Quest topK} m[p]
+  selected_mass_shadowkv    = Σ_{p∈ShadowKV topK} m[p]
+  selected_mass_oracle_max  = Σ_{p∈oracle_max topK} m[p]
+  selected_mass_mass_topk   = Σ_{p∈mass topK} m[p]                         (ceiling)
+
+By construction:
+  mass_recall_X   = selected_mass_X + mass_recall_sink + mass_recall_recent
+  selected_mass_X + Σ_{p∉ topK} m[p] = 1 − sink − recent
+
+(C) PAGED-ONLY MASS metrics (no sink/recent floor; denominator = total
     paged attention mass Σ_p m[p] = 1 − (sink_mass + recent_mass)):
 
   paged_mass_recall_proxy       = Σ_{p∈DCT topK} m[p]       / Σ_p m[p]
@@ -32,6 +54,7 @@ Reports per-query-head metrics grouped into three families.
   paged_mass_recall_mass_topk   = Σ_{p∈mass topK} m[p]      / Σ_p m[p]   (ceiling)
   paged_mass_ratio_proxy        = paged_mass_recall_proxy / paged_mass_recall_mass_topk
   paged_mass_ratio_quest        = paged_mass_recall_quest / paged_mass_recall_mass_topk
+  paged_mass_ratio_shadowkv     = paged_mass_recall_shadowkv / paged_mass_recall_mass_topk
 
 Paged-only strips the always-kept sink + recent floor from both numerator
 and denominator, so values are the fraction of **paged** attention mass
@@ -39,8 +62,9 @@ and denominator, so values are the fraction of **paged** attention mass
 paged mass so the ceiling = 1 exactly when K ≥ P, and separates
 selection quality from the always-kept floor. By construction:
 
-  mass_recall_X = paged_mass_recall_X · (1 − mass_recall_sink_recent)
-                  + mass_recall_sink_recent
+  floor = mass_recall_sink + mass_recall_recent
+  mass_recall_X       = paged_mass_recall_X · (1 − floor) + floor
+  selected_mass_X     = paged_mass_recall_X · (1 − floor)
   paged_mass_recall_mass_topk ≤ 1        (= 1 when K ≥ P)
 
 FIDELITY metrics (per-head cosine similarity between full and drop-mode
@@ -80,10 +104,11 @@ so their mass contributes to every selector). Sources of loss:
   oracle_max − proxy   : DCT proxy's approximation gap vs max(Q·K)
   proxy vs quest vs shadowkv : different proxy families against each other
 
-Reuses CLI, model setup, and task-loading utilities from
-``compare_proxy_oracle_slices.py`` — no modifications to core code (the debug
-hook payload already carries query_states, paged_k, selected_indices,
-num_kv_groups, oracle_page_scores).
+Reuses the dense recording-forward plumbing from
+``attention_mass_recall_ruler_quest.py`` (``_install_recording_forward``,
+``set_recording_hook``, ``load_model``). DCT proxy / oracle scores are
+reproduced inline from (Q, paged_k) — no dependency on the DCT forward
+itself.
 
 Usage:
     python oracle/attention_mass_recall_ruler.py \\
@@ -116,16 +141,19 @@ from eval_ruler import infer_model_family
 from oracle.compare_proxy_oracle_slices import (
     ALL_TASKS,
     _indices_to_mask,
-    apply_monkey_patch,
-    cleanup_model,
-    load_model,
     load_task_configs,
 )
 
+# Dense recording forward + model helpers live in the Quest sibling script.
+# Imported lazily at call sites to avoid a circular import (that module
+# imports compute_per_page_mass / compute_quest_scores / compute_output_fidelity
+# from this one).
+
 
 MASS_METRIC_KEYS = [
-    # Mass of (sink + recent) alone / full KV — always-kept floor shared by every selector.
-    "mass_recall_sink_recent",
+    # Always-kept floor components (each is a fraction of total softmax mass).
+    "mass_recall_sink",
+    "mass_recall_recent",
     # Mass of (sink + selected pages + recent) / full KV — includes always-kept floor.
     "mass_recall_proxy",
     "mass_recall_quest",
@@ -133,10 +161,19 @@ MASS_METRIC_KEYS = [
     "mass_recall_oracle_max",
     "mass_recall_mass_topk",
     "set_recall",
+    # Mass of (selected pages) / (full KV) — absolute fraction of total
+    # attention mass that lands on the selector's chosen pages.
+    # Equivalently: 1 − sink − recent − Σ_{unselected} m[p].
+    # mass_recall_X = selected_mass_X + sink + recent.
+    "selected_mass_proxy",
+    "selected_mass_quest",
+    "selected_mass_shadowkv",
+    "selected_mass_oracle_max",
+    "selected_mass_mass_topk",
     # Mass of (selected pages) / (total paged attention mass Σ_p m[p]).
     # No sink/recent floor in either numerator or denominator; rescales
     # per-head paged mass so the ceiling = 1 exactly when K ≥ P.
-    # mass_recall_X = paged_mass_recall_X · (1 − sink_recent) + sink_recent.
+    # mass_recall_X = paged_mass_recall_X · (1 − sink − recent) + sink + recent.
     "paged_mass_recall_proxy",
     "paged_mass_recall_quest",
     "paged_mass_recall_shadowkv",
@@ -144,6 +181,7 @@ MASS_METRIC_KEYS = [
     "paged_mass_recall_mass_topk",
     "paged_mass_ratio_proxy",
     "paged_mass_ratio_quest",
+    "paged_mass_ratio_shadowkv",
 ]
 
 FIDELITY_METRIC_KEYS = [
@@ -165,7 +203,7 @@ def compute_per_page_mass(
     paged_k: torch.Tensor,
     recent_k: torch.Tensor,
     num_kv_groups: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Per-query-head softmax mass over the full KV sequence.
 
     Softmax denominator spans sink + paged + recent tokens jointly, so each
@@ -180,10 +218,10 @@ def compute_per_page_mass(
         num_kv_groups: H_q // H_kv.
 
     Returns:
-        page_mass:  [H_q, P]  — softmax weights summed within each paged page.
-        extra_mass: [H_q]     — softmax weights on sink + recent tokens
-                                 (always-kept floor). Invariant:
-                                 page_mass.sum(-1) + extra_mass = 1.
+        page_mass:   [H_q, P] — softmax weights summed within each paged page.
+        sink_mass:   [H_q]    — softmax weights on sink tokens (always-kept).
+        recent_mass: [H_q]    — softmax weights on recent tokens (always-kept).
+        Invariant: page_mass.sum(-1) + sink_mass + recent_mass = 1.
     """
     bsz, H_q, q_len, d = query_states.shape
     assert bsz == 1 and q_len == 1, f"decode-step only, got shape {query_states.shape}"
@@ -219,8 +257,141 @@ def compute_per_page_mass(
         else weights.new_zeros(bsz, H_q)
     )
 
-    extra_mass = (sink_mass + recent_mass).squeeze(0)            # [H_q]
-    return page_mass.squeeze(0), extra_mass                      # [H_q, P], [H_q]
+    return (
+        page_mass.squeeze(0),                                    # [H_q, P]
+        sink_mass.squeeze(0),                                    # [H_q]
+        recent_mass.squeeze(0),                                  # [H_q]
+    )
+
+
+_dct_proj_cache: dict[tuple[int, int, str, torch.device, torch.dtype], torch.Tensor] = {}
+
+
+def _get_dct_lowpass_projection_matrix(
+    page_size: int, comp_size: int, layout: str,
+    device: torch.device, dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return the [comp_size, page_size] DCT → lowpass truncate → IDCT →
+    energy-correction projection matrix, matching DCT-Page's default pipeline.
+
+    Built by ``_build_dct_projection_matrix`` in ``dct_page_attention.py``
+    (imported lazily). Cached per (shape, layout, device, dtype).
+    """
+    key = (page_size, comp_size, layout, device, dtype)
+    M = _dct_proj_cache.get(key)
+    if M is None:
+        from dct_page_attention import _build_dct_projection_matrix
+        M = _build_dct_projection_matrix(page_size, comp_size, device, dtype, layout)
+        _dct_proj_cache[key] = M
+    return M
+
+
+def compute_dct_lowpass_proxy_scores(
+    query_states: torch.Tensor,
+    paged_k: torch.Tensor,
+    comp_size: int,
+    num_kv_groups: int,
+    group_agg_method: str,
+    scoring_method: str,
+    proxy_frequency_layout: str = "low",
+    comp_kv_quant: str = "none",
+    comp_kv_quant_granularity: str = "per_page",
+) -> torch.Tensor:
+    """DCT → lowpass truncate → IDCT → energy-correction proxy page scores,
+    matching the default ``eval_ruler.py`` pipeline (compression_method="dct",
+    proxy_frequency_layout="low").
+
+    For each page p of S tokens, apply the DCT-Page projection matrix
+    ``M ∈ R^{comp_size × S}`` that bakes in the full DCT-lowpass-IDCT with
+    ``√(comp_size/S)`` energy correction:
+        comp_k[p, c, :] = Σ_s M[c, s] · paged_k[p, s, :]
+    Optionally fake-quantize comp_k to simulate low-precision compressed-KV
+    storage (``_fake_quantize_comp`` from ``dct_page_attention.py``), then
+    score = reduce_c (q[h] · comp_k[p, c]) / √d, GQA group-aggregated.
+
+    Args:
+        query_states: [bsz=1, H_q, 1, d] — post-RoPE / post-QK-norm.
+        paged_k:      [bsz=1, H_kv, P, S, d] — post-RoPE.
+        comp_size:    Number of comp tokens per page.
+        num_kv_groups: H_q // H_kv.
+        group_agg_method: "mean" | "max".
+        scoring_method: "max" | "mean" | "sum" over the comp_size axis.
+        proxy_frequency_layout: "low" (default) or other layouts supported
+            by DCT-Page's ``_resolve_frequency_keep_indices``.
+        comp_kv_quant: "none" | "fp8_e4m3" | "fp8_e5m2" | "int8" | "int4".
+        comp_kv_quant_granularity: "per_page" | "per_comp_token".
+
+    Returns:
+        scores: [H_kv, P] — one proxy score per (kv-head, page).
+    """
+    bsz, H_q, q_len, d = query_states.shape
+    assert bsz == 1 and q_len == 1, f"decode-step only, got shape {query_states.shape}"
+    _, H_kv, P, S, _ = paged_k.shape
+    assert H_q == H_kv * num_kv_groups
+    scale = 1.0 / math.sqrt(d)
+
+    M = _get_dct_lowpass_projection_matrix(
+        S, comp_size, proxy_frequency_layout, paged_k.device, paged_k.dtype,
+    )                                                                         # [C, S]
+    # Project paged_k along the page-size axis: [..., P, S, d] @ M.T -> [..., P, C, d]
+    comp_k = torch.einsum("bhpsd,cs->bhpcd", paged_k, M)                      # [1, H_kv, P, C, d]
+
+    if comp_kv_quant != "none":
+        from dct_page_attention import _fake_quantize_comp
+        comp_k = _fake_quantize_comp(comp_k, comp_kv_quant, comp_kv_quant_granularity)
+
+    comp_k_q = comp_k.repeat_interleave(num_kv_groups, dim=1).float()         # [1, H_q, P, C, d]
+
+    q = query_states.float()                                                  # [1, H_q, 1, d]
+    scores_per_comp = torch.einsum(
+        "bhqd,bhpcd->bhpc", q, comp_k_q,
+    ) * scale                                                                 # [1, H_q, P, C]
+
+    if scoring_method == "max":
+        score_q = scores_per_comp.amax(dim=-1)
+    elif scoring_method == "mean":
+        score_q = scores_per_comp.mean(dim=-1)
+    elif scoring_method == "sum":
+        score_q = scores_per_comp.sum(dim=-1)
+    else:
+        raise ValueError(f"Unsupported scoring_method: {scoring_method!r}")
+
+    # GQA group reduction to kv-head level.
+    score_g = score_q.view(bsz, H_kv, num_kv_groups, P)
+    if group_agg_method == "max":
+        scores = score_g.max(dim=2).values
+    else:
+        scores = score_g.mean(dim=2)
+    return scores.squeeze(0)                                                  # [H_kv, P]
+
+
+def compute_oracle_max_scores(
+    query_states: torch.Tensor,
+    paged_k: torch.Tensor,
+    num_kv_groups: int,
+    group_agg_method: str,
+) -> torch.Tensor:
+    """Oracle per-page upper bound: max_{s in page} q · K[p,s] / √d.
+
+    Group-reduced to kv-head level the same way the proxies are.
+    """
+    bsz, H_q, q_len, d = query_states.shape
+    assert bsz == 1 and q_len == 1, f"decode-step only, got shape {query_states.shape}"
+    _, H_kv, P, S, _ = paged_k.shape
+    assert H_q == H_kv * num_kv_groups
+    scale = 1.0 / math.sqrt(d)
+
+    k_exp = paged_k.repeat_interleave(num_kv_groups, dim=1).float()           # [1, H_q, P, S, d]
+    q = query_states.float()                                                  # [1, H_q, 1, d]
+    qk = torch.einsum("bhqd,bhpsd->bhps", q, k_exp) * scale                   # [1, H_q, P, S]
+    score_q = qk.amax(dim=-1)                                                 # [1, H_q, P]
+
+    score_g = score_q.view(bsz, H_kv, num_kv_groups, P)
+    if group_agg_method == "max":
+        scores = score_g.max(dim=2).values
+    else:
+        scores = score_g.mean(dim=2)
+    return scores.squeeze(0)                                                  # [H_kv, P]
 
 
 def compute_quest_scores(
@@ -428,24 +599,26 @@ def compute_output_fidelity(
 
 def compute_all_metrics(
     page_mass: torch.Tensor,          # [H_q, P]
-    extra_mass: torch.Tensor,         # [H_q] — sink + recent mass (always-kept floor)
+    sink_mass: torch.Tensor,          # [H_q] — softmax mass on sink tokens
+    recent_mass: torch.Tensor,        # [H_q] — softmax mass on recent tokens
     selected_indices: torch.Tensor,   # [H_kv, K]
     oracle_page_scores: torch.Tensor, # [H_kv, P]
     quest_scores: torch.Tensor,       # [H_kv, P]
     shadowkv_scores: torch.Tensor,    # [H_kv, P]
     num_kv_groups: int,
 ) -> dict[str, torch.Tensor]:
-    """Compute six recall metrics. Returns dict of [H_q] float32 tensors.
+    """Compute mass-recall metrics. Returns dict of [H_q] float32 tensors.
 
-    The five mass metrics include ``extra_mass`` (sink + recent) because
-    those regions are always kept regardless of page selection.
+    Full-KV mass metrics include ``sink_mass + recent_mass`` because those
+    regions are always kept regardless of page selection.
     """
     H_q, P = page_mass.shape
     H_kv, K = selected_indices.shape
     assert H_q == H_kv * num_kv_groups, (
         f"H_q={H_q} != H_kv={H_kv} * num_kv_groups={num_kv_groups}"
     )
-    assert extra_mass.shape == (H_q,), f"extra_mass shape {extra_mass.shape} != ({H_q},)"
+    assert sink_mass.shape == (H_q,), f"sink_mass shape {sink_mass.shape} != ({H_q},)"
+    assert recent_mass.shape == (H_q,), f"recent_mass shape {recent_mass.shape} != ({H_q},)"
     assert quest_scores.shape == (H_kv, P), (
         f"quest_scores shape {quest_scores.shape} != ({H_kv}, {P})"
     )
@@ -454,7 +627,9 @@ def compute_all_metrics(
     )
 
     page_mass = page_mass.float()
-    extra_mass = extra_mass.float()
+    sink_mass = sink_mass.float()
+    recent_mass = recent_mass.float()
+    extra_mass = sink_mass + recent_mass                                       # [H_q]
     oracle_page_scores = oracle_page_scores.float()
     quest_scores = quest_scores.float()
     shadowkv_scores = shadowkv_scores.float()
@@ -512,6 +687,15 @@ def compute_all_metrics(
     set_recall_kv = (mP & mO).sum(-1).float() / mO.sum(-1).float().clamp(min=1)
     set_recall = set_recall_kv.repeat_interleave(num_kv_groups, dim=0)         # [H_q]
 
+    # ----- Selected-page mass (absolute, fraction of total softmax mass) ------
+    # Equivalent to 1 − sink − recent − Σ_{unselected} m[p]. Derived from the
+    # full-KV mass metrics by subtracting the always-kept floor.
+    selected_mass_proxy = mass_recall_proxy - extra_mass
+    selected_mass_quest = mass_recall_quest - extra_mass
+    selected_mass_shadowkv = mass_recall_shadowkv - extra_mass
+    selected_mass_oracle_max = mass_recall_oracle_max - extra_mass
+    selected_mass_mass_topk = mass_recall_mass_topk - extra_mass
+
     # ----- Paged-only mass captured by each selector --------------------------
     # Numerator: softmax mass on the selector's chosen pages (no sink/recent
     # floor). Denominator: total paged mass per head (sink + recent excluded),
@@ -550,15 +734,22 @@ def compute_all_metrics(
     paged_ceiling = paged_mass_recall_mass_topk.clamp(min=1e-8)
     paged_mass_ratio_proxy = paged_mass_recall_proxy / paged_ceiling
     paged_mass_ratio_quest = paged_mass_recall_quest / paged_ceiling
+    paged_mass_ratio_shadowkv = paged_mass_recall_shadowkv / paged_ceiling
 
     return {
-        "mass_recall_sink_recent": extra_mass,
+        "mass_recall_sink": sink_mass,
+        "mass_recall_recent": recent_mass,
         "mass_recall_proxy": mass_recall_proxy,
         "mass_recall_quest": mass_recall_quest,
         "mass_recall_shadowkv": mass_recall_shadowkv,
         "mass_recall_oracle_max": mass_recall_oracle_max,
         "mass_recall_mass_topk": mass_recall_mass_topk,
         "set_recall": set_recall,
+        "selected_mass_proxy": selected_mass_proxy,
+        "selected_mass_quest": selected_mass_quest,
+        "selected_mass_shadowkv": selected_mass_shadowkv,
+        "selected_mass_oracle_max": selected_mass_oracle_max,
+        "selected_mass_mass_topk": selected_mass_mass_topk,
         "paged_mass_recall_proxy": paged_mass_recall_proxy,
         "paged_mass_recall_quest": paged_mass_recall_quest,
         "paged_mass_recall_shadowkv": paged_mass_recall_shadowkv,
@@ -566,6 +757,7 @@ def compute_all_metrics(
         "paged_mass_recall_mass_topk": paged_mass_recall_mass_topk,
         "paged_mass_ratio_proxy": paged_mass_ratio_proxy,
         "paged_mass_ratio_quest": paged_mass_ratio_quest,
+        "paged_mass_ratio_shadowkv": paged_mass_ratio_shadowkv,
     }
 
 
@@ -573,15 +765,44 @@ def compute_all_metrics(
 # Recorder: computes mass inline, discards large tensors before returning
 # ---------------------------------------------------------------------------
 class MassRecallRecorder:
-    """Per-decode-step recorder that computes mass metrics inside the hook.
+    """Per-decode-step recorder that computes mass metrics inline.
 
-    paged_k / query_states arrive on GPU and are NOT retained across calls —
-    only the small per-record metric tensors are kept.
+    Dense-trajectory design: the recording forward (installed via
+    ``_install_recording_forward`` from the Quest sibling script) runs
+    standard full attention and emits post-RoPE / post-cache-update
+    ``query_states`` and ``key_states_full`` / ``value_states_full``. We
+    slice the KV into DCT's ``[sink | paged | recent]`` layout here, score
+    every selector against the same neutral Q, and compute the usual
+    metrics. No selector alters the decode path, so Q is identical across
+    all selectors — a fair comparison.
+
+    Large tensors are NOT retained across calls; only per-record [H_q]
+    metric tensors are kept.
     """
 
-    def __init__(self, num_decode_steps: int, group_agg_method: str):
+    def __init__(
+        self,
+        num_decode_steps: int,
+        page_size: int,
+        top_k: int,
+        sink_size: int,
+        recent_size: int,
+        comp_size: int,
+        scoring_method: str,
+        group_agg_method: str,
+        comp_kv_quant: str = "none",
+        comp_kv_quant_granularity: str = "per_page",
+    ):
         self.num_decode_steps = num_decode_steps
+        self.page_size = page_size
+        self.top_k = top_k
+        self.sink_size = sink_size
+        self.recent_size = recent_size
+        self.comp_size = comp_size
+        self.scoring_method = scoring_method
         self.group_agg_method = group_agg_method
+        self.comp_kv_quant = comp_kv_quant
+        self.comp_kv_quant_granularity = comp_kv_quant_granularity
         self.records: list[dict[str, Any]] = []
         self._step_by_layer: dict[int, int] = {}
 
@@ -592,44 +813,76 @@ class MassRecallRecorder:
         if decode_step >= self.num_decode_steps:
             return
 
+        query_states = payload["query_states"]    # [1, H_q, 1, d]
+        key_full = payload["key_states_full"]     # [1, H_kv, kv_len, d]
+        value_full = payload["value_states_full"] # [1, H_kv, kv_len, d]
         num_kv_groups = int(payload["num_kv_groups"])
-        num_pages = int(payload["num_pages"])
-        actual_top_k = int(payload["actual_top_k"])
 
-        query_states = payload["query_states"]
-        paged_k = payload["paged_k"]
-        paged_v = payload["paged_v"]
-        sink_k = payload["sink_k"]
-        sink_v = payload["sink_v"]
-        recent_k = payload["recent_k"]
-        recent_v = payload["recent_v"]
-        device = paged_k.device
+        bsz, H_kv, kv_len, d = key_full.shape
+        _, H_q, q_len, _ = query_states.shape
+        assert bsz == 1 and q_len == 1, f"expected decode step, got {query_states.shape}"
+        assert H_q == H_kv * num_kv_groups
+
+        # Segment [sink | paged | recent] exactly like DCT's segment_kv:
+        # fixed-length sink, fixed-length recent absorbing the alignment
+        # remainder, and the middle carved into whole pages of page_size.
+        sink_len = self.sink_size
+        if kv_len < sink_len + self.page_size + self.recent_size:
+            return  # nothing meaningful to page
+        after_sink = kv_len - sink_len
+        num_pages = (after_sink - self.recent_size) // self.page_size
+        if num_pages < 1:
+            return
+        actual_top_k = min(self.top_k, num_pages)
+        if num_pages <= actual_top_k:
+            return  # no sparsification happens when top_k covers every page
+        actual_recent = kv_len - sink_len - num_pages * self.page_size
+
+        P = num_pages
+        S = self.page_size
+        paged_end = sink_len + P * S
+        sink_k = key_full[:, :, :sink_len, :]
+        sink_v = value_full[:, :, :sink_len, :]
+        paged_k = key_full[:, :, sink_len:paged_end, :].view(bsz, H_kv, P, S, d)
+        paged_v = value_full[:, :, sink_len:paged_end, :].view(bsz, H_kv, P, S, d)
+        recent_k = key_full[:, :, paged_end:, :]
+        recent_v = value_full[:, :, paged_end:, :]
+        assert recent_k.shape[2] == actual_recent
 
         with torch.no_grad():
-            page_mass_gpu, extra_mass_gpu = compute_per_page_mass(
+            page_mass_gpu, sink_mass_gpu, recent_mass_gpu = compute_per_page_mass(
                 query_states, sink_k, paged_k, recent_k, num_kv_groups,
             )
             page_mass = page_mass_gpu.float().cpu()                            # [H_q, P]
-            extra_mass = extra_mass_gpu.float().cpu()                          # [H_q]
+            sink_mass = sink_mass_gpu.float().cpu()                            # [H_q]
+            recent_mass = recent_mass_gpu.float().cpu()                        # [H_q]
+
+            proxy_scores_gpu = compute_dct_lowpass_proxy_scores(
+                query_states, paged_k, self.comp_size, num_kv_groups,
+                self.group_agg_method, self.scoring_method,
+                proxy_frequency_layout="low",
+                comp_kv_quant=self.comp_kv_quant,
+                comp_kv_quant_granularity=self.comp_kv_quant_granularity,
+            )
+            proxy_scores = proxy_scores_gpu.float().cpu()                      # [H_kv, P]
 
             quest_scores_gpu = compute_quest_scores(
                 query_states, paged_k, num_kv_groups, self.group_agg_method,
             )
-            quest_scores = quest_scores_gpu.float().cpu()                      # [H_kv, P]
+            quest_scores = quest_scores_gpu.float().cpu()
 
             shadowkv_scores_gpu = compute_shadowkv_scores(
                 query_states, paged_k, num_kv_groups, self.group_agg_method,
             )
-            shadowkv_scores = shadowkv_scores_gpu.float().cpu()                # [H_kv, P]
+            shadowkv_scores = shadowkv_scores_gpu.float().cpu()
 
-            # Compute per-selector top-K indices on GPU for output fidelity.
-            # oracle_page_scores arrives CPU — move to GPU for topk+gather.
-            oracle_scores_gpu = (
-                payload["oracle_page_scores"][0].to(device, non_blocking=True)
+            oracle_scores_gpu = compute_oracle_max_scores(
+                query_states, paged_k, num_kv_groups, self.group_agg_method,
             )
-            proxy_topk_gpu = payload["selected_indices"][0].to(
-                device, non_blocking=True
-            ).long()
+            oracle_scores = oracle_scores_gpu.float().cpu()
+
+            # Top-K per selector (all at kv-head granularity).
+            proxy_topk_gpu = torch.topk(proxy_scores_gpu, actual_top_k, dim=-1).indices
             quest_topk_gpu = torch.topk(quest_scores_gpu, actual_top_k, dim=-1).indices
             shadowkv_topk_gpu = torch.topk(
                 shadowkv_scores_gpu, actual_top_k, dim=-1,
@@ -648,13 +901,11 @@ class MassRecallRecorder:
             )
             fidelity = {k: v.float().cpu() for k, v in fidelity_gpu.items()}
 
-        # oracle_page_scores and selected_indices arrive already detached/CPU.
-        selected_indices = payload["selected_indices"][0]                      # [H_kv, K]
-        oracle_page_scores = payload["oracle_page_scores"][0]                  # [H_kv, P]
+            selected_indices = proxy_topk_gpu.cpu()                            # [H_kv, K]
 
         mass_metrics = compute_all_metrics(
-            page_mass, extra_mass, selected_indices, oracle_page_scores,
-            quest_scores, shadowkv_scores, num_kv_groups,
+            page_mass, sink_mass, recent_mass, selected_indices,
+            oracle_scores, quest_scores, shadowkv_scores, num_kv_groups,
         )
         metrics = {**mass_metrics, **fidelity}
 
@@ -684,19 +935,42 @@ class MassRecallRecorder:
 
 
 def generate_with_mass_traces(
-    model, tokenizer, sample: dict[str, Any], num_decode_steps: int,
+    model,
+    tokenizer,
+    sample: dict[str, Any],
+    *,
+    num_decode_steps: int,
+    page_size: int,
+    top_k: int,
+    sink_size: int,
+    recent_size: int,
+    comp_size: int,
+    scoring_method: str,
     group_agg_method: str,
+    comp_kv_quant: str,
+    comp_kv_quant_granularity: str,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Run generate() with the mass-recall hook installed."""
-    from dct_page_attention import set_dct_page_debug_hook
+    """Run generate() with a fresh dense-trajectory recording hook installed."""
+    from oracle.attention_mass_recall_ruler_quest import set_recording_hook
 
     device = next(model.parameters()).device
     encoded = tokenizer(sample["input"], return_tensors="pt")
     input_ids = encoded.input_ids.to(device)
     attention_mask = encoded.attention_mask.to(device)
 
-    recorder = MassRecallRecorder(num_decode_steps, group_agg_method)
-    set_dct_page_debug_hook(recorder)
+    recorder = MassRecallRecorder(
+        num_decode_steps=num_decode_steps,
+        page_size=page_size,
+        top_k=top_k,
+        sink_size=sink_size,
+        recent_size=recent_size,
+        comp_size=comp_size,
+        scoring_method=scoring_method,
+        group_agg_method=group_agg_method,
+        comp_kv_quant=comp_kv_quant,
+        comp_kv_quant_granularity=comp_kv_quant_granularity,
+    )
+    set_recording_hook(recorder)
     try:
         with torch.no_grad():
             model.generate(
@@ -708,7 +982,7 @@ def generate_with_mass_traces(
                 pad_token_id=tokenizer.pad_token_id,
             )
     finally:
-        set_dct_page_debug_hook(None)
+        set_recording_hook(None)
 
     return recorder.records, int(input_ids.shape[1])
 
@@ -718,7 +992,11 @@ def generate_with_mass_traces(
 # ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Attention-mass recall vs full-attention softmax on RULER"
+        description=(
+            "Attention-mass recall vs full-attention softmax on RULER. "
+            "Dense baseline drives decoding; every selector is scored on "
+            "the same neutral Q at each decode step."
+        )
     )
     # Model
     p.add_argument("--base_model", type=str, default="Qwen/Qwen3-8B")
@@ -732,26 +1010,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data_root", type=Path,
                    default=Path("benchmark/data/ruler_data"))
 
-    # DCT page config
+    # Page layout + proxy scoring config (no DCT output path involved).
     p.add_argument("--page_size", type=int, default=16)
     p.add_argument("--top_k", type=int, default=128)
     p.add_argument("--sink_size", type=int, default=4)
     p.add_argument("--recent_size", type=int, default=128)
-    p.add_argument("--compress_ratio", type=float, default=0.125)
+    p.add_argument("--compress_ratio", type=float, default=0.125,
+                   help="Haar proxy compression ratio; comp_size = "
+                        "max(1, int(page_size * compress_ratio)).")
     p.add_argument("--scoring_method", type=str, default="max",
                    choices=["mean", "max", "sum"])
     p.add_argument("--group_agg_method", type=str, default="max",
-                   choices=["mean", "max", "topp"])
-    p.add_argument("--unselected_mode", type=str, default="drop",
-                   choices=["drop", "compressed"])
-    p.add_argument("--compression_method", type=str, default="dct",
-                   choices=["haar", "dct"])
-    p.add_argument("--compressed_token_rope", type=str, default="mixed",
-                   choices=["mixed", "block_center"])
-    p.add_argument("--proxy_frequency_layout", type=str, default="low")
+                   choices=["mean", "max"])
 
-    # comp_kv_quant
-    p.add_argument("--comp_kv_quant", type=str, default="fp8_e4m3",
+    # Fake-quantize the compressed K proxy (simulates low-precision comp-KV
+    # storage). Applied AFTER the DCT projection, BEFORE scoring.
+    p.add_argument("--comp_kv_quant", type=str, default="none",
                    choices=["none", "fp8_e4m3", "fp8_e5m2", "int8", "int4"])
     p.add_argument("--comp_kv_quant_granularity", type=str, default="per_page",
                    choices=["per_page", "per_comp_token"])
@@ -784,13 +1058,21 @@ def _aggregate_metric_dicts(dicts: list[dict[str, float]]) -> dict[str, float]:
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
+    from oracle.attention_mass_recall_ruler_quest import (
+        _install_recording_forward,
+        _model_family,
+        cleanup_model,
+        load_model,
+    )
+
     args = parse_args()
     start_time = time.time()
     torch.manual_seed(42)
 
     run_name = args.run_name or (
-        f"mass_{args.compression_method}_ps{args.page_size}"
-        f"_topk{args.top_k}_cr{args.compress_ratio}_quant_{args.comp_kv_quant}"
+        f"mass_dense_ps{args.page_size}_topk{args.top_k}"
+        f"_cr{args.compress_ratio}"
+        f"_{args.comp_kv_quant}"
     )
     run_dir = args.output_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -802,10 +1084,11 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    print("Applying DCT page attention patch...")
-    apply_monkey_patch(args)
     print(f"Loading model: {args.base_model}")
     model = load_model(args)
+    print("Installing dense recording forward (no DCT patch)...")
+    _install_recording_forward(model, _model_family(args.base_model))
+    comp_size = max(1, int(args.page_size * args.compress_ratio))
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model, local_files_only=args.local_files_only,
     )
@@ -848,8 +1131,17 @@ def main() -> None:
                 tqdm(samples, desc=f"  {task}"), start=1
             ):
                 records, input_len = generate_with_mass_traces(
-                    model, tokenizer, sample, args.num_decode_steps,
-                    args.group_agg_method,
+                    model, tokenizer, sample,
+                    num_decode_steps=args.num_decode_steps,
+                    page_size=args.page_size,
+                    top_k=args.top_k,
+                    sink_size=args.sink_size,
+                    recent_size=args.recent_size,
+                    comp_size=comp_size,
+                    scoring_method=args.scoring_method,
+                    group_agg_method=args.group_agg_method,
+                    comp_kv_quant=args.comp_kv_quant,
+                    comp_kv_quant_granularity=args.comp_kv_quant_granularity,
                 )
                 if not records:
                     print(f"  WARNING: no traces for sample {sample['index']} "
@@ -900,22 +1192,30 @@ def main() -> None:
                     o = _aggregate_metric_dicts(task_overall_records)
                     print(
                         f"  [{sample_idx}/{len(samples)}] "
-                        f"sr={o['mass_recall_sink_recent']:.3f}  "
+                        f"sink={o['mass_recall_sink']:.3f} "
+                        f"recent={o['mass_recall_recent']:.3f}  "
                         f"mass[p/q/s/o/c] = "
                         f"{o['mass_recall_proxy']:.3f}/"
                         f"{o['mass_recall_quest']:.3f}/"
                         f"{o['mass_recall_shadowkv']:.3f}/"
                         f"{o['mass_recall_oracle_max']:.3f}/"
                         f"{o['mass_recall_mass_topk']:.3f}  "
+                        f"sel[p/q/s/o/c] = "
+                        f"{o['selected_mass_proxy']:.3f}/"
+                        f"{o['selected_mass_quest']:.3f}/"
+                        f"{o['selected_mass_shadowkv']:.3f}/"
+                        f"{o['selected_mass_oracle_max']:.3f}/"
+                        f"{o['selected_mass_mass_topk']:.3f}  "
                         f"paged[p/q/s/o/c] = "
                         f"{o['paged_mass_recall_proxy']:.3f}/"
                         f"{o['paged_mass_recall_quest']:.3f}/"
                         f"{o['paged_mass_recall_shadowkv']:.3f}/"
                         f"{o['paged_mass_recall_oracle_max']:.3f}/"
                         f"{o['paged_mass_recall_mass_topk']:.3f}  "
-                        f"ratio[p/q] = "
+                        f"ratio[p/q/s] = "
                         f"{o['paged_mass_ratio_proxy']:.3f}/"
-                        f"{o['paged_mass_ratio_quest']:.3f}  "
+                        f"{o['paged_mass_ratio_quest']:.3f}/"
+                        f"{o['paged_mass_ratio_shadowkv']:.3f}  "
                         f"fid[p/q/s/o] = "
                         f"{o['output_fidelity_proxy']:.3f}/"
                         f"{o['output_fidelity_quest']:.3f}/"
@@ -936,18 +1236,23 @@ def main() -> None:
             o = per_task_results[task]["overall"]
             print(
                 f"  TASK SUMMARY\n"
-                f"    sink+recent (floor)                     = "
-                f"{o['mass_recall_sink_recent']:.3f}\n"
+                f"    sink / recent (floor)                   = "
+                f"{o['mass_recall_sink']:.3f} / {o['mass_recall_recent']:.3f}\n"
                 f"    mass   [proxy/quest/shadow/oracle/ceil] = "
                 f"{o['mass_recall_proxy']:.3f} / {o['mass_recall_quest']:.3f} / "
                 f"{o['mass_recall_shadowkv']:.3f} / {o['mass_recall_oracle_max']:.3f} / "
                 f"{o['mass_recall_mass_topk']:.3f}\n"
+                f"    select [proxy/quest/shadow/oracle/ceil] = "
+                f"{o['selected_mass_proxy']:.3f} / {o['selected_mass_quest']:.3f} / "
+                f"{o['selected_mass_shadowkv']:.3f} / {o['selected_mass_oracle_max']:.3f} / "
+                f"{o['selected_mass_mass_topk']:.3f}\n"
                 f"    paged  [proxy/quest/shadow/oracle/ceil] = "
                 f"{o['paged_mass_recall_proxy']:.3f} / {o['paged_mass_recall_quest']:.3f} / "
                 f"{o['paged_mass_recall_shadowkv']:.3f} / {o['paged_mass_recall_oracle_max']:.3f} / "
                 f"{o['paged_mass_recall_mass_topk']:.3f}\n"
-                f"    ratio  [proxy/quest vs ceil]            = "
-                f"{o['paged_mass_ratio_proxy']:.3f} / {o['paged_mass_ratio_quest']:.3f}\n"
+                f"    ratio  [proxy/quest/shadow vs ceil]     = "
+                f"{o['paged_mass_ratio_proxy']:.3f} / {o['paged_mass_ratio_quest']:.3f} / "
+                f"{o['paged_mass_ratio_shadowkv']:.3f}\n"
                 f"    fidelity[proxy/quest/shadow/oracle]     = "
                 f"{o['output_fidelity_proxy']:.3f} / {o['output_fidelity_quest']:.3f} / "
                 f"{o['output_fidelity_shadowkv']:.3f} / {o['output_fidelity_oracle_max']:.3f}\n"
@@ -960,6 +1265,7 @@ def main() -> None:
         summary = {
             "config": {
                 "base_model": args.base_model,
+                "trajectory": "dense",
                 "seq_len": args.seq_len,
                 "num_samples": args.num_samples,
                 "num_decode_steps": args.num_decode_steps,
@@ -968,12 +1274,9 @@ def main() -> None:
                 "sink_size": args.sink_size,
                 "recent_size": args.recent_size,
                 "compress_ratio": args.compress_ratio,
-                "compression_method": args.compression_method,
-                "compressed_token_rope": args.compressed_token_rope,
-                "proxy_frequency_layout": args.proxy_frequency_layout,
+                "comp_size": comp_size,
                 "scoring_method": args.scoring_method,
                 "group_agg_method": args.group_agg_method,
-                "unselected_mode": args.unselected_mode,
                 "comp_kv_quant": args.comp_kv_quant,
                 "comp_kv_quant_granularity": args.comp_kv_quant_granularity,
             },

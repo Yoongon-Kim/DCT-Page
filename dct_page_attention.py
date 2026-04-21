@@ -1484,7 +1484,7 @@ def dct_page_attention_forward(
     hidden_states: torch.Tensor,
     position_embeddings: tuple,
     attention_mask: Optional[torch.Tensor] = None, # The type can be torch.Tensor or None, and the default value is None
-    past_key_value: Optional[Cache] = None,
+    past_key_values: Optional[Cache] = None,
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> tuple:
@@ -1494,8 +1494,6 @@ def dct_page_attention_forward(
     - Prefill (q_len > 1): standard full causal attention.
     - Decode (q_len == 1, long KV cache): DCT page attention.
     """
-    # transformers 4.54 passes the cache as 'past_key_value' (singular)
-    past_key_values = past_key_value
     cfg = _dct_page_cfg
     num_score_proxy_modes = sum(
         int(flag)
