@@ -147,6 +147,10 @@ def parse_args():
                         help="In compressed mode, scale each unselected-page rep's softmax mass "
                              "by page_size/comp_size via a log(n) bias on QK logits "
                              "(multipole-style population weighting). No-op for drop mode.")
+    parser.add_argument("--score_use_quest_minmax", action="store_true",
+                        help="Use QUEST-style min/max key metadata scoring instead of compressed proxy scoring")
+    parser.add_argument("--max_unselected_compressed", type=int, default=-1,
+                        help="Max unselected pages to keep as compressed KV (-1=all, 0=drop all, N=top-N by score)")
     parser.add_argument("--no_triton", action="store_true")
     parser.add_argument("--comp_kv_quant", type=str, default="none",
                         choices=["none", "fp8_e4m3", "fp8_e5m2", "int8", "int4"],
@@ -198,7 +202,7 @@ def parse_args():
         elif args.mode == "multipole_attention":
             args.run_name = f"{tag}_multipole_attention"
         elif args.mode == "quest_attention":
-            args.run_name = f"{tag}_quest_attention"
+            args.run_name = f"{tag}_quest_ps{args.page_size}_pb{args.top_k}"
         elif args.mode == "duo_attention":
             args.run_name = f"{tag}_duo_attention"
         elif args.mode == "shadowkv":
@@ -313,6 +317,8 @@ def apply_monkey_patch(args):
                 weight_compressed_by_population=args.weight_compressed_by_population,
                 comp_kv_quant=args.comp_kv_quant,
                 comp_kv_quant_granularity=args.comp_kv_quant_granularity,
+                score_use_quest_minmax=args.score_use_quest_minmax,
+                max_unselected_compressed=args.max_unselected_compressed,
             )
         elif "qwen3" in model_name_lower:
             from dct_page_attention import replace_qwen3_attn
@@ -332,6 +338,8 @@ def apply_monkey_patch(args):
                 weight_compressed_by_population=args.weight_compressed_by_population,
                 comp_kv_quant=args.comp_kv_quant,
                 comp_kv_quant_granularity=args.comp_kv_quant_granularity,
+                score_use_quest_minmax=args.score_use_quest_minmax,
+                max_unselected_compressed=args.max_unselected_compressed,
             )
         else:
             from dct_page_attention import replace_qwen2_attn
@@ -351,6 +359,8 @@ def apply_monkey_patch(args):
                 weight_compressed_by_population=args.weight_compressed_by_population,
                 comp_kv_quant=args.comp_kv_quant,
                 comp_kv_quant_granularity=args.comp_kv_quant_granularity,
+                score_use_quest_minmax=args.score_use_quest_minmax,
+                max_unselected_compressed=args.max_unselected_compressed,
             )
     elif args.mode == "multipole_attention":
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "baselines"))
@@ -415,25 +425,32 @@ def load_model_and_tokenizer(args):
               f"Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
     elif args.mode == "quest_attention":
         from quest_attn.config import QUEST_ATTN_CONFIG
-        from quest_attn import LlamaForCausalLM as QuestLlamaForCausalLM
 
-        base_model = QUEST_ATTN_CONFIG["base_model"]
+        base_model = args.base_model
+        page_size = args.page_size
+        token_budget = args.page_size * args.top_k  # top_k used as page_budget
+        max_seq_len = QUEST_ATTN_CONFIG["max_seq_len"]
+
         model_name_lower = base_model.lower()
-        if not any(fam in model_name_lower for fam in ["llama", "mistral"]):
+        if "qwen3" in model_name_lower:
+            from quest_attn import Qwen3ForCausalLM as QuestModel
+        elif any(fam in model_name_lower for fam in ["llama", "mistral"]):
+            from quest_attn import LlamaForCausalLM as QuestModel
+        else:
             raise ValueError(
-                f"Quest only supports LLaMA-family models (Llama-2, Llama-3.x, Mistral), "
+                f"Quest supports LLaMA-family (Llama-2, Llama-3.x, Mistral) and Qwen3 models, "
                 f"got: {base_model}"
             )
-        print(f"Loading Quest model: {base_model}")
-        model = QuestLlamaForCausalLM.from_pretrained(
+        print(f"Loading Quest model: {base_model} (page_size={page_size}, page_budget={args.top_k}, token_budget={token_budget})")
+        model = QuestModel.from_pretrained(
             base_model,
             device_map="cuda:0",
             torch_dtype=torch.float16,
         )
         model.quest_init(
-            page_size=QUEST_ATTN_CONFIG["page_size"],
-            max_seq_len=QUEST_ATTN_CONFIG["max_seq_len"],
-            token_budget=QUEST_ATTN_CONFIG["token_budget"],
+            page_size=page_size,
+            max_seq_len=max_seq_len,
+            token_budget=token_budget,
             dtype=torch.float16,
             device=torch.device("cuda:0"),
         )
@@ -466,7 +483,7 @@ def load_model_and_tokenizer(args):
         # transformers env it runs in does not accept rope_parameters=).
         if "qwen3" in args.base_model.lower() and args.mode != "inf_llm":
             yarn_kwargs = {
-                "rope_parameters": {
+                "rope_scaling": {
                     "rope_type": "yarn",
                     "rope_theta": 1000000.0,
                     "factor": 4.0,
@@ -490,7 +507,7 @@ def load_model_and_tokenizer(args):
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
             **dtype_kwarg,
-            device_map="auto",
+            device_map="cuda:0",
             attn_implementation=attn_impl,
             **yarn_kwargs,
             **inf_llm_config_override,
@@ -687,6 +704,120 @@ def write_summary_csv(eval_results, pred_dir):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _save_summary(args, all_seq_results):
+    """Build and save summary.csv + summary.json from current results."""
+    if not all_seq_results:
+        return
+
+    seq_lens = sorted(all_seq_results.keys())
+
+    # Per-seq-len summary.csv
+    for sl in seq_lens:
+        sl_results = all_seq_results.get(sl, {})
+        if not sl_results:
+            continue
+        pred_dir = Path(args.output_dir) / args.run_name / "synthetic" / str(sl) / "pred"
+        eval_results = {t: {"score": s, "nulls": ""} for t, s in sl_results.items()}
+        write_summary_csv(eval_results, pred_dir)
+
+    # Consolidated summary.json
+    task_avgs = {}
+    for task in args.tasks:
+        scores = []
+        for sl in seq_lens:
+            if task in all_seq_results.get(sl, {}):
+                scores.append(all_seq_results[sl][task])
+        if scores:
+            task_avgs[task] = sum(scores) / len(scores)
+
+    overall_scores = []
+    for sl in seq_lens:
+        sl_scores = list(all_seq_results.get(sl, {}).values())
+        if sl_scores:
+            overall_scores.append(sum(sl_scores) / len(sl_scores))
+    overall = sum(overall_scores) / len(overall_scores) if overall_scores else 0
+
+    summary = {
+        "mode": args.mode,
+        "base_model": args.base_model,
+        "run_name": args.run_name,
+        "seq_length_scores": {str(sl): all_seq_results[sl] for sl in seq_lens},
+        "task_averages": {t: round(a, 2) for t, a in task_avgs.items()},
+        "overall": round(overall, 2),
+    }
+    if args.mode == "page_attention":
+        summary["top_k"] = args.top_k
+        summary["page_size"] = args.page_size
+        summary["compress_ratio"] = args.compress_ratio
+        summary["scoring_method"] = args.scoring_method
+        summary["group_agg_method"] = args.group_agg_method
+        summary["unselected_mode"] = args.unselected_mode
+    elif args.mode == "seer_attention":
+        from seer_attn.config import SEER_ATTN_CONFIG
+        summary["seer_attn_config"] = SEER_ATTN_CONFIG
+    elif args.mode == "multipole_attention":
+        from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
+        summary["multipole_attn_config"] = MULTIPOLE_ATTN_CONFIG
+    elif args.mode == "quest_attention":
+        summary["quest_attn_config"] = {
+            "base_model": args.base_model,
+            "page_size": args.page_size,
+            "page_budget": args.top_k,
+            "token_budget": args.page_size * args.top_k,
+        }
+
+    summary_path = Path(args.output_dir) / args.run_name / "summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+
+
+def _print_results_table(args, all_seq_results):
+    """Print the formatted results table."""
+    print(f"\n{'=' * 60}")
+    print(f"RULER Results — {args.run_name}")
+    print("=" * 60)
+
+    if not all_seq_results:
+        return
+
+    seq_lens = sorted(all_seq_results.keys())
+    header = f"{'Task':24s}" + "".join(f" {sl:>8d}" for sl in seq_lens) + "     Avg"
+    print(header)
+    print("-" * len(header))
+
+    task_avgs = {}
+    for task in args.tasks:
+        scores = []
+        row = f"{task:24s}"
+        for sl in seq_lens:
+            if task in all_seq_results.get(sl, {}):
+                s = all_seq_results[sl][task]
+                scores.append(s)
+                row += f" {s:>8.2f}"
+            else:
+                row += f" {'N/A':>8s}"
+        avg = sum(scores) / len(scores) if scores else 0
+        task_avgs[task] = avg
+        row += f" {avg:>7.2f}"
+        print(row)
+
+    print("-" * len(header))
+    overall_scores = []
+    row = f"{'AVERAGE':24s}"
+    for sl in seq_lens:
+        sl_scores = list(all_seq_results.get(sl, {}).values())
+        if sl_scores:
+            sl_avg = sum(sl_scores) / len(sl_scores)
+            overall_scores.append(sl_avg)
+            row += f" {sl_avg:>8.2f}"
+        else:
+            row += f" {'N/A':>8s}"
+    overall = sum(overall_scores) / len(overall_scores) if overall_scores else 0
+    row += f" {overall:>7.2f}"
+    print(row)
+    print("=" * len(header))
+
+
 def main():
     args = parse_args()
     start_time = time.time()
@@ -728,7 +859,6 @@ def main():
         pred_dir = Path(args.output_dir) / args.run_name / "synthetic" / str(seq_len) / "pred"
         pred_dir.mkdir(parents=True, exist_ok=True)
 
-        eval_results = {}
         for task in args.tasks:
             if task not in task_configs:
                 continue
@@ -740,99 +870,16 @@ def main():
 
             if predictions:
                 score, nulls = evaluate_task(predictions, task_configs[task])
-                eval_results[task] = {"score": score, "nulls": nulls}
                 print(f"  {task}: score={score:.2f}, nulls={nulls}")
 
-        if eval_results:
-            write_summary_csv(eval_results, pred_dir)
-            all_seq_results[seq_len] = {t: r["score"] for t, r in eval_results.items()}
+                # Update accumulated results and save immediately
+                if seq_len not in all_seq_results:
+                    all_seq_results[seq_len] = {}
+                all_seq_results[seq_len][task] = score
+                _save_summary(args, all_seq_results)
 
-    # Step 4: Consolidated summary
-    print(f"\n{'=' * 60}")
-    print(f"RULER Results — {args.run_name}")
-    print("=" * 60)
-
-    if all_seq_results:
-        # Header
-        seq_lens = sorted(all_seq_results.keys())
-        header = f"{'Task':24s}" + "".join(f" {sl:>8d}" for sl in seq_lens) + "     Avg"
-        print(header)
-        print("-" * len(header))
-
-        task_avgs = {}
-        for task in args.tasks:
-            scores = []
-            row = f"{task:24s}"
-            for sl in seq_lens:
-                if task in all_seq_results.get(sl, {}):
-                    s = all_seq_results[sl][task]
-                    scores.append(s)
-                    row += f" {s:>8.2f}"
-                else:
-                    row += f" {'N/A':>8s}"
-            avg = sum(scores) / len(scores) if scores else 0
-            task_avgs[task] = avg
-            row += f" {avg:>7.2f}"
-            print(row)
-
-        # Overall average
-        print("-" * len(header))
-        overall_scores = []
-        row = f"{'AVERAGE':24s}"
-        for sl in seq_lens:
-            sl_scores = list(all_seq_results.get(sl, {}).values())
-            if sl_scores:
-                sl_avg = sum(sl_scores) / len(sl_scores)
-                overall_scores.append(sl_avg)
-                row += f" {sl_avg:>8.2f}"
-            else:
-                row += f" {'N/A':>8s}"
-        overall = sum(overall_scores) / len(overall_scores) if overall_scores else 0
-        row += f" {overall:>7.2f}"
-        print(row)
-        print("=" * len(header))
-
-        # Save consolidated summary JSON
-        summary_path = Path(args.output_dir) / args.run_name / "summary.json"
-        summary = {
-            "mode": args.mode,
-            "base_model": args.base_model,
-            "run_name": args.run_name,
-            "seq_length_scores": {str(sl): all_seq_results[sl] for sl in seq_lens},
-            "task_averages": {t: round(a, 2) for t, a in task_avgs.items()},
-            "overall": round(overall, 2),
-        }
-        if args.mode == "page_attention":
-            summary["top_k"] = args.top_k
-            summary["page_size"] = args.page_size
-            summary["compress_ratio"] = args.compress_ratio
-            summary["scoring_method"] = args.scoring_method
-            summary["group_agg_method"] = args.group_agg_method
-            summary["unselected_mode"] = args.unselected_mode
-        elif args.mode == "seer_attention":
-            from seer_attn.config import SEER_ATTN_CONFIG
-            summary["seer_attn_config"] = SEER_ATTN_CONFIG
-        elif args.mode == "seer_prefill":
-            from seer_attn.prefill_config import SEER_PREFILL_CONFIG
-            summary["seer_prefill_config"] = SEER_PREFILL_CONFIG
-        elif args.mode == "multipole_attention":
-            from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
-            summary["multipole_attn_config"] = MULTIPOLE_ATTN_CONFIG
-        elif args.mode == "quest_attention":
-            from quest_attn.config import QUEST_ATTN_CONFIG
-            summary["quest_attn_config"] = QUEST_ATTN_CONFIG
-        elif args.mode == "duo_attention":
-            from duo_attn_baseline.config import DUO_ATTN_CONFIG
-            summary["duo_attn_config"] = DUO_ATTN_CONFIG
-        elif args.mode == "shadowkv":
-            from shadow_kv.config import SHADOWKV_CONFIG
-            summary["shadowkv_config"] = SHADOWKV_CONFIG
-        elif args.mode == "inf_llm":
-            from inf_llm_baseline.config import INF_LLM_CONFIG
-            summary["inf_llm_config"] = INF_LLM_CONFIG
-        with open(summary_path, "w") as f:
-            json.dump(summary, f, indent=2)
-        print(f"\nSummary saved to: {summary_path}")
+    # Step 4: Final results table
+    _print_results_table(args, all_seq_results)
 
     elapsed = (time.time() - start_time) / 60
     print(f"Total time: {elapsed:.1f} minutes")

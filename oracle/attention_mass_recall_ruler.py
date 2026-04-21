@@ -23,23 +23,25 @@ Reports per-query-head metrics grouped into three families.
   set_recall              = |DCT ∩ oracle_max| / K                         (page-set baseline)
 
 (B) PAGED-ONLY MASS metrics (no sink/recent floor; denominator = total
-    attention mass = 1 per head, since softmax sums to 1):
+    paged attention mass Σ_p m[p] = 1 − (sink_mass + recent_mass)):
 
-  paged_mass_recall_proxy       = Σ_{p∈DCT topK} m[p]
-  paged_mass_recall_quest       = Σ_{p∈Quest topK} m[p]
-  paged_mass_recall_shadowkv    = Σ_{p∈ShadowKV topK} m[p]
-  paged_mass_recall_oracle_max  = Σ_{p∈oracle_max topK} m[p]
-  paged_mass_recall_mass_topk   = Σ_{p∈mass topK} m[p]                   (ceiling)
+  paged_mass_recall_proxy       = Σ_{p∈DCT topK} m[p]       / Σ_p m[p]
+  paged_mass_recall_quest       = Σ_{p∈Quest topK} m[p]     / Σ_p m[p]
+  paged_mass_recall_shadowkv    = Σ_{p∈ShadowKV topK} m[p]  / Σ_p m[p]
+  paged_mass_recall_oracle_max  = Σ_{p∈oracle_max topK} m[p]/ Σ_p m[p]
+  paged_mass_recall_mass_topk   = Σ_{p∈mass topK} m[p]      / Σ_p m[p]   (ceiling)
   paged_mass_ratio_proxy        = paged_mass_recall_proxy / paged_mass_recall_mass_topk
   paged_mass_ratio_quest        = paged_mass_recall_quest / paged_mass_recall_mass_topk
 
-Paged-only strips the always-kept sink + recent floor from the numerator;
-the denominator is the full softmax mass (= 1), so values are the absolute
-fraction of total attention mass captured by the paged selection alone.
-By construction:
+Paged-only strips the always-kept sink + recent floor from both numerator
+and denominator, so values are the fraction of **paged** attention mass
+(not total) captured by the paged selection. This rescales each head's
+paged mass so the ceiling = 1 exactly when K ≥ P, and separates
+selection quality from the always-kept floor. By construction:
 
-  mass_recall_X = paged_mass_recall_X + mass_recall_sink_recent
-  paged_mass_recall_mass_topk ≤ 1 − mass_recall_sink_recent     (ceiling cap)
+  mass_recall_X = paged_mass_recall_X · (1 − mass_recall_sink_recent)
+                  + mass_recall_sink_recent
+  paged_mass_recall_mass_topk ≤ 1        (= 1 when K ≥ P)
 
 FIDELITY metrics (per-head cosine similarity between full and drop-mode
 attention outputs — V-aware, the actual downstream signal):
@@ -131,9 +133,10 @@ MASS_METRIC_KEYS = [
     "mass_recall_oracle_max",
     "mass_recall_mass_topk",
     "set_recall",
-    # Mass of (selected pages) / (total attention mass = 1 per head).
-    # No sink/recent floor in the numerator; denominator is the full
-    # softmax mass, so mass_recall_X = paged_mass_recall_X + mass_recall_sink_recent.
+    # Mass of (selected pages) / (total paged attention mass Σ_p m[p]).
+    # No sink/recent floor in either numerator or denominator; rescales
+    # per-head paged mass so the ceiling = 1 exactly when K ≥ P.
+    # mass_recall_X = paged_mass_recall_X · (1 − sink_recent) + sink_recent.
     "paged_mass_recall_proxy",
     "paged_mass_recall_quest",
     "paged_mass_recall_shadowkv",
@@ -511,19 +514,26 @@ def compute_all_metrics(
 
     # ----- Paged-only mass captured by each selector --------------------------
     # Numerator: softmax mass on the selector's chosen pages (no sink/recent
-    # floor). Denominator: total attention mass = 1 per head (softmax sums
-    # to 1 across sink + paged + recent), so these values are the absolute
-    # fraction of the full attention mass captured by the paged selection
-    # alone, and mass_recall_X = paged_mass_recall_X + mass_recall_sink_recent.
-    paged_mass_recall_proxy = torch.gather(page_mass, -1, sel_q).sum(-1)
-    paged_mass_recall_quest = torch.gather(page_mass, -1, quest_topk_q).sum(-1)
-    paged_mass_recall_shadowkv = torch.gather(
-        page_mass, -1, shadowkv_topk_q,
-    ).sum(-1)
-    paged_mass_recall_oracle_max = torch.gather(
-        page_mass, -1, oracle_topk_q,
-    ).sum(-1)
-    paged_mass_recall_mass_topk = torch.gather(page_mass, -1, mass_topk_idx).sum(-1)
+    # floor). Denominator: total paged mass per head (sink + recent excluded),
+    # clamped to 1e-8 to guard against heads whose mass lands entirely on
+    # sink/recent. Values are the fraction of paged attention mass captured,
+    # with ceiling = 1 exactly when K ≥ P.
+    paged_total = page_mass.sum(-1).clamp(min=1e-8)                            # [H_q]
+    paged_mass_recall_proxy = (
+        torch.gather(page_mass, -1, sel_q).sum(-1) / paged_total
+    )
+    paged_mass_recall_quest = (
+        torch.gather(page_mass, -1, quest_topk_q).sum(-1) / paged_total
+    )
+    paged_mass_recall_shadowkv = (
+        torch.gather(page_mass, -1, shadowkv_topk_q).sum(-1) / paged_total
+    )
+    paged_mass_recall_oracle_max = (
+        torch.gather(page_mass, -1, oracle_topk_q).sum(-1) / paged_total
+    )
+    paged_mass_recall_mass_topk = (
+        torch.gather(page_mass, -1, mass_topk_idx).sum(-1) / paged_total
+    )
 
     # Paged ceiling must dominate all four paged-selector metrics.
     if not (paged_mass_recall_mass_topk + tol >= paged_mass_recall_proxy).all():

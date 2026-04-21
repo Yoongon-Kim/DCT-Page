@@ -607,17 +607,20 @@ def main():
         print(f"Model loaded. Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
     elif args.mode == "quest_attention":
         from quest_attn.config import QUEST_ATTN_CONFIG
-        from quest_attn import LlamaForCausalLM as QuestLlamaForCausalLM
 
         base_model = QUEST_ATTN_CONFIG["base_model"]
         model_name_lower = base_model.lower()
-        if not any(fam in model_name_lower for fam in ["llama", "mistral"]):
+        if "qwen3" in model_name_lower:
+            from quest_attn import Qwen3ForCausalLM as QuestModel
+        elif any(fam in model_name_lower for fam in ["llama", "mistral"]):
+            from quest_attn import LlamaForCausalLM as QuestModel
+        else:
             raise ValueError(
-                f"Quest only supports LLaMA-family models (Llama-2, Llama-3.x, Mistral), "
+                f"Quest supports LLaMA-family (Llama-2, Llama-3.x, Mistral) and Qwen3 models, "
                 f"got: {base_model}"
             )
         print(f"Loading Quest model: {base_model}")
-        model = QuestLlamaForCausalLM.from_pretrained(
+        model = QuestModel.from_pretrained(
             base_model,
             device_map="cuda:0",
             torch_dtype=torch.float16,
