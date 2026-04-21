@@ -100,7 +100,8 @@ def parse_args():
                                  "seer_prefill",
                                  "multipole_attention", "quest_attention",
                                  "duo_attention",
-                                 "shadowkv"])
+                                 "shadowkv",
+                                 "inf_llm"])
 
     # Model
     parser.add_argument("--base_model", type=str,
@@ -167,6 +168,17 @@ def parse_args():
     parser.add_argument("--chunk_size", type=int, default=8,
                         help="ShadowKV: tokens per landmark chunk.")
 
+    # InfLLM baseline params (only used when --mode inf_llm). Main sparsity
+    # knobs (topk, n_local, block_size) stay config-only for now.
+    parser.add_argument("--inf_llm_n_init", type=int, default=128,
+                        help="InfLLM: sink token count.")
+    parser.add_argument("--inf_llm_repr_topk", type=int, default=4,
+                        help="InfLLM: representative tokens per block.")
+    parser.add_argument("--inf_llm_max_cached_block", type=int, default=32,
+                        help="InfLLM: GPU block cache size.")
+    parser.add_argument("--inf_llm_chunk_size", type=int, default=8192,
+                        help="InfLLM: prefill chunk size for GreedySearch.")
+
     parser.add_argument("--skip_existing", action="store_true",
                         help="Skip run if summary.json already exists in output dir")
 
@@ -193,6 +205,9 @@ def parse_args():
             args.run_name = (f"{tag}_shadowkv_{args.shadowkv_cache_mode}"
                              f"_sb{args.sparse_budget}_r{args.rank}"
                              f"_cs{args.chunk_size}")
+        elif args.mode == "inf_llm":
+            args.run_name = (f"{tag}_inf_llm_nini{args.inf_llm_n_init}"
+                             f"_repr{args.inf_llm_repr_topk}")
 
     if args.skip_existing:
         summary_path = Path(args.output_dir) / args.run_name / "summary.json"
@@ -350,6 +365,8 @@ def apply_monkey_patch(args):
         pass  # DuoAttention patches per-instance forwards post-load (see load_model_and_tokenizer)
     elif args.mode == "shadowkv":
         pass  # ShadowKV uses a custom LLM class; no monkey-patch needed.
+    elif args.mode == "inf_llm":
+        pass  # InfLLM patches per-instance forwards post-load (see load_model_and_tokenizer)
     elif args.mode == "baseline":
         print("Baseline mode: full attention (no monkey-patch)")
 
@@ -439,12 +456,15 @@ def load_model_and_tokenizer(args):
         tokenizer = model.tokenizer
         print("ShadowKV LLM ready.")
     else:
-        # DuoAttention's replacement forward assumes eager-style Q/K/V signatures.
-        attn_impl = "eager" if args.mode == "duo_attention" else "sdpa"
+        # DuoAttention's and InfLLM's replacement forwards assume eager-style Q/K/V signatures.
+        attn_impl = "eager" if args.mode in {"duo_attention", "inf_llm"} else "sdpa"
         print(f"Loading model: {args.base_model} (attn: {attn_impl})")
         tokenizer = AutoTokenizer.from_pretrained(args.base_model)
         yarn_kwargs = {}
-        if "qwen3" in args.base_model.lower():
+        # InfLLM replaces RoPE with its own RotaryEmbeddingESM and is Llama-only,
+        # so the Qwen3-yarn rope_scaling injection is irrelevant (and the old
+        # transformers env it runs in does not accept rope_parameters=).
+        if "qwen3" in args.base_model.lower() and args.mode != "inf_llm":
             yarn_kwargs = {
                 "rope_parameters": {
                     "rope_type": "yarn",
@@ -454,15 +474,26 @@ def load_model_and_tokenizer(args):
                 },
                 "max_position_embeddings": 131072,
             }
-        # transformers 4.45 (duo_attention env) only accepts torch_dtype=;
+        # Old transformers envs (duo_attention, inf_llm) only accept torch_dtype=;
         # transformers 5.x (main DCT-Page env) only accepts dtype=.
-        dtype_kwarg = {"torch_dtype": torch.bfloat16} if args.mode == "duo_attention" else {"dtype": torch.bfloat16}
+        dtype_kwarg = (
+            {"torch_dtype": torch.bfloat16}
+            if args.mode in {"duo_attention", "inf_llm"}
+            else {"dtype": torch.bfloat16}
+        )
+        # InfLLM's transformers 4.37 can't parse Llama-3.1's rope_type='llama3';
+        # strip rope_scaling up front (InfLLM replaces RoPE anyway).
+        inf_llm_config_override = {}
+        if args.mode == "inf_llm":
+            from inf_llm_baseline import load_llama_config_stripped_rope
+            inf_llm_config_override["config"] = load_llama_config_stripped_rope(args.base_model)
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
             **dtype_kwarg,
             device_map="auto",
             attn_implementation=attn_impl,
             **yarn_kwargs,
+            **inf_llm_config_override,
         )
         model.eval()
         print(f"Model loaded. Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
@@ -478,6 +509,22 @@ def load_model_and_tokenizer(args):
             assert_llama(args.base_model)
             DUO_ATTN_CONFIG["base_model"] = args.base_model
             init_duo_attention(model, DUO_ATTN_CONFIG)
+
+        if args.mode == "inf_llm":
+            from inf_llm_baseline import (
+                assert_llama_only,
+                build_inf_llm_generator,
+                init_inf_llm,
+            )
+            from inf_llm_baseline.config import INF_LLM_CONFIG
+            assert_llama_only(args.base_model)
+            INF_LLM_CONFIG["base_model"] = args.base_model
+            INF_LLM_CONFIG["n_init"] = args.inf_llm_n_init
+            INF_LLM_CONFIG["repr_topk"] = args.inf_llm_repr_topk
+            INF_LLM_CONFIG["max_cached_block"] = args.inf_llm_max_cached_block
+            INF_LLM_CONFIG["chunk_size"] = args.inf_llm_chunk_size
+            init_inf_llm(model, INF_LLM_CONFIG)
+            args._inf_llm_generator = build_inf_llm_generator(model, tokenizer, INF_LLM_CONFIG)
 
     return model, tokenizer
 
@@ -544,6 +591,17 @@ def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
                         max_new_tokens=tokens_to_generate,
                         eos_token_ids=eos_ids,
                     )
+                elif args.mode == "inf_llm":
+                    # InfLLM uses a stateful ContextManager KV cache that HF
+                    # generate() cannot round-trip. Use our GreedySearch adapter.
+                    _eos = model.generation_config.eos_token_id
+                    extra_eos = (list(_eos) if isinstance(_eos, (list, tuple)) else [_eos])
+                    extra_eos = [e for e in extra_eos if e is not None and e != tokenizer.eos_token_id]
+                    output_ids = args._inf_llm_generator.generate(
+                        input_ids,
+                        max_new_tokens=tokens_to_generate,
+                        extra_end_token_ids=extra_eos,
+                    )
                 else:
                     output_ids = model.generate(
                         input_ids,
@@ -559,6 +617,9 @@ def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
                 model.quest_clear()
             elif args.mode == "shadowkv":
                 model.shadowkv_clear()
+            elif args.mode == "inf_llm":
+                # ContextManager persists past_kv across samples; reset it.
+                args._inf_llm_generator.clear()
 
             result = {
                 "index": sample["index"],
@@ -766,6 +827,9 @@ def main():
         elif args.mode == "shadowkv":
             from shadow_kv.config import SHADOWKV_CONFIG
             summary["shadowkv_config"] = SHADOWKV_CONFIG
+        elif args.mode == "inf_llm":
+            from inf_llm_baseline.config import INF_LLM_CONFIG
+            summary["inf_llm_config"] = INF_LLM_CONFIG
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
         print(f"\nSummary saved to: {summary_path}")

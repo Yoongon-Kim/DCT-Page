@@ -56,6 +56,20 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--compression_method", type=str, default="dct", choices=["haar", "dct"],
                    help="Compression method for unselected pages: 'haar' (default) or 'dct'.")
+    p.add_argument(
+        "--comp_kv_quant",
+        default="none",
+        help="Comma-separated comp-KV fake-quant modes to sweep. "
+             "Each entry in {'none','fp8_e4m3','fp8_e5m2','int8','int4'}. "
+             "E.g. 'none', 'fp8_e4m3', or 'none,fp8_e4m3,int8' to run multiple.",
+    )
+    p.add_argument(
+        "--comp_kv_quant_granularity",
+        default="per_page",
+        choices=["per_page", "per_comp_token"],
+        help="Scale granularity for --comp_kv_quant (applied to every swept quant mode; "
+             "ignored when the mode is 'none').",
+    )
     p.add_argument("--scoring_method", type=str, default="max",
                    help="'mean'|'max'|'sum'|'proxy_dc_ac_{lam}'|'spread_dc_ac_{lam}'")
     p.add_argument("--group_agg_method", type=str, default="max", choices=["mean", "max", "topp"],
@@ -94,6 +108,28 @@ def parse_weight_pop(value: str) -> list[bool]:
     return out
 
 
+_VALID_COMP_KV_QUANTS = ("none", "fp8_e4m3", "fp8_e5m2", "int8", "int4")
+
+
+def parse_comp_kv_quant(value: str) -> list[str]:
+    out = []
+    seen = set()
+    for x in value.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        if x not in _VALID_COMP_KV_QUANTS:
+            raise ValueError(
+                f"--comp_kv_quant entries must be one of {list(_VALID_COMP_KV_QUANTS)}, got {x!r}"
+            )
+        if x not in seen:
+            out.append(x)
+            seen.add(x)
+    if not out:
+        raise ValueError("--comp_kv_quant must contain at least one value")
+    return out
+
+
 def resolve_tasks(value: str) -> list[str]:
     if value == "all":
         return list(TASKS)
@@ -111,9 +147,14 @@ def make_run_root(
     compress_ratio: float,
     compression_method: str,
     weight_pop: bool,
+    comp_kv_quant: str,
 ) -> Path:
     pop_tag = "popw" if weight_pop else "nopopw"
-    run_root = output_root / f"ps{page_size}_topk{top_k}_cr{compress_ratio}_{compression_method}_{pop_tag}"
+    quant_tag = "noquant" if comp_kv_quant == "none" else comp_kv_quant
+    run_root = output_root / (
+        f"ps{page_size}_topk{top_k}_cr{compress_ratio}_{compression_method}"
+        f"_{pop_tag}_{quant_tag}"
+    )
     run_root.mkdir(parents=True, exist_ok=True)
     return run_root
 
@@ -131,6 +172,8 @@ def build_run_cmd(
     scoring_method: str,
     group_agg_method: str,
     weight_pop: bool,
+    comp_kv_quant: str,
+    comp_kv_quant_granularity: str,
     data_root: Path,
     num_samples: int,
     max_new_tokens: int,
@@ -178,6 +221,10 @@ def build_run_cmd(
         compression_method,
         *(["--dct_score_use_low_proxy"] if compression_method == "dct" else []),
         "--dct_select_with_oracle_page_scores",
+        "--dct_comp_kv_quant",
+        comp_kv_quant,
+        "--dct_comp_kv_quant_granularity",
+        comp_kv_quant_granularity,
     ]
     if weight_pop:
         cmd.append("--dct_weight_compressed_by_population")
@@ -262,85 +309,102 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     combos = parse_combos(args.combos)
     weight_pops = parse_weight_pop(args.weight_pop)
+    comp_kv_quants = parse_comp_kv_quant(args.comp_kv_quant)
     tasks = resolve_tasks(args.tasks)
 
-    for weight_pop in weight_pops:
-        for page_size, top_k in combos:
-            run_root = make_run_root(
-                args.output_root, page_size, top_k, args.compress_ratio, args.compression_method, weight_pop
-            )
+    for comp_kv_quant in comp_kv_quants:
+        for weight_pop in weight_pops:
+            for page_size, top_k in combos:
+                run_root = make_run_root(
+                    args.output_root,
+                    page_size,
+                    top_k,
+                    args.compress_ratio,
+                    args.compression_method,
+                    weight_pop,
+                    comp_kv_quant,
+                )
 
-            if (run_root / "summary.json").exists():
+                if (run_root / "summary.json").exists():
+                    print(
+                        f"\n[oracle_hybrid] SKIP page_size={page_size} top_k={top_k} "
+                        f"cr={args.compress_ratio} weight_pop={int(weight_pop)} "
+                        f"comp_kv_quant={comp_kv_quant} "
+                        f"gran={args.comp_kv_quant_granularity} "
+                        f"— summary already exists in {run_root}",
+                        flush=True,
+                    )
+                    continue
+
+                manifest = {
+                    "model_name_or_path": args.model_name_or_path,
+                    "context_len": args.context_len,
+                    "page_size": page_size,
+                    "top_k": top_k,
+                    "compress_ratio": args.compress_ratio,
+                    "weight_compressed_by_population": weight_pop,
+                    "compression_method": args.compression_method,
+                    "scoring_method": args.scoring_method,
+                    "group_agg_method": args.group_agg_method,
+                    "unselected_mode": "compressed",
+                    "select_with_oracle_page_scores": True,
+                    "comp_kv_quant": comp_kv_quant,
+                    "comp_kv_quant_granularity": args.comp_kv_quant_granularity,
+                    "num_samples": args.num_samples,
+                    "max_new_tokens": args.max_new_tokens,
+                    "cuda_device": args.cuda_device,
+                    "tasks": tasks,
+                    "assumption": "Oracle page selection + hybrid mode: selected pages use full tokens, "
+                    f"unselected pages use {args.compression_method} compressed proxy KV cache "
+                    f"(comp_kv_quant={comp_kv_quant}, granularity={args.comp_kv_quant_granularity}).",
+                }
+                (run_root / "manifest.json").write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+
+                cmd = build_run_cmd(
+                    script_path=script_path,
+                    model_name_or_path=args.model_name_or_path,
+                    run_dir=run_root,
+                    context_len=args.context_len,
+                    tasks=tasks,
+                    page_size=page_size,
+                    top_k=top_k,
+                    compress_ratio=args.compress_ratio,
+                    compression_method=args.compression_method,
+                    scoring_method=args.scoring_method,
+                    group_agg_method=args.group_agg_method,
+                    weight_pop=weight_pop,
+                    comp_kv_quant=comp_kv_quant,
+                    comp_kv_quant_granularity=args.comp_kv_quant_granularity,
+                    data_root=args.data_root,
+                    num_samples=args.num_samples,
+                    max_new_tokens=args.max_new_tokens,
+                    cuda_device=args.cuda_device,
+                    local_files_only=args.local_files_only,
+                )
+                (run_root / "command.sh").write_text(
+                    "#!/usr/bin/env bash\nset -euo pipefail\n\n"
+                    + " ".join(shlex.quote(part) for part in cmd)
+                    + "\n",
+                    encoding="utf-8",
+                )
                 print(
-                    f"\n[oracle_hybrid] SKIP page_size={page_size} top_k={top_k} "
+                    f"\n[oracle_hybrid] page_size={page_size} top_k={top_k} "
                     f"cr={args.compress_ratio} weight_pop={int(weight_pop)} "
-                    f"— summary already exists in {run_root}",
+                    f"comp_kv_quant={comp_kv_quant} "
+                    f"gran={args.comp_kv_quant_granularity} -> {run_root}",
                     flush=True,
                 )
-                continue
-
-            manifest = {
-                "model_name_or_path": args.model_name_or_path,
-                "context_len": args.context_len,
-                "page_size": page_size,
-                "top_k": top_k,
-                "compress_ratio": args.compress_ratio,
-                "weight_compressed_by_population": weight_pop,
-                "compression_method": args.compression_method,
-                "scoring_method": args.scoring_method,
-                "group_agg_method": args.group_agg_method,
-                "unselected_mode": "compressed",
-                "select_with_oracle_page_scores": True,
-                "num_samples": args.num_samples,
-                "max_new_tokens": args.max_new_tokens,
-                "cuda_device": args.cuda_device,
-                "tasks": tasks,
-                "assumption": "Oracle page selection + hybrid mode: selected pages use full tokens, "
-                f"unselected pages use {args.compression_method} compressed proxy KV cache.",
-            }
-            (run_root / "manifest.json").write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-
-            cmd = build_run_cmd(
-                script_path=script_path,
-                model_name_or_path=args.model_name_or_path,
-                run_dir=run_root,
-                context_len=args.context_len,
-                tasks=tasks,
-                page_size=page_size,
-                top_k=top_k,
-                compress_ratio=args.compress_ratio,
-                compression_method=args.compression_method,
-                scoring_method=args.scoring_method,
-                group_agg_method=args.group_agg_method,
-                weight_pop=weight_pop,
-                data_root=args.data_root,
-                num_samples=args.num_samples,
-                max_new_tokens=args.max_new_tokens,
-                cuda_device=args.cuda_device,
-                local_files_only=args.local_files_only,
-            )
-            (run_root / "command.sh").write_text(
-                "#!/usr/bin/env bash\nset -euo pipefail\n\n"
-                + " ".join(shlex.quote(part) for part in cmd)
-                + "\n",
-                encoding="utf-8",
-            )
-            print(
-                f"\n[oracle_hybrid] page_size={page_size} top_k={top_k} "
-                f"cr={args.compress_ratio} weight_pop={int(weight_pop)} -> {run_root}",
-                flush=True,
-            )
-            print("  cmd: " + " ".join(shlex.quote(part) for part in cmd), flush=True)
-            if args.dry_run:
-                print(f"Dry run: {run_root}", flush=True)
-                continue
-            subprocess.run(cmd, cwd=repo_root, check=True)
-            rows = collect_page_summary(page_size, top_k, run_root)
-            write_summary_files(run_root, rows)
-            print(f"Results written to: {run_root}")
+                print("  cmd: " + " ".join(shlex.quote(part) for part in cmd), flush=True)
+                if args.dry_run:
+                    print(f"Dry run: {run_root}", flush=True)
+                    continue
+                subprocess.run(cmd, cwd=repo_root, check=True)
+                rows = collect_page_summary(page_size, top_k, run_root)
+                write_summary_files(run_root, rows)
+                print(f"Results written to: {run_root}")
 
 
 if __name__ == "__main__":

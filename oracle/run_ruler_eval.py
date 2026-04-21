@@ -150,6 +150,8 @@ def apply_dct_patch(args: argparse.Namespace) -> None:
         use_triton=not args.dct_no_triton,
         weight_compressed_by_population=args.dct_weight_compressed_by_population,
         max_unselected_compressed=args.dct_max_unselected_compressed,
+        comp_kv_quant=args.dct_comp_kv_quant,
+        comp_kv_quant_granularity=args.dct_comp_kv_quant_granularity,
     )
     if "llama" in model_name:
         from dct_page_attention import replace_llama_attn
@@ -225,7 +227,7 @@ def parse_args() -> argparse.Namespace:
         default="drop",
         choices=["drop", "compressed"],
     )
-    p.add_argument("--dct_compression_method", type=str, default="haar", choices=["haar", "dct"])
+    p.add_argument("--dct_compression_method", type=str, default="dct", choices=["haar", "dct"])
     p.add_argument("--dct_compressed_token_rope", type=str, default="mixed", choices=["mixed", "block_center"])
     p.add_argument("--dct_score_use_direct_spectral_proxy", action="store_true")
     p.add_argument(
@@ -253,6 +255,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dct_max_unselected_compressed", type=int, default=-1,
                    help="Max unselected pages contributing compressed tokens "
                         "(-1 = unlimited, 0 = drop all unselected, N = keep top-N by score)")
+    p.add_argument("--dct_comp_kv_quant", type=str, default="none",
+                   choices=["none", "fp8_e4m3", "fp8_e5m2", "int8", "int4"],
+                   help="Fake-quantization of compressed K/V at write time "
+                        "(precision study; no real byte-level storage change)")
+    p.add_argument("--dct_comp_kv_quant_granularity", type=str, default="per_page",
+                   choices=["per_page", "per_comp_token"],
+                   help="Scale granularity for --dct_comp_kv_quant")
     p.add_argument("--dct_no_triton", action="store_true")
     p.add_argument("--sweep_combos", nargs="+", default=None,
                    help="Space-separated page_size,top_k pairs to sweep. "
@@ -269,7 +278,7 @@ def resolve_model_family(model_name_or_path: str) -> str:
     elif "qwen2" in name:
         return "qwen2"
     elif "llama-3" in name or "llama3" in name:
-        return "llama3"
+        return "llama"
     elif "llama" in name:
         return "llama"
     else:
@@ -297,8 +306,15 @@ def parse_combos(values: list[str]) -> list[tuple[int, int]]:
     return combos
 
 
-def make_run_dir(output_root: Path, page_size: int, top_k: int, compress_ratio: float) -> Path:
-    run_dir = output_root / f"ps{page_size}_topk{top_k}_cr{compress_ratio}"
+def make_run_dir(
+    output_root: Path,
+    page_size: int,
+    top_k: int,
+    compress_ratio: float,
+    comp_kv_quant: str = "none",
+) -> Path:
+    quant_tag = "noquant" if comp_kv_quant == "none" else comp_kv_quant
+    run_dir = output_root / f"ps{page_size}_topk{top_k}_cr{compress_ratio}_{quant_tag}"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
@@ -381,7 +397,13 @@ def sweep_main(args: argparse.Namespace) -> None:
             base_argv.append(arg)
 
     for page_size, top_k in combos:
-        run_dir = make_run_dir(args.output_root, page_size, top_k, args.dct_compress_ratio)
+        run_dir = make_run_dir(
+            args.output_root,
+            page_size,
+            top_k,
+            args.dct_compress_ratio,
+            args.dct_comp_kv_quant,
+        )
         cmd = [
             sys.executable,
             str(script_path),
@@ -408,7 +430,13 @@ def main() -> None:
         return
 
     tasks = resolve_tasks(args.tasks)
-    run_dir = args.run_dir if args.run_dir is not None else make_run_dir(args.output_root, args.dct_page_size, args.dct_top_k, args.dct_compress_ratio)
+    run_dir = args.run_dir if args.run_dir is not None else make_run_dir(
+        args.output_root,
+        args.dct_page_size,
+        args.dct_top_k,
+        args.dct_compress_ratio,
+        args.dct_comp_kv_quant,
+    )
     if args.run_dir is not None:
         run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -441,6 +469,8 @@ def main() -> None:
             "select_with_oracle_page_scores": args.dct_select_with_oracle_page_scores,
             "use_triton": not args.dct_no_triton,
             "weight_compressed_by_population": args.dct_weight_compressed_by_population,
+            "comp_kv_quant": args.dct_comp_kv_quant,
+            "comp_kv_quant_granularity": args.dct_comp_kv_quant_granularity,
         },
     }
     (run_dir / "manifest.json").write_text(

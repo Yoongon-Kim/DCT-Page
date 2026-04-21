@@ -428,7 +428,7 @@ def parse_args():
 
     # Mode
     parser.add_argument("--mode", type=str, required=True,
-                        choices=["baseline", "page_attention", "seer_attention", "multipole_attention", "quest_attention", "duo_attention"])
+                        choices=["baseline", "page_attention", "seer_attention", "multipole_attention", "quest_attention", "duo_attention", "inf_llm"])
 
     # Model
     parser.add_argument("--base_model", type=str,
@@ -484,6 +484,16 @@ def parse_args():
                         choices=["per_page", "per_comp_token"],
                         help="Scale granularity for comp_kv_quant")
 
+    # InfLLM baseline params (only used when --mode inf_llm).
+    parser.add_argument("--inf_llm_n_init", type=int, default=128,
+                        help="InfLLM: sink token count.")
+    parser.add_argument("--inf_llm_repr_topk", type=int, default=4,
+                        help="InfLLM: representative tokens per block.")
+    parser.add_argument("--inf_llm_max_cached_block", type=int, default=32,
+                        help="InfLLM: GPU block cache size.")
+    parser.add_argument("--inf_llm_chunk_size", type=int, default=8192,
+                        help="InfLLM: prefill chunk size for GreedySearch.")
+
     args = parser.parse_args()
 
     if args.tasks is None:
@@ -501,8 +511,11 @@ def parse_args():
             args.run_name = f"{tag}_quest_attention"
         elif args.mode == "duo_attention":
             args.run_name = f"{tag}_duo_attention"
+        elif args.mode == "inf_llm":
+            args.run_name = (f"{tag}_inf_llm_nini{args.inf_llm_n_init}"
+                             f"_repr{args.inf_llm_repr_topk}")
         else:
-            args.run_name = f"{tag}_page_attn_topk{args.top_k}"
+            args.run_name = f"{tag}_page_attn_topk{args.top_k}_{args.comp_kv_quant}"
 
     return args
 
@@ -554,6 +567,13 @@ def evaluate_task(model, tokenizer, task, dataset, args):
                     max_length=input_len + max_gen,
                     do_sample=False,
                 )
+            elif args.mode == "inf_llm":
+                # InfLLM uses a stateful ContextManager KV cache that HF
+                # generate() cannot round-trip. Use our GreedySearch adapter.
+                output_ids = args._inf_llm_generator.generate(
+                    input_ids,
+                    max_new_tokens=max_gen,
+                )
             else:
                 output_ids = model.generate(
                     input_ids,
@@ -572,6 +592,9 @@ def evaluate_task(model, tokenizer, task, dataset, args):
 
         if args.mode == "quest_attention":
             model.quest_clear()
+        elif args.mode == "inf_llm":
+            # ContextManager persists past_kv across samples; reset it.
+            args._inf_llm_generator.clear()
 
         response = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
@@ -789,6 +812,8 @@ def main():
         replace_attn_multipole(MULTIPOLE_ATTN_CONFIG)
     elif args.mode == "duo_attention":
         pass  # DuoAttention patches per-instance forwards post-load
+    elif args.mode == "inf_llm":
+        pass  # InfLLM patches per-instance forwards post-load
     elif args.mode not in ("seer_attention", "quest_attention"):
         print("Baseline mode: full attention (no monkey-patch)")
 
@@ -844,12 +869,14 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(base_model)
         print(f"Model loaded. Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
     else:
-        # DuoAttention's replacement forward assumes eager-style Q/K/V signatures.
-        attn_impl = "eager" if args.mode == "duo_attention" else "sdpa"
+        # DuoAttention's and InfLLM's replacement forwards assume eager-style Q/K/V signatures.
+        attn_impl = "eager" if args.mode in {"duo_attention", "inf_llm"} else "sdpa"
         print(f"Loading model: {args.base_model} (attn: {attn_impl})")
         tokenizer = AutoTokenizer.from_pretrained(args.base_model)
         yarn_kwargs = {}
-        if "qwen3" in args.base_model.lower():
+        # InfLLM overrides RoPE and is Llama-only, so skip Qwen3-yarn injection
+        # (its old-transformers env also doesn't accept rope_parameters=).
+        if "qwen3" in args.base_model.lower() and args.mode != "inf_llm":
             yarn_kwargs = {
                 "rope_parameters": {
                     "rope_type": "yarn",
@@ -859,12 +886,19 @@ def main():
                 },
                 "max_position_embeddings": 131072,
             }
+        # InfLLM's transformers 4.37 can't parse Llama-3.1's rope_type='llama3';
+        # strip rope_scaling up front (InfLLM replaces RoPE anyway).
+        inf_llm_config_override = {}
+        if args.mode == "inf_llm":
+            from inf_llm_baseline import load_llama_config_stripped_rope
+            inf_llm_config_override["config"] = load_llama_config_stripped_rope(args.base_model)
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
             torch_dtype=torch.bfloat16,
             device_map="auto",
             attn_implementation=attn_impl,
             **yarn_kwargs,
+            **inf_llm_config_override,
         )
         model.eval()
         print(f"Model loaded. Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
@@ -880,6 +914,22 @@ def main():
             assert_llama(args.base_model)
             DUO_ATTN_CONFIG["base_model"] = args.base_model
             init_duo_attention(model, DUO_ATTN_CONFIG)
+
+        if args.mode == "inf_llm":
+            from inf_llm_baseline import (
+                assert_llama_only,
+                build_inf_llm_generator,
+                init_inf_llm,
+            )
+            from inf_llm_baseline.config import INF_LLM_CONFIG
+            assert_llama_only(args.base_model)
+            INF_LLM_CONFIG["base_model"] = args.base_model
+            INF_LLM_CONFIG["n_init"] = args.inf_llm_n_init
+            INF_LLM_CONFIG["repr_topk"] = args.inf_llm_repr_topk
+            INF_LLM_CONFIG["max_cached_block"] = args.inf_llm_max_cached_block
+            INF_LLM_CONFIG["chunk_size"] = args.inf_llm_chunk_size
+            init_inf_llm(model, INF_LLM_CONFIG)
+            args._inf_llm_generator = build_inf_llm_generator(model, tokenizer, INF_LLM_CONFIG)
 
     # Evaluate each task
     all_task_results = {}
@@ -935,6 +985,9 @@ def main():
     elif args.mode == "duo_attention":
         from duo_attn_baseline.config import DUO_ATTN_CONFIG
         summary["duo_attn_config"] = DUO_ATTN_CONFIG
+    elif args.mode == "inf_llm":
+        from inf_llm_baseline.config import INF_LLM_CONFIG
+        summary["inf_llm_config"] = INF_LLM_CONFIG
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
 
