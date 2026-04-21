@@ -3,9 +3,24 @@
 # Sweeps percent_clusters and percentiles values by rewriting multipole_attn/config.py.
 set -e
 
-# ---- Configuration ----
+# ---- Configuration (env defaults, overridable via CLI flags below) ----
 BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 NUM_SAMPLES="${NUM_SAMPLES:-25}"
+PREPARE_FLAG=""
+
+# ---- Parse CLI flags ----
+usage() {
+    echo "Usage: $0 [--base_model MODEL] [--num_samples N] [--prepare]"
+}
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --base_model)   BASE_MODEL="$2"; shift 2 ;;
+        --num_samples)  NUM_SAMPLES="$2"; shift 2 ;;
+        --prepare)      PREPARE_FLAG="--prepare"; shift ;;
+        -h|--help)      usage; exit 0 ;;
+        *)              echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
 
 # Derive a short model tag from BASE_MODEL (used for output dir + run name).
 # Only Llama 3.x and Qwen3 are supported — eval_ruler.py enforces this.
@@ -19,12 +34,6 @@ OUTPUT_DIR="${OUTPUT_DIR:-results_ruler/multipole_attention/${MODEL_TAG}}"
 
 # Sequence lengths to evaluate
 SEQ_LENGTHS="${SEQ_LENGTHS:-32768}" #"${SEQ_LENGTHS:-4096 8192 16384 32768 65536 131072}"
-
-# Pass --prepare to also prepare data (skips if already exists)
-PREPARE_FLAG=""
-if [[ "$*" == *"--prepare"* ]]; then
-    PREPARE_FLAG="--prepare"
-fi
 
 # Fixed multipole parameters
 USE_CENTROIDS=True

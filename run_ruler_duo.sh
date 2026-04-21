@@ -18,9 +18,24 @@ else
     echo "WARNING: $CONDA_SETUP not found; assuming duo_env is already active."
 fi
 
-# ---- Configuration ----
+# ---- Configuration (env defaults, overridable via CLI flags below) ----
 BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 NUM_SAMPLES="${NUM_SAMPLES:-25}"
+PREPARE_FLAG=""
+
+# ---- Parse CLI flags ----
+usage() {
+    echo "Usage: $0 [--base_model MODEL] [--num_samples N] [--prepare]"
+}
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --base_model)   BASE_MODEL="$2"; shift 2 ;;
+        --num_samples)  NUM_SAMPLES="$2"; shift 2 ;;
+        --prepare)      PREPARE_FLAG="--prepare"; shift ;;
+        -h|--help)      usage; exit 0 ;;
+        *)              echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
 
 # DuoAttention only has patterns for Llama. Hard-fail otherwise.
 case "$(echo "$BASE_MODEL" | tr '[:upper:]' '[:lower:]')" in
@@ -32,12 +47,6 @@ OUTPUT_DIR="${OUTPUT_DIR:-results_ruler/duo_attention/${MODEL_TAG}}"
 
 # Sequence lengths to evaluate
 SEQ_LENGTHS="${SEQ_LENGTHS:-32768}"
-
-# Pass --prepare to also prepare data (skips if already exists)
-PREPARE_FLAG=""
-if [[ "$*" == *"--prepare"* ]]; then
-    PREPARE_FLAG="--prepare"
-fi
 
 # Pattern location (upstream DuoAttention repo)
 PATTERN_ROOT="${PATTERN_ROOT:-/home/yoongonkim/duo-attention/attn_patterns}"

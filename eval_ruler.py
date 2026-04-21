@@ -250,7 +250,9 @@ def load_task_configs():
 # Data preparation
 # ---------------------------------------------------------------------------
 def prepare_data(args):
-    """Run eval_ruler/data/prepare.py for tasks that don't have data yet."""
+    """Run eval_ruler/data/prepare.py for tasks that don't have data yet
+    or whose cached JSONL has fewer samples than --num_samples. Existing
+    files are overwritten by prepare.py (open with mode='w')."""
     model_template_type, model_family = infer_model_family(args.base_model)
     prepare_script = os.path.join(RULER_DIR, "data", "prepare.py")
 
@@ -258,8 +260,12 @@ def prepare_data(args):
         for task in args.tasks:
             data_file = RULER_DATA_DIR / model_family / str(seq_len) / task / "validation.jsonl"
             if data_file.exists():
-                print(f"  Data exists, skipping: {data_file}")
-                continue
+                with open(data_file, "r") as f:
+                    existing = sum(1 for line in f if line.strip())
+                if existing >= args.num_samples:
+                    print(f"  Data exists ({existing} >= {args.num_samples} samples), skipping: {data_file}")
+                    continue
+                print(f"  Data has {existing} < {args.num_samples} samples, regenerating: {data_file}")
 
             data_file.parent.mkdir(parents=True, exist_ok=True)
             save_dir = str(RULER_DATA_DIR / model_family / str(seq_len))
@@ -275,7 +281,7 @@ def prepare_data(args):
                 "--model_template_type", model_template_type,
                 "--num_samples", str(args.num_samples),
             ]
-            print(f"  Preparing {task} @ seq_len={seq_len}...")
+            print(f"  Preparing {task} @ seq_len={seq_len} (num_samples={args.num_samples})...")
             result = subprocess.run(cmd, cwd=RULER_DIR, capture_output=True, text=True)
             if result.returncode != 0:
                 print(f"  ERROR preparing {task}: {result.stderr}")

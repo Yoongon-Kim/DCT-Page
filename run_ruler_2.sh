@@ -50,7 +50,7 @@ GROUP_AGG_METHOD="max"
 MODE="drop"
 COMP_TOKEN_ROPE="mixed"
 # ---- Sweep (page_size, top_k) x (compress_ratio, comp_kv_quant) ----
-for PS_TK in "16,128" "32,64"; do
+for PS_TK in "16,64" "32,32"; do
     IFS=',' read -r PAGE_SIZE TOP_K <<< "$PS_TK"
     for CR_QUANT in "0.0625,none" "0.125,fp8_e4m3" "0.125,fp8_e5m2" "0.25,int4"; do
         IFS=',' read -r COMPRESS_RATIO COMP_KV_QUANT <<< "$CR_QUANT"
