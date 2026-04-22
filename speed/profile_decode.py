@@ -167,6 +167,15 @@ _sync_mode = False  # when True, add torch.cuda.synchronize() between steps for 
 _current_layer = 0
 
 
+class _ProfileTopKImpl:
+    """Tiny mutable holder so the forward can read the chosen topk impl
+    without threading a kwarg through each call."""
+    value = 'auto'
+
+
+_profile_topk_impl = _ProfileTopKImpl()
+
+
 def _flush_events():
     """Sync all devices, then compute all deferred elapsed times."""
     for i in range(torch.cuda.device_count()):
@@ -323,7 +332,13 @@ def profiled_dct_page_attention_forward(
         _rec(4)
 
     # Step 5a: score cache update
-    from triton_kernels import score_pages_triton, topk_sort_triton
+    from triton_kernels import (
+        score_pages_triton,
+        topk_sort,
+        topk_sort_triton,
+        topk_sort_twostage_triton,
+        topk_sort_torch,
+    )
 
     _num_kv_heads = self.config.num_key_value_heads  # 8 for Llama-3.1-8B
     page_scores_buf = getattr(self, '_page_scores_buf', None)
@@ -368,8 +383,40 @@ def profiled_dct_page_attention_forward(
         self._topk_out_buf = torch.empty(
             bsz, _num_kv_heads, actual_top_k, dtype=torch.int32, device=paged_k.device
         )
+    # Scratch for two-stage dispatch; large enough for NUM_CHUNKS=8.
+    scratch_n = 8 * actual_top_k
+    scratch_buf = getattr(self, '_topk_scratch_buf', None)
+    if (
+        scratch_buf is None
+        or scratch_buf.shape[0] != bsz
+        or scratch_buf.shape[1] != _num_kv_heads
+        or scratch_buf.shape[2] < scratch_n
+    ):
+        self._topk_scratch_buf = torch.empty(
+            bsz, _num_kv_heads, scratch_n, dtype=torch.int64, device=paged_k.device
+        )
 
-    selected_indices = topk_sort_triton(page_scores, actual_top_k, out=self._topk_out_buf)
+    topk_impl = getattr(_profile_topk_impl, 'value', 'auto')
+    if topk_impl == 'fused':
+        selected_indices = topk_sort_triton(
+            page_scores, actual_top_k, out=self._topk_out_buf,
+        )
+    elif topk_impl == 'twostage':
+        selected_indices = topk_sort_twostage_triton(
+            page_scores, actual_top_k,
+            out=self._topk_out_buf,
+            scratch=self._topk_scratch_buf[:, :, :scratch_n],
+        )
+    elif topk_impl == 'torch':
+        selected_indices = topk_sort_torch(
+            page_scores, actual_top_k, out=self._topk_out_buf,
+        )
+    else:  # auto
+        selected_indices = topk_sort(
+            page_scores, actual_top_k,
+            out=self._topk_out_buf,
+            scratch=self._topk_scratch_buf[:, :, :scratch_n],
+        )
 
     if _enabled:
         _rec(7)
@@ -575,8 +622,62 @@ def parse_args():
     p.add_argument("--chunk_size", type=int, default=0,
                    help="Chunked prefill size (0 = single-pass prefill). "
                         "Use e.g. 8192 to reduce peak memory for long contexts.")
+    p.add_argument("--topk_impl", choices=["auto", "fused", "twostage", "torch"],
+                   default="auto",
+                   help="Which top-k implementation to use in the decode step. "
+                        "auto = single-stage for num_pages<=1024, two-stage above.")
+    p.add_argument("--benchmark_topk", action="store_true",
+                   help="Run a standalone micro-benchmark of the three topk "
+                        "implementations over representative shapes and exit.")
     args = p.parse_args()
     return args
+
+
+def run_benchmark_topk():
+    """Standalone micro-benchmark: fused vs twostage vs torch across shapes.
+
+    Reports average per-call time and validates that all three kernels produce
+    the same output.
+    """
+    from triton_kernels import (
+        topk_sort_triton, topk_sort_twostage_triton, topk_sort_torch,
+    )
+
+    def bench(fn, *args, trials=1000, warmup=50):
+        for _ in range(warmup):
+            fn(*args)
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(trials):
+            fn(*args)
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) / trials * 1000  # us
+
+    print("Top-K micro-benchmark (bsz=1, num_kv_heads=8, top_k=64)")
+    print(f"{'num_pages':>10} {'fused us':>10} {'2stage-4':>10} {'2stage-8':>10} {'torch':>8} {'ok':>5}")
+    torch.manual_seed(0)
+    top_k = 64
+    for num_pages in [512, 1020, 1024, 1025, 2040, 2048]:
+        scores = torch.randn(1, 8, num_pages, dtype=torch.float32, device='cuda')
+        out_buf = torch.empty(1, 8, top_k, dtype=torch.int32, device='cuda')
+        scratch4 = torch.empty(1, 8, 4 * top_k, dtype=torch.int64, device='cuda')
+        scratch8 = torch.empty(1, 8, 8 * top_k, dtype=torch.int64, device='cuda')
+
+        us_fused = bench(topk_sort_triton, scores, top_k, out_buf)
+        us_ts4 = bench(topk_sort_twostage_triton, scores, top_k, out_buf, scratch4, 4)
+        us_ts8 = bench(topk_sort_twostage_triton, scores, top_k, out_buf, scratch8, 8)
+        us_torch = bench(topk_sort_torch, scores, top_k, out_buf)
+
+        a = topk_sort_triton(scores, top_k).clone()
+        b = topk_sort_twostage_triton(scores, top_k, num_chunks=4)
+        c = topk_sort_twostage_triton(scores, top_k, num_chunks=8)
+        d = topk_sort_torch(scores, top_k)
+        ok = torch.equal(a, b) and torch.equal(a, c) and torch.equal(a, d)
+
+        print(f"{num_pages:>10} {us_fused:>10.2f} {us_ts4:>10.2f} {us_ts8:>10.2f} {us_torch:>8.2f} {str(ok):>5}")
 
 
 # ---------------------------------------------------------------------------
@@ -725,6 +826,12 @@ def main():
     global _sync_mode
     args = parse_args()
     _sync_mode = getattr(args, 'sync', False)
+
+    if getattr(args, 'benchmark_topk', False):
+        run_benchmark_topk()
+        return
+
+    _profile_topk_impl.value = args.topk_impl
 
     import types
     import transformers

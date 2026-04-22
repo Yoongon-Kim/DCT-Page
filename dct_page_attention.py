@@ -29,7 +29,7 @@ from config import DCTPageConfig
 from triton_kernels import (
     assemble_kv_split_triton,
     build_assemble_stride_cache,
-    topk_sort_triton,
+    topk_sort,
     assemble_kv_drop_triton,
     score_pages_triton,
     apply_rope_q_direct,
@@ -489,17 +489,34 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
     # V is only consumed in compressed mode; skip compress/store entirely for drop.
     store_v = cfg.unselected_mode != "drop"
 
+    cur_strategy = cfg.compressed_token_rope
+    cur_quant = cfg.comp_kv_quant
+    cur_quant_granularity = cfg.comp_kv_quant_granularity
+
+    # Fast-path: cache hit — no new pages and all config keys match. On decode,
+    # n_new == 0 for (page_size - 1)/page_size of steps, so this skips the slow
+    # Python dispatch (getattrs, slice creation, dequant) on most steps.
+    n_cached = getattr(attn_module, '_comp_n_pages_cached', 0)
+    if (n_cached == num_pages and n_cached > 0
+            and getattr(attn_module, '_comp_cache_strategy', None) == cur_strategy
+            and getattr(attn_module, '_comp_cache_quant', None) == cur_quant
+            and getattr(attn_module, '_comp_cache_quant_granularity', None) == cur_quant_granularity
+            and getattr(attn_module, '_comp_cache_store_v', None) == store_v):
+        last = getattr(attn_module, '_last_comp_kv', None)
+        # Also verify shape (protects against page_size/compress_ratio/bsz changes
+        # between decode loops that would otherwise be caught by the slow path).
+        if (last is not None
+                and last[0].shape[0] == bsz
+                and last[0].shape[3] == comp_size):
+            return last
+
     cached_k = getattr(attn_module, '_comp_k_cache', None)
     cached_v = getattr(attn_module, '_comp_v_cache', None)
-    n_cached = getattr(attn_module, '_comp_n_pages_cached', 0)
     capacity = getattr(attn_module, '_comp_cache_capacity', 0)
     cached_strategy = getattr(attn_module, '_comp_cache_strategy', None)
     cached_quant = getattr(attn_module, '_comp_cache_quant', None)
     cached_quant_granularity = getattr(attn_module, '_comp_cache_quant_granularity', None)
     cached_store_v = getattr(attn_module, '_comp_cache_store_v', None)
-    cur_strategy = cfg.compressed_token_rope
-    cur_quant = cfg.comp_kv_quant
-    cur_quant_granularity = cfg.comp_kv_quant_granularity
 
     # Invalidate cache when the sequence restarts, shape changes, RoPE strategy changes,
     # quant config changes (requires different storage dtype / scale shape), or the
@@ -519,6 +536,7 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
         attn_module._comp_v_scale_cache = None
         attn_module._comp_n_pages_cached = 0
         attn_module._comp_cache_capacity = 0
+        attn_module._last_comp_kv = None
         n_cached = 0
         capacity = 0
     attn_module._comp_cache_strategy = cur_strategy
@@ -645,6 +663,7 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
         attn_module._comp_n_pages_cached = num_pages
 
     if attn_module._comp_k_cache is None:
+        attn_module._last_comp_kv = None
         return None, None
 
     k_slice = attn_module._comp_k_cache[:, :, :num_pages]
@@ -658,7 +677,9 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
         )
 
     if not store_v or attn_module._comp_v_cache is None:
-        return comp_k, None
+        result = (comp_k, None)
+        attn_module._last_comp_kv = result
+        return result
 
     v_slice = attn_module._comp_v_cache[:, :, :num_pages]
     if cur_quant == "none":
@@ -669,7 +690,9 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
             attn_module._comp_v_scale_cache[:, :, :num_pages],
             cur_quant, cur_quant_granularity, head_dim,
         )
-    return comp_k, comp_v
+    result = (comp_k, comp_v)
+    attn_module._last_comp_kv = result
+    return result
 
 
 _FP8_MAX = {"fp8_e4m3": 448.0, "fp8_e5m2": 57344.0}
@@ -871,6 +894,9 @@ def _compress_pages(attn_module, paged_x, comp_size):
     M = _get_or_build_projection_matrix(
         attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
     )
+    if _dct_page_cfg.use_triton and paged_x.stride(-1) == 1:
+        from triton_kernels import compress_pages_triton
+        return compress_pages_triton(paged_x, M)
     return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
 
 
@@ -1005,10 +1031,12 @@ _DCT_RUNTIME_STATE_ATTRS = (
     "_comp_cache_quant",
     "_comp_cache_quant_granularity",
     "_comp_cache_store_v",
+    "_last_comp_kv",
     "_page_scores_buf",
     "_page_scores_np",
     "_page_scores_capacity",
     "_topk_out_buf",
+    "_topk_scratch_buf",
     "_assemble_stride_cache",
     "_final_k_buf",
     "_final_v_buf",
@@ -1114,6 +1142,7 @@ def dct_page_attention_forward(
         self._comp_k_scale_cache = None
         self._comp_v_scale_cache = None
         self._comp_n_pages_cached = 0
+        self._last_comp_kv = None
 
         extra_tokens = cfg.page_size * 2
 
@@ -1228,8 +1257,25 @@ def dct_page_attention_forward(
             bsz, _num_kv_heads, actual_top_k, dtype=torch.int32, device=paged_k.device
         )
 
-    selected_indices = topk_sort_triton(
-        selection_page_scores, actual_top_k, out=self._topk_out_buf[:, :, :actual_top_k]
+    # Pre-allocate two-stage topk scratch (only used when num_pages > 1024).
+    # Holds num_chunks * top_k packed int64 entries; sized generously once.
+    _topk_scratch_n = 8 * actual_top_k
+    scratch_buf = getattr(self, '_topk_scratch_buf', None)
+    if (
+        scratch_buf is None
+        or scratch_buf.shape[0] != bsz
+        or scratch_buf.shape[1] != _num_kv_heads
+        or scratch_buf.shape[2] < _topk_scratch_n
+    ):
+        self._topk_scratch_buf = torch.empty(
+            bsz, _num_kv_heads, _topk_scratch_n, dtype=torch.int64, device=paged_k.device
+        )
+
+    selected_indices = topk_sort(
+        selection_page_scores,
+        actual_top_k,
+        out=self._topk_out_buf[:, :, :actual_top_k],
+        scratch=self._topk_scratch_buf[:, :, :_topk_scratch_n],
     )
 
     if debug_hook is not None:

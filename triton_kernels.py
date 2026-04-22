@@ -207,6 +207,69 @@ def _score_pages_c1_g4_kernel(
     tl.store(out_ptrs, agg_scores, mask=p_mask)
 
 
+@triton.jit
+def _score_pages_max_max_kernel(
+    query_ptr,         # [bsz, num_kv_heads, NUM_KV_GROUPS, head_dim]
+    comp_keys_ptr,     # [bsz, num_kv_heads, num_pages, COMP_SIZE, head_dim]
+    out_scores_ptr,    # [bsz, num_kv_heads, num_pages]
+    q_stride_b, q_stride_h, q_stride_g,
+    ck_stride_b, ck_stride_h, ck_stride_p, ck_stride_c,
+    os_stride_b, os_stride_h,
+    num_kv_heads,
+    num_pages,
+    head_dim,
+    scaling,
+    NUM_KV_GROUPS: tl.constexpr,
+    COMP_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+):
+    """Specialized kernel for scoring_method=max, group_agg_method=max.
+
+    Collapses the intermediate [NUM_KV_GROUPS, BLOCK_P] buffer into a single
+    [BLOCK_P] running max since both aggregations are max (associative /
+    commutative across (c, g) pairs).
+
+    Tuning: BLOCK_P=16, num_warps=4, num_stages=4 was the winner of a manual
+    sweep at (page_size=32, comp_size=4, num_pages=1020) and (page_size=16,
+    comp_size=2, num_pages=2040) — within noise across both target configs.
+    @triton.autotune was tried but added ~40us/launch overhead even on cache
+    hits, dominating the kernel itself; a fixed config is faster here.
+    """
+    pid_bh = tl.program_id(0)
+    pid_pt = tl.program_id(1)
+
+    h = pid_bh % num_kv_heads
+    b = pid_bh // num_kv_heads
+
+    p_start = pid_pt * BLOCK_P
+    p_offsets = tl.arange(0, BLOCK_P)
+    p_indices = p_start + p_offsets
+    p_mask = p_indices < num_pages
+
+    d_idx = tl.arange(0, BLOCK_D)
+    d_mask = d_idx < head_dim
+
+    q_base = query_ptr + b * q_stride_b + h * q_stride_h
+    ck_base = comp_keys_ptr + b * ck_stride_b + h * ck_stride_h
+
+    best = tl.full([BLOCK_P], float("-inf"), dtype=tl.float32)
+    mask_2d = p_mask[:, None] & d_mask[None, :]
+
+    # Outer loop on c (loads large k tile once per c), inner loop on g (small
+    # q vector). Both loops are compile-time unrolled via tl.static_range.
+    for c in tl.static_range(COMP_SIZE):
+        k_ptrs = ck_base + p_indices[:, None] * ck_stride_p + c * ck_stride_c + d_idx[None, :]
+        k = tl.load(k_ptrs, mask=mask_2d, other=0.0).to(tl.float32)
+        for g in tl.static_range(NUM_KV_GROUPS):
+            q = tl.load(q_base + g * q_stride_g + d_idx, mask=d_mask, other=0.0).to(tl.float32) * scaling
+            dots = tl.sum(k * q[None, :], axis=1)
+            best = tl.maximum(best, dots)
+
+    out_ptrs = out_scores_ptr + b * os_stride_b + h * os_stride_h + p_indices
+    tl.store(out_ptrs, best, mask=p_mask)
+
+
 _SCORING_MAP = {"max": 0, "mean": 1, "sum": 2}
 _GROUP_AGG_MAP = {"mean": 0, "max": 1, "topp": 1}
 
@@ -331,6 +394,9 @@ def score_pages_triton(
     num_page_tiles = (num_pages + BLOCK_P - 1) // BLOCK_P
     grid = (bsz * num_kv_heads, num_page_tiles)
 
+    use_specialized_max_max = (
+        scoring_method == "max" and group_agg_method == "max"
+    )
     use_specialized_c4_g4 = (
         scoring_method == "max"
         and group_agg_method == "mean"
@@ -344,7 +410,26 @@ def score_pages_triton(
     )
 
     with torch.cuda.device(query.device):
-        if use_specialized_c4_g4:
+        if use_specialized_max_max:
+            MM_BLOCK_P = 16
+            MM_NUM_WARPS = 4
+            MM_NUM_STAGES = 4
+            mm_grid = (bsz * num_kv_heads, (num_pages + MM_BLOCK_P - 1) // MM_BLOCK_P)
+            _score_pages_max_max_kernel[mm_grid](
+                query, compressed_keys, page_scores,
+                q_stride_0, q_stride_1, q_stride_2,
+                ck_stride_0, ck_stride_1, ck_stride_2, ck_stride_3,
+                ps_stride_0, ps_stride_bh,
+                num_kv_heads, num_pages, head_dim,
+                scaling,
+                NUM_KV_GROUPS=num_kv_groups,
+                COMP_SIZE=comp_size,
+                BLOCK_D=BLOCK_D,
+                BLOCK_P=MM_BLOCK_P,
+                num_warps=MM_NUM_WARPS,
+                num_stages=MM_NUM_STAGES,
+            )
+        elif use_specialized_c4_g4:
             _score_pages_max_mean_c4_g4_kernel[grid](
                 query, compressed_keys, page_scores,
                 q_stride_0, q_stride_1, q_stride_2,
@@ -479,6 +564,8 @@ def topk_sort_triton(
             num_pages,
             TOP_K=top_k,
             BLOCK_P=BLOCK_P,
+            num_warps=1,
+            num_stages=1,
         )
 
     # --- DEBUG: validate against torch.topk reference ---
@@ -496,6 +583,176 @@ def topk_sort_triton(
     # --- END DEBUG ---
 
     return selected
+
+
+# ---------------------------------------------------------------------------
+# Kernel 1c: Two-stage TopK (for wide BLOCK_P, e.g. page_size=16)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _topk_local_kernel(
+    scores_ptr,       # [bsz * num_kv_heads, num_pages]
+    scratch_ptr,      # [bsz * num_kv_heads, NUM_CHUNKS * TOP_K]  int64 packed
+    s_stride_bh, sc_stride_bh,
+    num_pages,
+    TOP_K: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+):
+    """Stage 1: sort each chunk of scores, write top TOP_K packed (desc_key, page_idx)."""
+    pid_bh = tl.program_id(0)
+    pid_c = tl.program_id(1)
+
+    offs = tl.arange(0, CHUNK_SIZE)
+    p_idx = pid_c * CHUNK_SIZE + offs
+    mask = p_idx < num_pages
+
+    base_s = scores_ptr + pid_bh * s_stride_bh
+    scores = tl.load(base_s + p_idx, mask=mask, other=float('-inf'))
+
+    bits = scores.to(tl.int32, bitcast=True)
+    sortable = tl.where(bits >= 0, bits, bits ^ 0x7FFFFFFF)
+    desc_key = -sortable
+    # Use p_idx (global page index) so merge yields the correct answer.
+    packed = (desc_key.to(tl.int64) << 32) | p_idx.to(tl.int64)
+    sorted_packed = tl.sort(packed)  # ascending int64 = descending score
+
+    sc_base = scratch_ptr + pid_bh * sc_stride_bh + pid_c * TOP_K
+    write_mask = offs < TOP_K
+    tl.store(sc_base + offs, sorted_packed, mask=write_mask)
+
+
+@triton.jit
+def _topk_merge_kernel(
+    scratch_ptr,      # [bsz * num_kv_heads, TOTAL]  int64 packed
+    out_ptr,          # [bsz * num_kv_heads, TOP_K]  int32
+    sc_stride_bh, o_stride_bh,
+    TOP_K: tl.constexpr,
+    TOTAL: tl.constexpr,  # NUM_CHUNKS * TOP_K, must be power of 2
+):
+    """Stage 2: merge all chunk top-k lists and emit final top-k sorted ascending by index."""
+    pid_bh = tl.program_id(0)
+    idx = tl.arange(0, TOTAL)
+
+    sc_base = scratch_ptr + pid_bh * sc_stride_bh
+    packed = tl.load(sc_base + idx)
+    sorted_packed = tl.sort(packed)
+
+    sorted_indices = (sorted_packed & 0xFFFFFFFF).to(tl.int32)
+    top_indices = tl.where(idx < TOP_K, sorted_indices, 2147483647)
+    sorted_top = tl.sort(top_indices)
+
+    base_o = out_ptr + pid_bh * o_stride_bh
+    tl.store(base_o + idx, sorted_top, mask=idx < TOP_K)
+
+
+def topk_sort_twostage_triton(
+    page_scores: torch.Tensor,
+    top_k: int,
+    out: torch.Tensor = None,
+    scratch: torch.Tensor = None,
+    num_chunks: int = 4,
+) -> torch.Tensor:
+    """Two-stage parallel top-k: sort chunks in parallel, then merge.
+
+    Produces identical output to topk_sort_triton. Wins when BLOCK_P would
+    be very wide (e.g. num_pages >= 2048) because single-CTA bitonic sort
+    is O(log²n) barrier-chained — halving n via chunking roughly halves
+    the barrier depth.
+
+    TOP_K must be a power of 2 so that NUM_CHUNKS * TOP_K is also a power
+    of 2 (required by tl.sort in the merge kernel).
+    """
+    bsz, num_kv_heads, num_pages = page_scores.shape
+    assert (top_k & (top_k - 1)) == 0 and top_k > 0, "top_k must be a power of 2"
+    assert (num_chunks & (num_chunks - 1)) == 0 and num_chunks > 0, "num_chunks must be a power of 2"
+
+    # Each chunk must be at least TOP_K so it can contribute TOP_K entries.
+    per_chunk = max(1, (num_pages + num_chunks - 1) // num_chunks)
+    CHUNK_SIZE = max(top_k, triton.next_power_of_2(per_chunk))
+    TOTAL = num_chunks * top_k
+
+    if out is None:
+        out = torch.empty(
+            bsz, num_kv_heads, top_k,
+            dtype=torch.int32, device=page_scores.device,
+        )
+    if scratch is None:
+        scratch = torch.empty(
+            bsz, num_kv_heads, TOTAL,
+            dtype=torch.int64, device=page_scores.device,
+        )
+
+    s_stride_bh = page_scores.stride(1)
+    sc_stride_bh = scratch.stride(1)
+    o_stride_bh = out.stride(1)
+
+    grid1 = (bsz * num_kv_heads, num_chunks)
+    grid2 = (bsz * num_kv_heads,)
+
+    with torch.cuda.device(page_scores.device):
+        _topk_local_kernel[grid1](
+            page_scores, scratch,
+            s_stride_bh, sc_stride_bh,
+            num_pages,
+            TOP_K=top_k,
+            CHUNK_SIZE=CHUNK_SIZE,
+            num_warps=1,
+            num_stages=1,
+        )
+        _topk_merge_kernel[grid2](
+            scratch, out,
+            sc_stride_bh, o_stride_bh,
+            TOP_K=top_k,
+            TOTAL=TOTAL,
+            num_warps=1,
+            num_stages=1,
+        )
+
+    return out
+
+
+def topk_sort_torch(
+    page_scores: torch.Tensor,
+    top_k: int,
+    out: torch.Tensor = None,
+) -> torch.Tensor:
+    """Pure-PyTorch fallback for top-k page selection + ascending sort.
+
+    Produces identical output contract to topk_sort_triton.
+    """
+    _, indices = torch.topk(page_scores, top_k, dim=-1)
+    indices, _ = indices.sort(dim=-1)
+    indices = indices.to(torch.int32)
+    if out is not None:
+        out.copy_(indices)
+        return out
+    return indices
+
+
+# Threshold: single-stage wins up to BLOCK_P=1024, two-stage wins above.
+# Measured on H100: at num_pages=1020, fused=14us vs twostage-8=24us;
+# at num_pages=2040, fused=28us vs twostage-8=23us.
+_TOPK_TWOSTAGE_MIN_PAGES = 1025
+
+
+def topk_sort(
+    page_scores: torch.Tensor,
+    top_k: int,
+    out: torch.Tensor = None,
+    scratch: torch.Tensor = None,
+) -> torch.Tensor:
+    """Auto-dispatch top-k: single-stage for num_pages <= 1024, two-stage above.
+
+    The two-stage path needs a power-of-2 top_k (so NUM_CHUNKS * TOP_K is a
+    power of 2 for tl.sort). If top_k is not a power of 2, falls back to
+    single-stage regardless of num_pages.
+    """
+    num_pages = page_scores.shape[-1]
+    is_pow2_top_k = top_k > 0 and (top_k & (top_k - 1)) == 0
+    if num_pages >= _TOPK_TWOSTAGE_MIN_PAGES and is_pow2_top_k:
+        return topk_sort_twostage_triton(
+            page_scores, top_k, out=out, scratch=scratch, num_chunks=8,
+        )
+    return topk_sort_triton(page_scores, top_k, out=out)
 
 
 # ---------------------------------------------------------------------------
@@ -571,20 +828,20 @@ def _copy_full_segments_kernel(
     local = tl.maximum(pid_tile - sink_tiles, 0)
     rank = local // page_tiles  # only meaningful for pages; clamped via safe_rank elsewhere
 
-    # Load selected page index unconditionally (clamped rank is safe for all segments)
-    safe_rank = tl.maximum(tl.minimum(rank, top_k - 1), 0)
-    page_idx = tl.load(sel_indices_ptr + b * si_stride_b + h * si_stride_h + safe_rank).to(tl.int32)
-
-    # Single if/elif/else for ALL per-segment values (one merge point)
+    # Single if/elif/else for ALL per-segment values (one merge point).
+    # sel_indices is only needed on page tiles — defer the load until then.
     if is_sink:
         t_start = pid_tile * BLOCK_T
         num_tokens = sink_len
         write_start = 0
+        page_idx = tl.zeros([], dtype=tl.int32)
     elif is_recent:
         t_start = (pid_tile - page_end) * BLOCK_T
         num_tokens = recent_len
         write_start = total_len - recent_len
+        page_idx = tl.zeros([], dtype=tl.int32)
     else:
+        page_idx = tl.load(sel_indices_ptr + b * si_stride_b + h * si_stride_h + rank).to(tl.int32)
         t_start = (local % page_tiles) * BLOCK_T
         num_tokens = PAGE_SIZE
         write_start = sink_len + page_idx * COMP_SIZE + rank * (PAGE_SIZE - COMP_SIZE)
@@ -1220,7 +1477,7 @@ def assemble_kv_drop_triton(
         rope_stride_t = 0
 
     with torch.cuda.device(device):
-        BLOCK_T_FULL = min(128, max(64, triton.next_power_of_2(page_size)))
+        BLOCK_T_FULL = min(128, triton.next_power_of_2(page_size))
         sink_tiles = (sink_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
         page_tiles = (page_size + BLOCK_T_FULL - 1) // BLOCK_T_FULL
         recent_tiles = (recent_len + BLOCK_T_FULL - 1) // BLOCK_T_FULL
@@ -1326,3 +1583,104 @@ def apply_rope_q_direct(
         )
 
     return out_buf
+
+
+# ---------------------------------------------------------------------------
+# Kernel 4: DCT page compression (replaces torch.einsum('cs,bhnsd->bhncd', ...))
+# ---------------------------------------------------------------------------
+@triton.jit
+def _compress_pages_kernel(
+    page_ptr,   # [bsz, kv_heads, n_new, PAGE_SIZE, head_dim]
+    m_ptr,      # [COMP_SIZE, PAGE_SIZE]
+    out_ptr,    # [bsz, kv_heads, n_new, COMP_SIZE, head_dim]
+    # page strides (outer b, h, n, t dims; head_dim is contiguous)
+    p_stride_b, p_stride_h, p_stride_n, p_stride_t,
+    # projection matrix stride
+    m_stride_c,
+    # output strides
+    o_stride_b, o_stride_h, o_stride_n, o_stride_c,
+    # runtime dim
+    num_kv_heads,
+    head_dim,
+    # constexprs
+    PAGE_SIZE: tl.constexpr,
+    COMP_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Project one page per program via the precomputed DCT-lowpass-IDCT matrix.
+
+    Grid: (bsz * num_kv_heads, n_new).
+    Computes out[b, h, n, c, d] = sum_t(M[c, t] * page[b, h, n, t, d]).
+    """
+    pid_bh = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    b = pid_bh // num_kv_heads
+    h = pid_bh % num_kv_heads
+
+    d_idx = tl.arange(0, BLOCK_D)
+    d_mask = d_idx < head_dim
+    c_idx = tl.arange(0, COMP_SIZE)
+
+    page_base = page_ptr + b * p_stride_b + h * p_stride_h + pid_n * p_stride_n
+
+    # Accumulate [COMP_SIZE, BLOCK_D] in fp32. Unroll t-loop over PAGE_SIZE
+    # (constexpr) so both M and page rows live in registers.
+    out = tl.zeros([COMP_SIZE, BLOCK_D], dtype=tl.float32)
+    for t in tl.static_range(PAGE_SIZE):
+        # page_row[d] = page[b, h, pid_n, t, d]  ->  [BLOCK_D]
+        page_row = tl.load(
+            page_base + t * p_stride_t + d_idx,
+            mask=d_mask, other=0.0,
+        ).to(tl.float32)
+        # m_col[c] = M[c, t]  ->  [COMP_SIZE]
+        m_col = tl.load(m_ptr + c_idx * m_stride_c + t).to(tl.float32)
+        out += m_col[:, None] * page_row[None, :]
+
+    out_base = out_ptr + b * o_stride_b + h * o_stride_h + pid_n * o_stride_n
+    out_offsets = c_idx[:, None] * o_stride_c + d_idx[None, :]
+    out_mask = d_mask[None, :]
+    tl.store(out_base + out_offsets, out.to(out_ptr.dtype.element_ty), mask=out_mask)
+
+
+def compress_pages_triton(
+    paged_x: torch.Tensor,  # [bsz, kv_heads, n_new, page_size, head_dim]
+    M: torch.Tensor,        # [comp_size, page_size]
+    out: torch.Tensor = None,
+) -> torch.Tensor:
+    """Apply the DCT-lowpass-IDCT projection M to each page of paged_x.
+
+    Equivalent to torch.einsum('cs,bhnsd->bhncd', M, paged_x) but avoids the
+    einsum launch-dispatch cost on each new-page step.
+
+    Shapes:
+        paged_x: [bsz, kv_heads, n_new, page_size, head_dim]
+        M:       [comp_size, page_size]
+    Returns:
+        [bsz, kv_heads, n_new, comp_size, head_dim] in paged_x.dtype.
+    """
+    bsz, num_kv_heads, n_new, page_size, head_dim = paged_x.shape
+    comp_size = M.shape[0]
+    assert M.shape[1] == page_size
+    assert paged_x.stride(-1) == 1, "compress_pages_triton expects contiguous head_dim"
+
+    if out is None:
+        out = torch.empty(
+            bsz, num_kv_heads, n_new, comp_size, head_dim,
+            dtype=paged_x.dtype, device=paged_x.device,
+        )
+    BLOCK_D = triton.next_power_of_2(head_dim)
+    grid = (bsz * num_kv_heads, n_new)
+
+    with torch.cuda.device(paged_x.device):
+        _compress_pages_kernel[grid](
+            paged_x, M, out,
+            paged_x.stride(0), paged_x.stride(1), paged_x.stride(2), paged_x.stride(3),
+            M.stride(0),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            num_kv_heads,
+            head_dim,
+            PAGE_SIZE=page_size,
+            COMP_SIZE=comp_size,
+            BLOCK_D=BLOCK_D,
+        )
+    return out

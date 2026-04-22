@@ -21,6 +21,12 @@ import time
 import types
 from pathlib import Path
 
+_THIS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _THIS_DIR.parent
+for _p in (_THIS_DIR, _REPO_ROOT):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicLayer
@@ -313,10 +319,15 @@ def parse_args():
     p.add_argument("--num_repeats", type=int, default=3,
                    help="Repeats per context length for averaging")
     p.add_argument("--max_new_tokens", type=int, default=128)
-    p.add_argument("--warmup_steps", type=int, default=1)
+    p.add_argument("--warmup_steps", type=int, default=3)
     p.add_argument("--chunk_size", type=int, default=0,
                    help="Chunked prefill size (0 = single-pass prefill). "
                         "Use e.g. 8192 to reduce peak memory for long contexts.")
+    p.add_argument("--baseline_dynamic_cache", action="store_true",
+                   help="Use HF DynamicLayer (torch.cat every decode step) for the baseline. "
+                        "Default: baseline uses PreAllocatedLayer, matching the DCT path, "
+                        "so the measured speedup isolates the attention-sparsity gain "
+                        "rather than conflating it with cache-management overhead.")
     p.add_argument("--output_dir", default="results/speed_test_dummy")
     p.add_argument("--run_name", default=None)
 
@@ -325,10 +336,10 @@ def parse_args():
     dct.add_argument("--top_k", type=int, default=64)
     dct.add_argument("--sink_size", type=int, default=4)
     dct.add_argument("--recent_size", type=int, default=128)
-    dct.add_argument("--compress_ratio", type=float, default=0.03125)
+    dct.add_argument("--compress_ratio", type=float, default=0.125)
     dct.add_argument("--scoring_method", default="max",
                      choices=["mean", "max"])
-    dct.add_argument("--group_agg_method", default="mean",
+    dct.add_argument("--group_agg_method", default="max",
                      choices=["mean", "max"])
     dct.add_argument("--unselected_mode", default="drop",
                      choices=["drop", "compressed"])
@@ -372,7 +383,12 @@ def make_run_name(label, args):
 def benchmark_dummy(model, tokenizer, args, label, context_lengths):
     device = next(model.parameters()).device
     vocab_size = tokenizer.vocab_size
-    use_pre_alloc = (label == "dct") and not getattr(args, 'no_triton', False)
+    if label == "dct":
+        use_pre_alloc = not getattr(args, 'no_triton', False)
+    elif label == "baseline":
+        use_pre_alloc = not getattr(args, 'baseline_dynamic_cache', False)
+    else:
+        use_pre_alloc = False
 
     all_records = []
     # stats grouped by context length: {ctx_len: {prefill_times, step_times}}
