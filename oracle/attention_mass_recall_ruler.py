@@ -190,6 +190,9 @@ MASS_METRIC_KEYS = [
     # Always-kept floor components (each is a fraction of total softmax mass).
     "mass_recall_sink",
     "mass_recall_recent",
+    # Total paged-region mass per head: Σ_p m[p] = 1 − sink − recent.
+    # Carried through aggregation as the denominator for paged_mass_recall_*.
+    "pages_mass",
     # Mass of (sink + selected pages + recent) / full KV — includes always-kept floor.
     "mass_recall_proxy",
     "mass_recall_quest",
@@ -201,15 +204,20 @@ MASS_METRIC_KEYS = [
     # attention mass that lands on the selector's chosen pages.
     # Equivalently: 1 − sink − recent − Σ_{unselected} m[p].
     # mass_recall_X = selected_mass_X + sink + recent.
+    # paged_mass_recall_* and paged_mass_ratio_* are derived post-hoc from
+    # these aggregates (see DERIVED_PAGED_KEYS / _derive_paged_metrics).
     "selected_mass_proxy",
     "selected_mass_quest",
     "selected_mass_shadowkv",
     "selected_mass_oracle_max",
     "selected_mass_mass_topk",
-    # Mass of (selected pages) / (total paged attention mass Σ_p m[p]).
-    # No sink/recent floor in either numerator or denominator; rescales
-    # per-head paged mass so the ceiling = 1 exactly when K ≥ P.
-    # mass_recall_X = paged_mass_recall_X · (1 − sink − recent) + sink + recent.
+]
+
+# Paged-only metrics derived from aggregated MASS_METRIC_KEYS. Computed at
+# print/summary time (ratio-of-means) instead of per decode step:
+#   paged_mass_recall_X = mean(selected_mass_X) / mean(pages_mass)
+#   paged_mass_ratio_X  = mean(selected_mass_X) / mean(selected_mass_mass_topk)
+DERIVED_PAGED_KEYS = [
     "paged_mass_recall_proxy",
     "paged_mass_recall_quest",
     "paged_mass_recall_shadowkv",
@@ -733,49 +741,16 @@ def compute_all_metrics(
     selected_mass_oracle_max = mass_recall_oracle_max - extra_mass
     selected_mass_mass_topk = mass_recall_mass_topk - extra_mass
 
-    # ----- Paged-only mass captured by each selector --------------------------
-    # Numerator: softmax mass on the selector's chosen pages (no sink/recent
-    # floor). Denominator: total paged mass per head (sink + recent excluded),
-    # clamped to 1e-8 to guard against heads whose mass lands entirely on
-    # sink/recent. Values are the fraction of paged attention mass captured,
-    # with ceiling = 1 exactly when K ≥ P.
-    paged_total = page_mass.sum(-1).clamp(min=1e-8)                            # [H_q]
-    paged_mass_recall_proxy = (
-        torch.gather(page_mass, -1, sel_q).sum(-1) / paged_total
-    )
-    paged_mass_recall_quest = (
-        torch.gather(page_mass, -1, quest_topk_q).sum(-1) / paged_total
-    )
-    paged_mass_recall_shadowkv = (
-        torch.gather(page_mass, -1, shadowkv_topk_q).sum(-1) / paged_total
-    )
-    paged_mass_recall_oracle_max = (
-        torch.gather(page_mass, -1, oracle_topk_q).sum(-1) / paged_total
-    )
-    paged_mass_recall_mass_topk = (
-        torch.gather(page_mass, -1, mass_topk_idx).sum(-1) / paged_total
-    )
-
-    # Paged ceiling must dominate all four paged-selector metrics.
-    if not (paged_mass_recall_mass_topk + tol >= paged_mass_recall_proxy).all():
-        raise AssertionError("paged_mass_recall_mass_topk < paged_mass_recall_proxy — ceiling violated")
-    if not (paged_mass_recall_mass_topk + tol >= paged_mass_recall_quest).all():
-        raise AssertionError("paged_mass_recall_mass_topk < paged_mass_recall_quest — ceiling violated")
-    if not (paged_mass_recall_mass_topk + tol >= paged_mass_recall_shadowkv).all():
-        raise AssertionError("paged_mass_recall_mass_topk < paged_mass_recall_shadowkv — ceiling violated")
-    if not (paged_mass_recall_mass_topk + tol >= paged_mass_recall_oracle_max).all():
-        raise AssertionError("paged_mass_recall_mass_topk < paged_mass_recall_oracle_max — ceiling violated")
-
-    # Ratios against the paged-only ceiling make selector quality easier to
-    # interpret when absolute paged-only recalls are small.
-    paged_ceiling = paged_mass_recall_mass_topk.clamp(min=1e-8)
-    paged_mass_ratio_proxy = paged_mass_recall_proxy / paged_ceiling
-    paged_mass_ratio_quest = paged_mass_recall_quest / paged_ceiling
-    paged_mass_ratio_shadowkv = paged_mass_recall_shadowkv / paged_ceiling
+    # Total paged-region mass per head (= 1 − sink − recent). Carried through
+    # aggregation as the denominator for paged_mass_recall_*; the ratios are
+    # derived post-hoc as ratio-of-aggregated-means by ``_derive_paged_metrics``
+    # rather than averaged per-step.
+    pages_mass = page_mass.sum(-1)                                             # [H_q]
 
     return {
         "mass_recall_sink": sink_mass,
         "mass_recall_recent": recent_mass,
+        "pages_mass": pages_mass,
         "mass_recall_proxy": mass_recall_proxy,
         "mass_recall_quest": mass_recall_quest,
         "mass_recall_shadowkv": mass_recall_shadowkv,
@@ -787,15 +762,106 @@ def compute_all_metrics(
         "selected_mass_shadowkv": selected_mass_shadowkv,
         "selected_mass_oracle_max": selected_mass_oracle_max,
         "selected_mass_mass_topk": selected_mass_mass_topk,
-        "paged_mass_recall_proxy": paged_mass_recall_proxy,
-        "paged_mass_recall_quest": paged_mass_recall_quest,
-        "paged_mass_recall_shadowkv": paged_mass_recall_shadowkv,
-        "paged_mass_recall_oracle_max": paged_mass_recall_oracle_max,
-        "paged_mass_recall_mass_topk": paged_mass_recall_mass_topk,
-        "paged_mass_ratio_proxy": paged_mass_ratio_proxy,
-        "paged_mass_ratio_quest": paged_mass_ratio_quest,
-        "paged_mass_ratio_shadowkv": paged_mass_ratio_shadowkv,
     }
+
+
+def _derive_paged_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    """Derive paged_mass_recall_* and paged_mass_ratio_* from aggregated masses.
+
+    Per-step:
+        pages_mass            = Σ_p page_mass[p] = 1 − sink − recent
+        selected_mass_X       = Σ_{p ∈ topK_X} page_mass[p]
+        paged_mass_recall_X   = selected_mass_X / pages_mass
+        paged_mass_ratio_X    = selected_mass_X / selected_mass_mass_topk
+
+    Aggregated (across head, step, sample, task, layer) — ratio of means:
+        paged_mass_recall_X = mean(selected_mass_X) / mean(pages_mass)
+        paged_mass_ratio_X  = mean(selected_mass_X) / mean(selected_mass_mass_topk)
+
+    A ratio-of-means aggregation rather than mean-of-per-step-ratios; more
+    stable when per-head paged_mass is tiny.
+    """
+    pm = float(metrics.get("pages_mass", 0.0))
+    smm = float(metrics.get("selected_mass_mass_topk", 0.0))
+    out: dict[str, float] = {}
+    for sel in ("proxy", "quest", "shadowkv", "oracle_max", "mass_topk"):
+        sm = float(metrics.get(f"selected_mass_{sel}", 0.0))
+        out[f"paged_mass_recall_{sel}"] = (sm / pm) if pm > 1e-12 else 0.0
+    for sel in ("proxy", "quest", "shadowkv"):
+        sm = float(metrics.get(f"selected_mass_{sel}", 0.0))
+        out[f"paged_mass_ratio_{sel}"] = (sm / smm) if smm > 1e-12 else 0.0
+    return out
+
+
+# ---------------------------------------------------------------------------
+# comp_size sweep: per-step selected_mass_* (ratios derived post-hoc)
+# ---------------------------------------------------------------------------
+def compute_selected_mass_sweep(
+    query_states: torch.Tensor,        # [1, H_q, 1, d]
+    paged_k: torch.Tensor,             # [1, H_kv, P, S, d]
+    page_mass: torch.Tensor,           # [H_q, P]
+    top_k: int,
+    comp_sizes: list[int],
+    num_kv_groups: int,
+    group_agg_method: str,
+    scoring_method: str,
+) -> dict[int, torch.Tensor]:
+    """Per-step selected_mass_proxy(c) for each comp_size.
+
+    For each c in ``comp_sizes`` build the proxy with c lowpass tokens per page,
+    pick its top-K pages, and return the mass landed on the chosen pages:
+
+        selected_mass_proxy(c) = Σ_{p∈proxy_topK(c)} m[p]
+
+    Aggregation derives paged_mass_recall_proxy(c) and paged_mass_ratio_proxy(c)
+    post-hoc as ratio-of-means using selected_mass_mass_topk and pages_mass.
+    Quantization is intentionally disabled (full-precision compressed K).
+    """
+    H_q, P = page_mass.shape
+    actual_top_k = min(top_k, P)
+
+    out: dict[int, torch.Tensor] = {}
+    for c in comp_sizes:
+        proxy_scores = compute_dct_lowpass_proxy_scores(
+            query_states, paged_k, c, num_kv_groups,
+            group_agg_method, scoring_method,
+            comp_kv_quant="none",
+        )                                                                      # [H_kv, P]
+        proxy_topk = torch.topk(proxy_scores, actual_top_k, dim=-1).indices    # [H_kv, K]
+        proxy_topk_q = proxy_topk.repeat_interleave(num_kv_groups, dim=0)      # [H_q, K]
+        out[c] = torch.gather(page_mass, -1, proxy_topk_q).sum(-1)             # [H_q]
+    return out
+
+
+def compute_quest_selected_mass(
+    query_states: torch.Tensor,        # [1, H_q, 1, d]
+    paged_k: torch.Tensor,             # [1, H_kv, P, S, d]
+    page_mass: torch.Tensor,           # [H_q, P]
+    top_k: int,
+    num_kv_groups: int,
+    group_agg_method: str,
+) -> torch.Tensor:
+    """Quest's per-step selected_mass_quest. No comp_size knob."""
+    H_q, P = page_mass.shape
+    actual_top_k = min(top_k, P)
+
+    quest_scores = compute_quest_scores(
+        query_states, paged_k, num_kv_groups, group_agg_method,
+    )                                                                          # [H_kv, P]
+    quest_topk = torch.topk(quest_scores, actual_top_k, dim=-1).indices        # [H_kv, K]
+    quest_topk_q = quest_topk.repeat_interleave(num_kv_groups, dim=0)          # [H_q, K]
+    return torch.gather(page_mass, -1, quest_topk_q).sum(-1)                   # [H_q]
+
+
+def compute_mass_topk_selected_mass(
+    page_mass: torch.Tensor,           # [H_q, P]
+    top_k: int,
+) -> torch.Tensor:
+    """Per-step selected_mass_mass_topk: best-K pages by mass (ceiling)."""
+    H_q, P = page_mass.shape
+    actual_top_k = min(top_k, P)
+    mass_topk_idx = torch.topk(page_mass, actual_top_k, dim=-1).indices        # [H_q, K]
+    return torch.gather(page_mass, -1, mass_topk_idx).sum(-1)                  # [H_q]
 
 
 # ---------------------------------------------------------------------------
@@ -1024,6 +1090,173 @@ def generate_with_mass_traces(
 
 
 # ---------------------------------------------------------------------------
+# comp_size sweep recorder + generator
+# ---------------------------------------------------------------------------
+class PagedMassRatioSweepRecorder:
+    """Per-decode-step recorder for the comp_size sweep.
+
+    Skips shadowkv / oracle / fidelity to keep per-step cost low. Records
+    per-step selected_mass values (no per-step ratios); paged_mass_ratio and
+    paged_mass_recall are derived post-hoc as ratio-of-aggregated-means by
+    ``_run_comp_size_sweep``:
+
+        paged_mass_ratio_X(c) = mean(selected_mass_X(c)) / mean(selected_mass_mass_topk)
+        paged_mass_recall_X(c) = mean(selected_mass_X(c)) / mean(pages_mass)
+    """
+
+    def __init__(
+        self,
+        num_decode_steps: int,
+        page_size: int,
+        top_k: int,
+        sink_size: int,
+        recent_size: int,
+        comp_sizes: list[int],
+        scoring_method: str,
+        group_agg_method: str,
+    ):
+        self.num_decode_steps = num_decode_steps
+        self.page_size = page_size
+        self.top_k = top_k
+        self.sink_size = sink_size
+        self.recent_size = recent_size
+        self.comp_sizes = list(comp_sizes)
+        self.scoring_method = scoring_method
+        self.group_agg_method = group_agg_method
+        self.records: list[dict[str, Any]] = []
+        self._step_by_layer: dict[int, int] = {}
+
+    def __call__(self, payload: dict[str, Any]) -> None:
+        layer_idx = int(payload["layer_idx"])
+        decode_step = self._step_by_layer.get(layer_idx, 0)
+        self._step_by_layer[layer_idx] = decode_step + 1
+        if decode_step >= self.num_decode_steps:
+            return
+
+        query_states = payload["query_states"]
+        key_full = payload["key_states_full"]
+        value_full = payload["value_states_full"]
+        num_kv_groups = int(payload["num_kv_groups"])
+
+        bsz, H_kv, kv_len, d = key_full.shape
+        _, H_q, q_len, _ = query_states.shape
+        assert bsz == 1 and q_len == 1
+        assert H_q == H_kv * num_kv_groups
+
+        sink_len = self.sink_size
+        if kv_len < sink_len + self.page_size + self.recent_size:
+            return
+        after_sink = kv_len - sink_len
+        num_pages = (after_sink - self.recent_size) // self.page_size
+        if num_pages < 1:
+            return
+        actual_top_k = min(self.top_k, num_pages)
+        if num_pages <= actual_top_k:
+            return
+
+        P = num_pages
+        S = self.page_size
+        paged_end = sink_len + P * S
+        sink_k = key_full[:, :, :sink_len, :]
+        paged_k = key_full[:, :, sink_len:paged_end, :].view(bsz, H_kv, P, S, d)
+        recent_k = key_full[:, :, paged_end:, :]
+
+        with torch.no_grad():
+            page_mass_gpu, _, _ = compute_per_page_mass(
+                query_states, sink_k, paged_k, recent_k, num_kv_groups,
+            )                                                                  # [H_q, P]
+
+            proxy_sel_gpu = compute_selected_mass_sweep(
+                query_states, paged_k, page_mass_gpu,
+                top_k=actual_top_k,
+                comp_sizes=self.comp_sizes,
+                num_kv_groups=num_kv_groups,
+                group_agg_method=self.group_agg_method,
+                scoring_method=self.scoring_method,
+            )
+            proxy_selected = {
+                c: t.float().cpu().tolist() for c, t in proxy_sel_gpu.items()
+            }
+
+            quest_sel_gpu = compute_quest_selected_mass(
+                query_states, paged_k, page_mass_gpu,
+                top_k=actual_top_k,
+                num_kv_groups=num_kv_groups,
+                group_agg_method=self.group_agg_method,
+            )
+            quest_selected = quest_sel_gpu.float().cpu().tolist()
+
+            mass_topk_sel_gpu = compute_mass_topk_selected_mass(
+                page_mass_gpu, top_k=actual_top_k,
+            )
+            mass_topk_selected = mass_topk_sel_gpu.float().cpu().tolist()
+
+            pages_mass = page_mass_gpu.sum(-1).float().cpu().tolist()         # [H_q]
+
+        self.records.append({
+            "layer_idx": layer_idx,
+            "decode_step": decode_step,
+            "num_pages": num_pages,
+            "actual_top_k": actual_top_k,
+            "num_kv_groups": num_kv_groups,
+            "H_q": int(page_mass_gpu.shape[0]),
+            "proxy_selected": proxy_selected,    # {comp_size: [H_q] list}
+            "quest_selected": quest_selected,    # [H_q] list
+            "mass_topk_selected": mass_topk_selected,  # [H_q] list
+            "pages_mass": pages_mass,            # [H_q] list
+        })
+
+
+def generate_with_paged_mass_ratio_sweep(
+    model,
+    tokenizer,
+    sample: dict[str, Any],
+    *,
+    num_decode_steps: int,
+    page_size: int,
+    top_k: int,
+    sink_size: int,
+    recent_size: int,
+    comp_sizes: list[int],
+    scoring_method: str,
+    group_agg_method: str,
+) -> tuple[list[dict[str, Any]], int]:
+    """generate() wrapper that installs a fresh PagedMassRatioSweepRecorder."""
+    from oracle.attention_mass_recall_ruler_quest import set_recording_hook
+
+    device = next(model.parameters()).device
+    encoded = tokenizer(sample["input"], return_tensors="pt")
+    input_ids = encoded.input_ids.to(device)
+    attention_mask = encoded.attention_mask.to(device)
+
+    recorder = PagedMassRatioSweepRecorder(
+        num_decode_steps=num_decode_steps,
+        page_size=page_size,
+        top_k=top_k,
+        sink_size=sink_size,
+        recent_size=recent_size,
+        comp_sizes=comp_sizes,
+        scoring_method=scoring_method,
+        group_agg_method=group_agg_method,
+    )
+    set_recording_hook(recorder)
+    try:
+        with torch.no_grad():
+            model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=num_decode_steps,
+                do_sample=False,
+                use_cache=True,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+    finally:
+        set_recording_hook(None)
+
+    return recorder.records, int(input_ids.shape[1])
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
@@ -1070,6 +1303,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_decode_steps", type=int, default=20,
                    help="Number of decode steps per sample to record.")
 
+    # comp_size sweep mode (paged_mass_ratio_proxy vs lowpass cutoff,
+    # mirroring observations/dct_page_energy.py). When set, the script
+    # bypasses the quest/shadowkv/oracle/fidelity selectors and forces
+    # comp_kv_quant='none'; output goes to <output_dir>/<run_name>/ with
+    # a paged_mass_ratio_curve.png plot.
+    p.add_argument("--comp_size_sweep", type=str, nargs="?", const="all",
+                   default=None,
+                   help="Trigger comp_size sweep mode (measures only "
+                        "paged_mass_ratio_proxy and emits a plot). Pass with "
+                        "no value (or 'all') to auto-sweep every comp_size "
+                        "in 1..page_size; otherwise pass a comma-separated "
+                        "list (e.g. '1,2,4,8,16,32').")
+
     # Output
     p.add_argument("--output_dir", type=Path,
                    default=Path("results_attention_mass_recall"))
@@ -1091,6 +1337,432 @@ def _aggregate_metric_dicts(dicts: list[dict[str, float]]) -> dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
+# comp_size sweep: plot + main
+# ---------------------------------------------------------------------------
+def _render_comp_size_sweep_plot(
+    run_dir: Path,
+    per_layer_mean: dict[int, dict[int, float]],
+    overall_mean: dict[int, float],
+    comp_sizes: list[int],
+    page_size: int,
+    title: str,
+    quest_per_layer_mean: dict[int, float] | None = None,
+    quest_overall_mean: float | None = None,
+) -> None:
+    """One-panel plot: x = comp_size, y = paged_mass_ratio_proxy.
+
+    Bold mean line + ±1σ shaded band across layers for each selector. The
+    band shows how consistent layers are without the visual clutter of
+    plotting all per-layer curves.
+    """
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    xs = np.array(comp_sizes, dtype=np.float64)
+
+    # DCT proxy: ±1σ band across layers per comp_size.
+    proxy_layers = np.array(
+        [[by_c[c] for c in comp_sizes]
+         for _, by_c in sorted(per_layer_mean.items())],
+        dtype=np.float64,
+    )                                              # [num_layers, num_comp_sizes]
+    proxy_std = proxy_layers.std(axis=0)
+    ys_mean = np.array([overall_mean[c] for c in comp_sizes], dtype=np.float64)
+    ax.fill_between(
+        xs,
+        np.clip(ys_mean - proxy_std, 0.0, 1.0),
+        np.clip(ys_mean + proxy_std, 0.0, 1.0),
+        color="C0", alpha=0.18,
+        label="DCT proxy ±1σ across layers",
+    )
+    ax.plot(xs, ys_mean, color="C0", linewidth=2.2, marker="o",
+            label="DCT proxy (mean over layers)")
+
+    if quest_per_layer_mean and quest_overall_mean is not None:
+        # Quest has no comp_size knob; band is a horizontal stripe at
+        # quest_overall_mean ±1σ across layers, drawn full-width so it reads
+        # as a reference baseline rather than a function of comp_size.
+        quest_arr = np.array(list(quest_per_layer_mean.values()), dtype=np.float64)
+        quest_std = float(quest_arr.std())
+        ax.axhspan(
+            max(quest_overall_mean - quest_std, 0.0),
+            min(quest_overall_mean + quest_std, 1.0),
+            color="C1", alpha=0.12,
+            label=f"Quest ±1σ across layers (σ={quest_std:.3f})",
+        )
+        ax.axhline(quest_overall_mean, color="C1", linewidth=2.2,
+                   linestyle="-",
+                   label=f"Quest (mean over layers) = {quest_overall_mean:.3f}")
+
+    ax.axhline(1.0, color="red", alpha=0.3, linestyle="--",
+               label="paged-mass ceiling")
+
+    ax.set_xlabel(f"comp_size (lowpass cutoff; page_size={page_size})")
+    ax.set_ylabel("paged_mass_ratio_proxy")
+    ax.set_title(f"{title}\npaged_mass_ratio_proxy vs comp_size")
+    ax.set_ylim(0.0, 1.05)
+    # Linear x-axis: comp_size is a token-budget count, so equal x-distance
+    # should mean equal added bins. Log scale would compress the high-c jump
+    # where most of the gain happens.
+    is_dense = len(comp_sizes) == max(comp_sizes) - min(comp_sizes) + 1
+    if is_dense and len(comp_sizes) > 12:
+        # Many consecutive ticks would crowd the axis; show endpoints +
+        # powers of 2 in between.
+        tick_set = {comp_sizes[0], comp_sizes[-1]}
+        p2 = 1
+        while p2 <= comp_sizes[-1]:
+            if p2 >= comp_sizes[0]:
+                tick_set.add(p2)
+            p2 *= 2
+        ticks = sorted(tick_set)
+    else:
+        ticks = comp_sizes
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([str(t) for t in ticks])
+    ax.legend(loc="lower right")
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    out = run_dir / "paged_mass_ratio_curve.png"
+    plt.savefig(out, dpi=120)
+    plt.close(fig)
+    print(f"[plot] {out}")
+
+
+def _run_comp_size_sweep(args: argparse.Namespace) -> None:
+    """Sweep comp_size and emit per-layer / overall paged_mass_ratio + plot."""
+    from oracle.attention_mass_recall_ruler_quest import (
+        _install_recording_forward,
+        _model_family,
+        cleanup_model,
+        load_model,
+    )
+
+    spec = args.comp_size_sweep.strip().lower()
+    if spec in ("all", "auto", ""):
+        comp_sizes = list(range(1, args.page_size + 1))
+        sweep_tag = "all"
+    else:
+        comp_sizes = sorted({int(c) for c in spec.split(",") if c.strip()})
+        sweep_tag = "c" + "-".join(str(c) for c in comp_sizes)
+    if not comp_sizes:
+        raise ValueError("--comp_size_sweep must expand to at least one value")
+    for c in comp_sizes:
+        if c < 1 or c > args.page_size:
+            raise ValueError(
+                f"comp_size {c} out of valid range [1, page_size={args.page_size}]"
+            )
+
+    start_time = time.time()
+    torch.manual_seed(42)
+
+    run_name = args.run_name or (
+        f"mass_ratio_sweep_ps{args.page_size}_topk{args.top_k}_{sweep_tag}"
+    )
+    run_dir = args.output_dir / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    per_sample_dir = run_dir / "per_sample"
+    per_sample_dir.mkdir(exist_ok=True)
+
+    config = {**vars(args), "comp_sizes": comp_sizes, "mode": "comp_size_sweep"}
+    (run_dir / "config.json").write_text(
+        json.dumps(config, ensure_ascii=False, indent=2, default=str) + "\n",
+        encoding="utf-8",
+    )
+
+    print(f"Loading model: {args.base_model}")
+    model = load_model(args)
+    print("Installing dense recording forward (no DCT patch)...")
+    _install_recording_forward(model, _model_family(args.base_model))
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.base_model, local_files_only=args.local_files_only,
+    )
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    _, tokenizer_family = infer_model_family(args.base_model)
+    task_configs = load_task_configs()
+
+    # Accumulate per-step selected_mass values as flat float lists per
+    # (layer, comp_size) and per comp_size overall. Each list element is one
+    # (head, decode_step, sample, task) observation. paged_mass_ratio and
+    # paged_mass_recall are derived post-hoc as ratio-of-means at print/plot
+    # time, NOT averaged from per-step ratios.
+    overall_proxy: dict[int, list[float]] = {c: [] for c in comp_sizes}
+    overall_quest: list[float] = []
+    overall_mass_topk: list[float] = []
+    overall_pages_mass: list[float] = []
+    per_layer_proxy: dict[int, dict[int, list[float]]] = {}
+    per_layer_quest: dict[int, list[float]] = {}
+    per_layer_mass_topk: dict[int, list[float]] = {}
+    per_layer_pages_mass: dict[int, list[float]] = {}
+    per_task_proxy: dict[str, dict[int, list[float]]] = {}
+    per_task_quest: dict[str, list[float]] = {}
+    per_task_mass_topk: dict[str, list[float]] = {}
+    per_task_pages_mass: dict[str, list[float]] = {}
+
+    try:
+        for task in args.tasks:
+            if task not in task_configs:
+                print(f"  WARNING: task {task!r} not in RULER configs, skipping")
+                continue
+            print(f"\n{'=' * 60}\nTASK: {task}\n{'=' * 60}")
+
+            data_path = (
+                args.data_root / tokenizer_family / str(args.seq_len)
+                / task / "validation.jsonl"
+            )
+            if not data_path.exists():
+                print(f"  WARNING: data not found at {data_path}, skipping")
+                continue
+
+            with data_path.open("r", encoding="utf-8") as fp:
+                samples = [json.loads(line) for line in fp if line.strip()]
+            if args.num_samples > 0:
+                samples = samples[: args.num_samples]
+
+            task_proxy: dict[int, list[float]] = {c: [] for c in comp_sizes}
+            task_quest: list[float] = []
+            task_mass_topk: list[float] = []
+            task_pages_mass: list[float] = []
+            sample_fp = (per_sample_dir / f"{task}.jsonl").open(
+                "w", encoding="utf-8", buffering=1
+            )
+
+            for sample_idx, sample in enumerate(
+                tqdm(samples, desc=f"  {task}"), start=1
+            ):
+                records, input_len = generate_with_paged_mass_ratio_sweep(
+                    model, tokenizer, sample,
+                    num_decode_steps=args.num_decode_steps,
+                    page_size=args.page_size,
+                    top_k=args.top_k,
+                    sink_size=args.sink_size,
+                    recent_size=args.recent_size,
+                    comp_sizes=comp_sizes,
+                    scoring_method=args.scoring_method,
+                    group_agg_method=args.group_agg_method,
+                )
+                if not records:
+                    print(f"  WARNING: no traces for sample {sample['index']} "
+                          f"(input_len={input_len}); skipping")
+                    continue
+
+                sample_proxy: dict[int, dict[int, list[float]]] = {}
+                sample_quest_by_layer: dict[int, list[float]] = {}
+                sample_mass_topk_by_layer: dict[int, list[float]] = {}
+                sample_pages_mass_by_layer: dict[int, list[float]] = {}
+                for rec in records:
+                    layer_idx = rec["layer_idx"]
+                    sample_proxy.setdefault(layer_idx, {c: [] for c in comp_sizes})
+                    per_layer_proxy.setdefault(layer_idx, {c: [] for c in comp_sizes})
+                    for c in comp_sizes:
+                        sm = rec["proxy_selected"][c]
+                        sample_proxy[layer_idx][c].extend(sm)
+                        per_layer_proxy[layer_idx][c].extend(sm)
+                        task_proxy[c].extend(sm)
+                        overall_proxy[c].extend(sm)
+
+                    quest_per_head = rec["quest_selected"]
+                    sample_quest_by_layer.setdefault(layer_idx, []).extend(quest_per_head)
+                    per_layer_quest.setdefault(layer_idx, []).extend(quest_per_head)
+                    task_quest.extend(quest_per_head)
+                    overall_quest.extend(quest_per_head)
+
+                    mass_topk_per_head = rec["mass_topk_selected"]
+                    sample_mass_topk_by_layer.setdefault(layer_idx, []).extend(mass_topk_per_head)
+                    per_layer_mass_topk.setdefault(layer_idx, []).extend(mass_topk_per_head)
+                    task_mass_topk.extend(mass_topk_per_head)
+                    overall_mass_topk.extend(mass_topk_per_head)
+
+                    pages_per_head = rec["pages_mass"]
+                    sample_pages_mass_by_layer.setdefault(layer_idx, []).extend(pages_per_head)
+                    per_layer_pages_mass.setdefault(layer_idx, []).extend(pages_per_head)
+                    task_pages_mass.extend(pages_per_head)
+                    overall_pages_mass.extend(pages_per_head)
+
+                # Per-sample summary stores the aggregated selected-mass means
+                # plus the derived ratio-of-means at each layer, so the JSONL
+                # is self-describing without a recomputation step downstream.
+                sample_layer_summary: dict[str, dict[str, Any]] = {}
+                for lyr in sorted(sample_proxy.keys()):
+                    smm = _mean(sample_mass_topk_by_layer.get(lyr, []))
+                    pm = _mean(sample_pages_mass_by_layer.get(lyr, []))
+                    qm = _mean(sample_quest_by_layer.get(lyr, []))
+                    sample_layer_summary[str(lyr)] = {
+                        "selected_mass_proxy": {
+                            str(c): _mean(vs) for c, vs in sample_proxy[lyr].items()
+                        },
+                        "selected_mass_quest": qm,
+                        "selected_mass_mass_topk": smm,
+                        "pages_mass": pm,
+                        "paged_mass_ratio_proxy": {
+                            str(c): (_mean(vs) / smm) if smm > 1e-12 else 0.0
+                            for c, vs in sample_proxy[lyr].items()
+                        },
+                        "paged_mass_ratio_quest": (qm / smm) if smm > 1e-12 else 0.0,
+                        "paged_mass_recall_proxy": {
+                            str(c): (_mean(vs) / pm) if pm > 1e-12 else 0.0
+                            for c, vs in sample_proxy[lyr].items()
+                        },
+                        "paged_mass_recall_quest": (qm / pm) if pm > 1e-12 else 0.0,
+                    }
+                sample_record = {
+                    "sample_index": int(sample["index"]),
+                    "input_len": input_len,
+                    "num_records": len(records),
+                    "comp_sizes": comp_sizes,
+                    "per_layer": sample_layer_summary,
+                }
+                sample_fp.write(json.dumps(sample_record, ensure_ascii=False) + "\n")
+
+                if sample_idx % 5 == 0 or sample_idx == len(samples):
+                    smm = _mean(task_mass_topk)
+                    bits = " ".join(
+                        f"c{c}={(_mean(task_proxy[c]) / smm if smm > 1e-12 else 0):.3f}"
+                        for c in comp_sizes
+                    )
+                    qratio = _mean(task_quest) / smm if smm > 1e-12 else 0.0
+                    print(f"  [{sample_idx}/{len(samples)}] {bits} "
+                          f"quest={qratio:.3f}")
+
+            sample_fp.close()
+            per_task_proxy[task] = task_proxy
+            per_task_quest[task] = task_quest
+            per_task_mass_topk[task] = task_mass_topk
+            per_task_pages_mass[task] = task_pages_mass
+
+            smm_task = _mean(task_mass_topk)
+            pm_task = _mean(task_pages_mass)
+            print("  TASK SUMMARY")
+            for c in comp_sizes:
+                mp = _mean(task_proxy[c])
+                ratio = mp / smm_task if smm_task > 1e-12 else 0.0
+                recall = mp / pm_task if pm_task > 1e-12 else 0.0
+                print(f"    comp_size={c:3d}  paged_mass_ratio_proxy = "
+                      f"{ratio:.4f}  paged_mass_recall_proxy = {recall:.4f}")
+            mq = _mean(task_quest)
+            qratio = mq / smm_task if smm_task > 1e-12 else 0.0
+            qrecall = mq / pm_task if pm_task > 1e-12 else 0.0
+            print(f"    quest        paged_mass_ratio_quest = {qratio:.4f}"
+                  f"  paged_mass_recall_quest = {qrecall:.4f}")
+
+        # ----- Derive ratios post-hoc from aggregated selected_mass means ---
+        # paged_mass_ratio_X(c) = mean(selected_mass_X(c)) / mean(selected_mass_mass_topk)
+        # paged_mass_recall_X(c) = mean(selected_mass_X(c)) / mean(pages_mass)
+        smm_overall = _mean(overall_mass_topk)
+        pm_overall = _mean(overall_pages_mass)
+
+        def _safe_div(num: float, den: float) -> float:
+            return num / den if den > 1e-12 else 0.0
+
+        ratio_per_layer: dict[int, dict[int, float]] = {}
+        recall_per_layer: dict[int, dict[int, float]] = {}
+        for lyr, by_c in sorted(per_layer_proxy.items()):
+            smm = _mean(per_layer_mass_topk.get(lyr, []))
+            pm = _mean(per_layer_pages_mass.get(lyr, []))
+            ratio_per_layer[lyr] = {
+                c: _safe_div(_mean(vs), smm) for c, vs in by_c.items()
+            }
+            recall_per_layer[lyr] = {
+                c: _safe_div(_mean(vs), pm) for c, vs in by_c.items()
+            }
+        ratio_overall: dict[int, float] = {
+            c: _safe_div(_mean(vs), smm_overall) for c, vs in overall_proxy.items()
+        }
+        recall_overall: dict[int, float] = {
+            c: _safe_div(_mean(vs), pm_overall) for c, vs in overall_proxy.items()
+        }
+
+        quest_ratio_per_layer: dict[int, float] = {
+            lyr: _safe_div(_mean(vs), _mean(per_layer_mass_topk.get(lyr, [])))
+            for lyr, vs in sorted(per_layer_quest.items())
+        }
+        quest_recall_per_layer: dict[int, float] = {
+            lyr: _safe_div(_mean(vs), _mean(per_layer_pages_mass.get(lyr, [])))
+            for lyr, vs in sorted(per_layer_quest.items())
+        }
+        quest_ratio_overall = _safe_div(_mean(overall_quest), smm_overall)
+        quest_recall_overall = _safe_div(_mean(overall_quest), pm_overall)
+
+        per_task_summary: dict[str, Any] = {}
+        for task, by_c in per_task_proxy.items():
+            smm_task = _mean(per_task_mass_topk[task])
+            pm_task = _mean(per_task_pages_mass[task])
+            mq_task = _mean(per_task_quest[task])
+            per_task_summary[task] = {
+                "num_samples": min(args.num_samples, len(samples)) if args.num_samples > 0 else len(samples),
+                "selected_mass_proxy": {str(c): _mean(vs) for c, vs in by_c.items()},
+                "selected_mass_quest": mq_task,
+                "selected_mass_mass_topk": smm_task,
+                "pages_mass": pm_task,
+                "paged_mass_ratio_proxy": {
+                    str(c): _safe_div(_mean(vs), smm_task) for c, vs in by_c.items()
+                },
+                "paged_mass_ratio_quest": _safe_div(mq_task, smm_task),
+                "paged_mass_recall_proxy": {
+                    str(c): _safe_div(_mean(vs), pm_task) for c, vs in by_c.items()
+                },
+                "paged_mass_recall_quest": _safe_div(mq_task, pm_task),
+            }
+
+        summary = {
+            "config": config,
+            "comp_sizes": comp_sizes,
+            "per_task": per_task_summary,
+            "overall": {
+                "selected_mass_proxy": {
+                    str(c): _mean(vs) for c, vs in overall_proxy.items()
+                },
+                "selected_mass_quest": _mean(overall_quest),
+                "selected_mass_mass_topk": smm_overall,
+                "pages_mass": pm_overall,
+                "paged_mass_ratio_proxy": {str(c): m for c, m in ratio_overall.items()},
+                "paged_mass_ratio_quest": quest_ratio_overall,
+                "paged_mass_recall_proxy": {str(c): m for c, m in recall_overall.items()},
+                "paged_mass_recall_quest": quest_recall_overall,
+            },
+            "per_layer": {
+                str(lyr): {
+                    "paged_mass_ratio_proxy": {str(c): m for c, m in ratio_per_layer[lyr].items()},
+                    "paged_mass_recall_proxy": {str(c): m for c, m in recall_per_layer[lyr].items()},
+                    "paged_mass_ratio_quest": quest_ratio_per_layer.get(lyr, 0.0),
+                    "paged_mass_recall_quest": quest_recall_per_layer.get(lyr, 0.0),
+                }
+                for lyr in sorted(per_layer_proxy.keys())
+            },
+        }
+        (run_dir / "summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2, default=str) + "\n",
+            encoding="utf-8",
+        )
+
+        title = f"{_model_family(args.base_model)} @ {args.seq_len} (page_size={args.page_size})"
+        _render_comp_size_sweep_plot(
+            run_dir, ratio_per_layer, ratio_overall,
+            comp_sizes, args.page_size, title,
+            quest_per_layer_mean=quest_ratio_per_layer,
+            quest_overall_mean=quest_ratio_overall,
+        )
+
+        elapsed = (time.time() - start_time) / 60
+        print(f"\n{'=' * 60}\nOVERALL RESULTS\n{'=' * 60}")
+        for c in comp_sizes:
+            print(f"  comp_size={c:3d}  paged_mass_ratio_proxy = {ratio_overall[c]:.4f}"
+                  f"  paged_mass_recall_proxy = {recall_overall[c]:.4f}")
+        print(f"  quest          paged_mass_ratio_quest = {quest_ratio_overall:.4f}"
+              f"  paged_mass_recall_quest = {quest_recall_overall:.4f}")
+        print(f"\n  Results: {run_dir}")
+        print(f"  Total time: {elapsed:.1f} min")
+
+    finally:
+        cleanup_model(model)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -1102,6 +1774,9 @@ def main() -> None:
     )
 
     args = parse_args()
+    if args.comp_size_sweep:
+        _run_comp_size_sweep(args)
+        return
     start_time = time.time()
     torch.manual_seed(42)
 
@@ -1226,6 +1901,7 @@ def main() -> None:
 
                 if sample_idx % 5 == 0 or sample_idx == len(samples):
                     o = _aggregate_metric_dicts(task_overall_records)
+                    o.update(_derive_paged_metrics(o))
                     print(
                         f"  [{sample_idx}/{len(samples)}] "
                         f"sink={o['mass_recall_sink']:.3f} "
@@ -1261,13 +1937,17 @@ def main() -> None:
 
             sample_fp.close()
 
+            task_overall_agg = _aggregate_metric_dicts(task_overall_records)
+            task_overall_agg.update(_derive_paged_metrics(task_overall_agg))
+            task_per_layer_agg = {}
+            for lyr, bucket in sorted(task_per_layer.items()):
+                lm = _aggregate_metric_dicts(bucket)
+                lm.update(_derive_paged_metrics(lm))
+                task_per_layer_agg[str(lyr)] = lm
             per_task_results[task] = {
                 "num_samples": len(samples),
-                "overall": _aggregate_metric_dicts(task_overall_records),
-                "per_layer": {
-                    str(lyr): _aggregate_metric_dicts(bucket)
-                    for lyr, bucket in sorted(task_per_layer.items())
-                },
+                "overall": task_overall_agg,
+                "per_layer": task_per_layer_agg,
             }
             o = per_task_results[task]["overall"]
             print(
@@ -1297,6 +1977,7 @@ def main() -> None:
 
         overall_task_means = [r["overall"] for r in per_task_results.values()]
         overall = _aggregate_metric_dicts(overall_task_means)
+        overall.update(_derive_paged_metrics(overall))
 
         summary = {
             "config": {
@@ -1326,7 +2007,7 @@ def main() -> None:
 
         elapsed = (time.time() - start_time) / 60
         print(f"\n{'=' * 60}\nOVERALL RESULTS\n{'=' * 60}")
-        for k in METRIC_KEYS:
+        for k in MASS_METRIC_KEYS + DERIVED_PAGED_KEYS + FIDELITY_METRIC_KEYS:
             print(f"  {k:25s} = {overall[k]:.3f}")
         print(f"\n  Results: {run_dir}")
         print(f"  Total time: {elapsed:.1f} min")
