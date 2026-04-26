@@ -493,7 +493,7 @@ def load_model_and_tokenizer(args):
         # strip rope_scaling up front (InfLLM replaces RoPE anyway).
         inf_llm_config_override = {}
         if args.mode == "inf_llm":
-            from inf_llm import load_llama_config_stripped_rope
+            from infllm import load_llama_config_stripped_rope
             inf_llm_config_override["config"] = load_llama_config_stripped_rope(args.base_model)
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
@@ -519,12 +519,12 @@ def load_model_and_tokenizer(args):
             init_duo_attention(model, DUO_ATTN_CONFIG)
 
         if args.mode == "inf_llm":
-            from inf_llm import (
+            from infllm import (
                 assert_llama_only,
                 build_inf_llm_generator,
                 init_inf_llm,
             )
-            from inf_llm.config import INF_LLM_CONFIG
+            from infllm.config import INF_LLM_CONFIG
             assert_llama_only(args.base_model)
             INF_LLM_CONFIG["base_model"] = args.base_model
             INF_LLM_CONFIG["n_init"] = args.inf_llm_n_init

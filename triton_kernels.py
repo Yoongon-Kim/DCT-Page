@@ -483,13 +483,14 @@ def _topk_sort_kernel(
     num_pages,
     TOP_K: tl.constexpr,
     BLOCK_P: tl.constexpr,
+    SORT_ASCENDING: tl.constexpr,
 ):
-    """One program per (batch, kv_head). Finds top-k page indices sorted ascending.
+    """One program per (batch, kv_head). Finds top-k page indices.
 
-    Algorithm: two vectorized sorts via tl.sort —
-      1) Sort (score descending, index) packed into int64 to find top-k,
-      2) Sort the top-k indices ascending.
-    O(n log²n + n log²n) vectorized ops vs. O(k·n + k²) serial ops.
+    Phase 1 sorts `(−score, page_idx)` packed into int64 to locate the top-k.
+    Phase 2 (when `SORT_ASCENDING=True`) sorts those top-k indices ascending.
+    Drop-mode callers pass `SORT_ASCENDING=False` and skip phase 2 entirely —
+    attention with `is_causal=False` is permutation-invariant over middle KV.
     """
     pid = tl.program_id(0)
     base_s = scores_ptr + pid * s_stride_bh
@@ -513,22 +514,25 @@ def _topk_sort_kernel(
     packed = (desc_key.to(tl.int64) << 32) | p_idx.to(tl.int64)
     sorted_packed = tl.sort(packed)
 
-    # --- Phase 2: Sort top-k indices ascending ---
-    # Extract page indices (lower 32 bits), sentinel the tail with INT_MAX
     sorted_indices = (sorted_packed & 0xFFFFFFFF).to(tl.int32)
-    top_indices = tl.where(p_idx < TOP_K, sorted_indices, 2147483647)
-    sorted_top = tl.sort(top_indices)
+    if SORT_ASCENDING:
+        # Sentinel the tail with INT_MAX, then sort ascending by page index.
+        top_indices = tl.where(p_idx < TOP_K, sorted_indices, 2147483647)
+        out_indices = tl.sort(top_indices)
+    else:
+        # Descending-score order is fine for drop mode; skip the second sort.
+        out_indices = sorted_indices
 
-    # Store first TOP_K results (mask keeps writes in-bounds)
-    tl.store(base_o + p_idx, sorted_top, mask=p_idx < TOP_K)
+    tl.store(base_o + p_idx, out_indices, mask=p_idx < TOP_K)
 
 
 def topk_sort_triton(
     page_scores: torch.Tensor,
     top_k: int,
     out: torch.Tensor = None,
+    sort_ascending: bool = True,
 ) -> torch.Tensor:
-    """Fused top-k selection + ascending sort + int32 cast in one kernel.
+    """Fused top-k selection (+ optional ascending sort + int32 cast) in one kernel.
 
     Replaces: torch.topk() + .sort() + .to(int32)
 
@@ -537,9 +541,12 @@ def topk_sort_triton(
         top_k: number of pages to select
         out: optional pre-allocated [bsz, num_kv_heads, top_k] int32 buffer.
              Strides may be larger than the logical shape.
+        sort_ascending: if True (default), output indices are sorted ascending by
+            page index (required for compressed mode). If False, output indices
+            are in descending-score order — fine for drop mode, ~40-50% cheaper.
 
     Returns:
-        selected_indices: [bsz, num_kv_heads, top_k] int32, sorted ascending
+        selected_indices: [bsz, num_kv_heads, top_k] int32
     """
     bsz, num_kv_heads, num_pages = page_scores.shape
     BLOCK_P = triton.next_power_of_2(num_pages)
@@ -564,6 +571,7 @@ def topk_sort_triton(
             num_pages,
             TOP_K=top_k,
             BLOCK_P=BLOCK_P,
+            SORT_ASCENDING=sort_ascending,
             num_warps=1,
             num_stages=1,
         )
@@ -627,8 +635,14 @@ def _topk_merge_kernel(
     sc_stride_bh, o_stride_bh,
     TOP_K: tl.constexpr,
     TOTAL: tl.constexpr,  # NUM_CHUNKS * TOP_K, must be power of 2
+    SORT_ASCENDING: tl.constexpr,
 ):
-    """Stage 2: merge all chunk top-k lists and emit final top-k sorted ascending by index."""
+    """Stage 2: merge all chunk top-k lists and emit final top-k.
+
+    When `SORT_ASCENDING=True` the output is sorted ascending by page index
+    (required for compressed mode). Otherwise it's left in descending-score
+    order — fine for drop mode, skips a second bitonic sort on `TOTAL` lanes.
+    """
     pid_bh = tl.program_id(0)
     idx = tl.arange(0, TOTAL)
 
@@ -637,11 +651,14 @@ def _topk_merge_kernel(
     sorted_packed = tl.sort(packed)
 
     sorted_indices = (sorted_packed & 0xFFFFFFFF).to(tl.int32)
-    top_indices = tl.where(idx < TOP_K, sorted_indices, 2147483647)
-    sorted_top = tl.sort(top_indices)
+    if SORT_ASCENDING:
+        top_indices = tl.where(idx < TOP_K, sorted_indices, 2147483647)
+        out_indices = tl.sort(top_indices)
+    else:
+        out_indices = sorted_indices
 
     base_o = out_ptr + pid_bh * o_stride_bh
-    tl.store(base_o + idx, sorted_top, mask=idx < TOP_K)
+    tl.store(base_o + idx, out_indices, mask=idx < TOP_K)
 
 
 def topk_sort_twostage_triton(
@@ -650,6 +667,7 @@ def topk_sort_twostage_triton(
     out: torch.Tensor = None,
     scratch: torch.Tensor = None,
     num_chunks: int = 4,
+    sort_ascending: bool = True,
 ) -> torch.Tensor:
     """Two-stage parallel top-k: sort chunks in parallel, then merge.
 
@@ -660,6 +678,9 @@ def topk_sort_twostage_triton(
 
     TOP_K must be a power of 2 so that NUM_CHUNKS * TOP_K is also a power
     of 2 (required by tl.sort in the merge kernel).
+
+    `sort_ascending=False` (drop mode) skips the final ascending-by-index
+    sort inside `_topk_merge_kernel` — output is in descending-score order.
     """
     bsz, num_kv_heads, num_pages = page_scores.shape
     assert (top_k & (top_k - 1)) == 0 and top_k > 0, "top_k must be a power of 2"
@@ -703,6 +724,7 @@ def topk_sort_twostage_triton(
             sc_stride_bh, o_stride_bh,
             TOP_K=top_k,
             TOTAL=TOTAL,
+            SORT_ASCENDING=sort_ascending,
             num_warps=1,
             num_stages=1,
         )
@@ -714,13 +736,17 @@ def topk_sort_torch(
     page_scores: torch.Tensor,
     top_k: int,
     out: torch.Tensor = None,
+    sort_ascending: bool = True,
 ) -> torch.Tensor:
-    """Pure-PyTorch fallback for top-k page selection + ascending sort.
+    """Pure-PyTorch fallback for top-k page selection.
 
-    Produces identical output contract to topk_sort_triton.
+    Produces identical output contract to topk_sort_triton. When
+    `sort_ascending=False` (drop mode) the extra `.sort()` is skipped and
+    indices are returned in descending-score order.
     """
     _, indices = torch.topk(page_scores, top_k, dim=-1)
-    indices, _ = indices.sort(dim=-1)
+    if sort_ascending:
+        indices, _ = indices.sort(dim=-1)
     indices = indices.to(torch.int32)
     if out is not None:
         out.copy_(indices)
@@ -739,20 +765,284 @@ def topk_sort(
     top_k: int,
     out: torch.Tensor = None,
     scratch: torch.Tensor = None,
+    sort_ascending: bool = True,
 ) -> torch.Tensor:
     """Auto-dispatch top-k: single-stage for num_pages <= 1024, two-stage above.
 
     The two-stage path needs a power-of-2 top_k (so NUM_CHUNKS * TOP_K is a
     power of 2 for tl.sort). If top_k is not a power of 2, falls back to
     single-stage regardless of num_pages.
+
+    `sort_ascending=False` (drop mode) skips the final ascending-by-index sort.
     """
     num_pages = page_scores.shape[-1]
     is_pow2_top_k = top_k > 0 and (top_k & (top_k - 1)) == 0
     if num_pages >= _TOPK_TWOSTAGE_MIN_PAGES and is_pow2_top_k:
         return topk_sort_twostage_triton(
             page_scores, top_k, out=out, scratch=scratch, num_chunks=8,
+            sort_ascending=sort_ascending,
         )
-    return topk_sort_triton(page_scores, top_k, out=out)
+    return topk_sort_triton(
+        page_scores, top_k, out=out, sort_ascending=sort_ascending,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Kernel 1d: Fused TopK + Pack (writes FlashInfer-ready indices_buf in one pass)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _topk_sort_and_pack_kernel(
+    scores_ptr,            # [bsz * num_kv_heads, num_pages] (flat, fp32)
+    indices_buf_ptr,       # [bsz * num_kv_heads, page_budget] (flat, int32)
+    last_page_idx_ptr,     # [bsz] int32
+    recent_offsets_ptr,    # [NUM_RECENT] int32 (static: typically [-R, -R+1, ..., -1])
+    s_stride_bh,
+    o_stride_bh,
+    num_pages,
+    NUM_KV_HEADS: tl.constexpr,
+    NUM_SINK_PAGES: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+    NUM_RECENT: tl.constexpr,
+    NUM_RECENT_PADDED: tl.constexpr,   # next_pow2(NUM_RECENT), >= 1
+    SORT_ASCENDING: tl.constexpr,
+):
+    """One program per (batch, kv_head). Finds top-k page indices and writes
+    the middle+recent regions of a preallocated `indices_buf` in one pass.
+
+    Layout produced:
+      indices_buf[b, h, 0                       : NUM_SINK_PAGES)            : NOT TOUCHED (static, written once at cache init)
+      indices_buf[b, h, NUM_SINK_PAGES          : NUM_SINK_PAGES + TOP_K)    : topk(scores[b, h]) + NUM_SINK_PAGES
+      indices_buf[b, h, NUM_SINK_PAGES + TOP_K  : NUM_SINK_PAGES + TOP_K + NUM_RECENT) : last_page_idx[b] + recent_offsets
+
+    Top-k phase is identical to `_topk_sort_kernel`; only the write-back
+    target and offset differ. Register footprint matches the unfused kernel
+    (no new accumulators) — we only add a handful of int32 loads/adds/stores
+    for the recent tail.
+    """
+    pid = tl.program_id(0)
+    b = pid // NUM_KV_HEADS
+    base_s = scores_ptr + pid * s_stride_bh
+    base_o = indices_buf_ptr + pid * o_stride_bh
+
+    p_idx = tl.arange(0, BLOCK_P)
+    mask = p_idx < num_pages
+    scores = tl.load(base_s + p_idx, mask=mask, other=float('-inf'))
+
+    # --- Phase 1: Sort by score descending to find top-k ---
+    bits = scores.to(tl.int32, bitcast=True)
+    sortable = tl.where(bits >= 0, bits, bits ^ 0x7FFFFFFF)
+    desc_key = -sortable
+    packed = (desc_key.to(tl.int64) << 32) | p_idx.to(tl.int64)
+    sorted_packed = tl.sort(packed)
+
+    sorted_indices = (sorted_packed & 0xFFFFFFFF).to(tl.int32)
+    if SORT_ASCENDING:
+        top_indices = tl.where(p_idx < TOP_K, sorted_indices, 2147483647)
+        topk_out = tl.sort(top_indices)
+    else:
+        topk_out = sorted_indices
+
+    # --- Phase 2: Pack write — topk region with +NUM_SINK_PAGES offset ---
+    topk_with_offset = topk_out + NUM_SINK_PAGES
+    tl.store(
+        base_o + NUM_SINK_PAGES + p_idx,
+        topk_with_offset,
+        mask=p_idx < TOP_K,
+    )
+
+    # --- Phase 3: Pack write — recent region = last_page_idx + recent_offsets ---
+    if NUM_RECENT > 0:
+        last_idx = tl.load(last_page_idx_ptr + b)  # int32 scalar
+        r_idx = tl.arange(0, NUM_RECENT_PADDED)
+        r_mask = r_idx < NUM_RECENT
+        offsets = tl.load(recent_offsets_ptr + r_idx, mask=r_mask, other=0)
+        recent_vals = last_idx + offsets
+        tl.store(
+            base_o + (NUM_SINK_PAGES + TOP_K) + r_idx,
+            recent_vals,
+            mask=r_mask,
+        )
+
+
+@triton.jit
+def _topk_merge_and_pack_kernel(
+    scratch_ptr,           # [bsz * num_kv_heads, TOTAL] int64 packed
+    indices_buf_ptr,       # [bsz * num_kv_heads, page_budget] int32
+    last_page_idx_ptr,     # [bsz] int32
+    recent_offsets_ptr,    # [NUM_RECENT] int32
+    sc_stride_bh,
+    o_stride_bh,
+    NUM_KV_HEADS: tl.constexpr,
+    NUM_SINK_PAGES: tl.constexpr,
+    TOP_K: tl.constexpr,
+    TOTAL: tl.constexpr,         # NUM_CHUNKS * TOP_K, must be pow2
+    NUM_RECENT: tl.constexpr,
+    NUM_RECENT_PADDED: tl.constexpr,
+    SORT_ASCENDING: tl.constexpr,
+):
+    """Stage 2 (two-stage topk) with fused pack-indices write.
+
+    Same layout as `_topk_sort_and_pack_kernel`; only the local-chunk topk
+    staging differs — Stage 1 (`_topk_local_kernel`) is reused unchanged.
+    """
+    pid = tl.program_id(0)
+    b = pid // NUM_KV_HEADS
+    idx = tl.arange(0, TOTAL)
+
+    sc_base = scratch_ptr + pid * sc_stride_bh
+    packed = tl.load(sc_base + idx)
+    sorted_packed = tl.sort(packed)
+
+    sorted_indices = (sorted_packed & 0xFFFFFFFF).to(tl.int32)
+    if SORT_ASCENDING:
+        top_indices = tl.where(idx < TOP_K, sorted_indices, 2147483647)
+        topk_out = tl.sort(top_indices)
+    else:
+        topk_out = sorted_indices
+
+    base_o = indices_buf_ptr + pid * o_stride_bh
+    topk_with_offset = topk_out + NUM_SINK_PAGES
+    tl.store(
+        base_o + NUM_SINK_PAGES + idx,
+        topk_with_offset,
+        mask=idx < TOP_K,
+    )
+
+    if NUM_RECENT > 0:
+        last_idx = tl.load(last_page_idx_ptr + b)
+        r_idx = tl.arange(0, NUM_RECENT_PADDED)
+        r_mask = r_idx < NUM_RECENT
+        offsets = tl.load(recent_offsets_ptr + r_idx, mask=r_mask, other=0)
+        recent_vals = last_idx + offsets
+        tl.store(
+            base_o + (NUM_SINK_PAGES + TOP_K) + r_idx,
+            recent_vals,
+            mask=r_mask,
+        )
+
+
+def topk_sort_and_pack_triton(
+    page_scores: torch.Tensor,           # (bsz, num_kv_heads, num_pages) fp32
+    indices_buf: torch.Tensor,           # (bsz, num_kv_heads, page_budget) int32
+    num_sink_pages: int,
+    top_k: int,
+    last_page_idx: torch.Tensor,         # (bsz,) int32
+    recent_offsets: torch.Tensor,        # (num_recent,) int32 (may be empty)
+    scratch: torch.Tensor = None,        # (bsz, num_kv_heads, >= 8*top_k) int64, for two-stage
+    sort_ascending: bool = False,
+    num_chunks: int = 8,
+) -> torch.Tensor:
+    """Fused top-k + pack-indices write. Replaces `topk_sort(...)` followed by
+    a Python `pack_indices(...)` call that copies/offsets into a preallocated
+    indices buffer.
+
+    Layout written into `indices_buf[b, h, :]`:
+      [0, num_sink_pages)                              : NOT TOUCHED — static, caller writes once
+      [num_sink_pages, num_sink_pages + top_k)         : topk indices + num_sink_pages
+      [num_sink_pages + top_k, page_budget)            : last_page_idx[b] + recent_offsets
+
+    `indices_buf` must be shape (bsz, num_kv_heads, page_budget) int32 where
+    `page_budget == num_sink_pages + top_k + recent_offsets.numel()`. The
+    caller is responsible for pre-filling the sink region (e.g. at cache
+    init) — doing it here would waste a store on every decode step.
+
+    `sort_ascending=False` is the drop-mode default (order-invariant middle
+    attention). With `sort_ascending=True` the topk slice is sorted ascending
+    by page index — matches `topk_sort(sort_ascending=True)` semantics for
+    bit-identical comparison against sequential topk + pack.
+
+    Dispatch: single-stage for `num_pages <= 1024`; two-stage (reusing
+    `_topk_local_kernel`) above that, same threshold as `topk_sort`.
+    """
+    bsz, num_kv_heads, num_pages = page_scores.shape
+    page_budget = indices_buf.shape[-1]
+    num_recent = int(recent_offsets.numel())
+
+    assert indices_buf.shape == (bsz, num_kv_heads, page_budget), (
+        f"indices_buf shape {tuple(indices_buf.shape)} does not match "
+        f"(bsz={bsz}, num_kv_heads={num_kv_heads}, page_budget={page_budget})"
+    )
+    assert indices_buf.dtype == torch.int32, "indices_buf must be int32"
+    assert page_budget == num_sink_pages + top_k + num_recent, (
+        f"page_budget ({page_budget}) != num_sink_pages ({num_sink_pages}) "
+        f"+ top_k ({top_k}) + num_recent ({num_recent})"
+    )
+    assert last_page_idx.shape == (bsz,) and last_page_idx.dtype == torch.int32, (
+        "last_page_idx must be shape (bsz,) int32"
+    )
+    if num_recent > 0:
+        assert recent_offsets.dtype == torch.int32, "recent_offsets must be int32"
+
+    is_pow2_top_k = top_k > 0 and (top_k & (top_k - 1)) == 0
+    use_twostage = num_pages >= _TOPK_TWOSTAGE_MIN_PAGES and is_pow2_top_k
+
+    s_stride_bh = page_scores.stride(1)
+    o_stride_bh = indices_buf.stride(1)
+    # next_pow2(max(NUM_RECENT, 1)) so tl.arange is always valid.
+    NUM_RECENT_PADDED = 1 if num_recent == 0 else triton.next_power_of_2(num_recent)
+
+    if use_twostage:
+        per_chunk = max(1, (num_pages + num_chunks - 1) // num_chunks)
+        CHUNK_SIZE = max(top_k, triton.next_power_of_2(per_chunk))
+        TOTAL = num_chunks * top_k
+
+        if scratch is None:
+            scratch = torch.empty(
+                bsz, num_kv_heads, TOTAL,
+                dtype=torch.int64, device=page_scores.device,
+            )
+        sc_stride_bh = scratch.stride(1)
+
+        grid1 = (bsz * num_kv_heads, num_chunks)
+        grid2 = (bsz * num_kv_heads,)
+
+        with torch.cuda.device(page_scores.device):
+            _topk_local_kernel[grid1](
+                page_scores, scratch,
+                s_stride_bh, sc_stride_bh,
+                num_pages,
+                TOP_K=top_k,
+                CHUNK_SIZE=CHUNK_SIZE,
+                num_warps=1,
+                num_stages=1,
+            )
+            _topk_merge_and_pack_kernel[grid2](
+                scratch, indices_buf,
+                last_page_idx, recent_offsets,
+                sc_stride_bh, o_stride_bh,
+                NUM_KV_HEADS=num_kv_heads,
+                NUM_SINK_PAGES=num_sink_pages,
+                TOP_K=top_k,
+                TOTAL=TOTAL,
+                NUM_RECENT=num_recent,
+                NUM_RECENT_PADDED=NUM_RECENT_PADDED,
+                SORT_ASCENDING=sort_ascending,
+                num_warps=1,
+                num_stages=1,
+            )
+    else:
+        BLOCK_P = max(top_k, triton.next_power_of_2(num_pages))
+        grid = (bsz * num_kv_heads,)
+
+        with torch.cuda.device(page_scores.device):
+            _topk_sort_and_pack_kernel[grid](
+                page_scores, indices_buf,
+                last_page_idx, recent_offsets,
+                s_stride_bh, o_stride_bh,
+                num_pages,
+                NUM_KV_HEADS=num_kv_heads,
+                NUM_SINK_PAGES=num_sink_pages,
+                TOP_K=top_k,
+                BLOCK_P=BLOCK_P,
+                NUM_RECENT=num_recent,
+                NUM_RECENT_PADDED=NUM_RECENT_PADDED,
+                SORT_ASCENDING=sort_ascending,
+                num_warps=1,
+                num_stages=1,
+            )
+
+    return indices_buf
 
 
 # ---------------------------------------------------------------------------

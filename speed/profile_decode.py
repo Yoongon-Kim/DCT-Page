@@ -94,6 +94,109 @@ import torch.nn.functional as F
 
 from transformers.cache_utils import DynamicLayer
 
+import contextlib
+from torch.nn.attention import sdpa_kernel, SDPBackend
+from torch.profiler import profile as _torch_profile, ProfilerActivity
+
+
+_SDPA_BACKEND_MAP = {
+    "auto":         None,
+    "flash":        [SDPBackend.FLASH_ATTENTION],
+    "mem_efficient":[SDPBackend.EFFICIENT_ATTENTION],
+    "math":         [SDPBackend.MATH],
+    "cudnn":        [SDPBackend.CUDNN_ATTENTION],
+}
+
+
+def _sdpa_backend_context(backend_str):
+    """Return a context manager that pins SDPA to the chosen backend.
+
+    `auto` keeps PyTorch's default dispatcher (all backends allowed). Any
+    other value whitelists ONLY that backend — SDPA will raise rather than
+    silently fall back, which is what we want when benchmarking.
+    """
+    backends = _SDPA_BACKEND_MAP.get(backend_str)
+    if backends is None:
+        return contextlib.nullcontext()
+    return sdpa_kernel(backends)
+
+
+_SDPA_KERNEL_SIGNATURES = [
+    # (label, substrings — any match wins)
+    ("FlashAttention-2",     ("flash_fwd", "flash::flash_fwd", "flash_attn")),
+    ("memory-efficient",     ("fmha_cutlass", "cutlassf", "mem_efficient_attention")),
+    ("cuDNN attention",      ("cudnn_attention", "cudnn_fused_attention")),
+    ("math (unfused)",       ("scaled_dot_product_attention_math", "sdp_math")),
+]
+
+
+def _probe_sdpa_backend(model, past_key_values, next_token, current_pos,
+                        backend_ctx, mode_label):
+    """Run ONE decode step under torch.profiler, grep kernel names, and
+    print which SDPA backend actually fired. `backend_ctx` is a context
+    manager for the first `with` block; a second one is constructed via
+    the stashed `_requested_label -> backend_str` map for the profile run
+    (sdpa_kernel isn't re-entrant on a single instance)."""
+    device = next_token.device
+    static_pos = torch.tensor([current_pos], device=device, dtype=torch.long)
+    # Resolve the backend string from the requested_label so we can build a
+    # second fresh context for the profiled call.
+    requested_label = getattr(_probe_sdpa_backend, "_requested_label", None)
+    label_to_str = {
+        "FlashAttention-2": "flash", "memory-efficient": "mem_efficient",
+        "math (unfused)": "math", "cuDNN attention": "cudnn", None: "auto",
+    }
+    backend_str = label_to_str.get(requested_label, "auto")
+
+    # Warmup (cuDNN + FA pick plans on first call; skip that cost from the trace).
+    with backend_ctx, torch.no_grad():
+        model(next_token, past_key_values=past_key_values,
+              use_cache=True, cache_position=static_pos)
+    torch.cuda.synchronize(device)
+
+    with _sdpa_backend_context(backend_str), torch.no_grad(), _torch_profile(
+        activities=[ProfilerActivity.CUDA], record_shapes=False,
+    ) as prof:
+        model(next_token, past_key_values=past_key_values,
+              use_cache=True, cache_position=static_pos)
+    torch.cuda.synchronize(device)
+
+    kernel_names = []
+    for ev in prof.events():
+        dur = getattr(ev, "cuda_time_total", 0) or getattr(ev, "self_cuda_time_total", 0)
+        if dur > 0 and ev.name:
+            kernel_names.append(ev.name.lower())
+
+    hits = {label: [] for label, _ in _SDPA_KERNEL_SIGNATURES}
+    unmatched_attn_like = []
+    for name in kernel_names:
+        matched = False
+        for label, needles in _SDPA_KERNEL_SIGNATURES:
+            if any(n in name for n in needles):
+                hits[label].append(name)
+                matched = True
+                break
+        if not matched and ("attention" in name or "sdpa" in name or "fmha" in name):
+            unmatched_attn_like.append(name)
+
+    print(f"\n  [SDPA probe: {mode_label}]")
+    any_hit = False
+    for label, _ in _SDPA_KERNEL_SIGNATURES:
+        if hits[label]:
+            any_hit = True
+            sample = hits[label][0]
+            print(f"    -> {label}  (e.g. {sample[:90]})  count={len(hits[label])}")
+    if not any_hit:
+        print(f"    -> NO known SDPA kernel matched. "
+              f"Attention-like kernels observed: {list(set(unmatched_attn_like))[:5]}")
+    # Extra: print a warning if FA2 was requested but not observed.
+    requested = getattr(_probe_sdpa_backend, "_requested_label", None)
+    if requested == "FlashAttention-2" and not hits["FlashAttention-2"]:
+        print(f"    [WARN] FA2 was requested via --sdpa_backend flash but "
+              f"no flash_fwd kernels were observed.")
+    elif requested == "FlashAttention-2":
+        print(f"    [OK] FA2 confirmed.")
+
 
 # ---------------------------------------------------------------------------
 # Pre-allocated KV cache (avoids torch.cat during decode)
@@ -174,6 +277,17 @@ class _ProfileTopKImpl:
 
 
 _profile_topk_impl = _ProfileTopKImpl()
+
+
+class _ProfileAttnBackend:
+    """Holds the attention backend selection ('sdpa' or 'quest') and the
+    optional verify flag. Set from CLI in main()."""
+    value = 'sdpa'
+    verify = False
+
+
+_profile_attn_backend = _ProfileAttnBackend()
+_quest_cache_ref = [None]  # single-element list; stashed after post-prefill build
 
 
 def _flush_events():
@@ -397,25 +511,30 @@ def profiled_dct_page_attention_forward(
         )
 
     topk_impl = getattr(_profile_topk_impl, 'value', 'auto')
+    _sort_ascending = (cfg.unselected_mode == "compressed")
     if topk_impl == 'fused':
         selected_indices = topk_sort_triton(
             page_scores, actual_top_k, out=self._topk_out_buf,
+            sort_ascending=_sort_ascending,
         )
     elif topk_impl == 'twostage':
         selected_indices = topk_sort_twostage_triton(
             page_scores, actual_top_k,
             out=self._topk_out_buf,
             scratch=self._topk_scratch_buf[:, :, :scratch_n],
+            sort_ascending=_sort_ascending,
         )
     elif topk_impl == 'torch':
         selected_indices = topk_sort_torch(
             page_scores, actual_top_k, out=self._topk_out_buf,
+            sort_ascending=_sort_ascending,
         )
     else:  # auto
         selected_indices = topk_sort(
             page_scores, actual_top_k,
             out=self._topk_out_buf,
             scratch=self._topk_scratch_buf[:, :, :scratch_n],
+            sort_ascending=_sort_ascending,
         )
 
     if _enabled:
@@ -428,41 +547,92 @@ def profiled_dct_page_attention_forward(
         middle_len = actual_top_k * cfg.page_size + num_unselected * comp_size
         assembled_len = cfg.sink_size + middle_len + actual_recent
 
-    # Pre-allocate or expand output buffers (avoids torch.empty per step)
-    _buf_len = getattr(self, '_assemble_buf_len', 0)
-    if assembled_len > _buf_len:
-        _max_len = assembled_len + cfg.page_size
-        _nkv = _num_kv_heads
-        self._final_k_buf = torch.empty(bsz, _nkv, _max_len, self.head_dim, dtype=paged_k.dtype, device=paged_k.device)
-        self._final_v_buf = torch.empty_like(self._final_k_buf)
-        self._sel_idx_buf = torch.empty(bsz, _nkv, actual_top_k, dtype=torch.int32, device=paged_k.device)
-        self._assemble_buf_len = _max_len
+    # Pre-allocate or expand output buffers (avoids torch.empty per step).
+    # Only needed for the SDPA path — Quest reads directly from its own cache.
+    _backend = _profile_attn_backend.value
+    if _backend == "sdpa" or _profile_attn_backend.verify:
+        _buf_len = getattr(self, '_assemble_buf_len', 0)
+        if assembled_len > _buf_len:
+            _max_len = assembled_len + cfg.page_size
+            _nkv = _num_kv_heads
+            self._final_k_buf = torch.empty(bsz, _nkv, _max_len, self.head_dim, dtype=paged_k.dtype, device=paged_k.device)
+            self._final_v_buf = torch.empty_like(self._final_k_buf)
+            self._sel_idx_buf = torch.empty(bsz, _nkv, actual_top_k, dtype=torch.int32, device=paged_k.device)
+            self._assemble_buf_len = _max_len
 
-    # Step 7: assemble drop (post-RoPE cache → no RoPE application needed here)
-    if cfg.unselected_mode == "drop":
-        final_k, final_v = assemble_kv_drop_triton(
-            paged_k, paged_v,
-            sink_k, sink_v, recent_k, recent_v,
-            selected_indices,
-            None, None,
-            out_k=self._final_k_buf,
-            out_v=self._final_v_buf,
-            out_sel_idx=self._sel_idx_buf,
-            original_position_rope=False,
+    # Step 7: assemble KV (SDPA) or pack Quest page indices. Cache is
+    # post-RoPE, so no RoPE is re-applied during assembly.
+    if _backend == "quest":
+        import quest_backend
+        qcache = _quest_cache_ref[0]
+        # Append this step's K/V into Quest's paged layout (in-place, O(1)).
+        # key_states/value_states include the just-inserted token at position -1.
+        quest_backend.append_quest_cache(
+            qcache, key_states[:, :, -1:, :], value_states[:, :, -1:, :], self.layer_idx,
         )
+        # pack_indices is alloc-free and produces a fixed-width index tensor
+        # (qcache.max_total_selected). sink / top_k / recent page counts are
+        # all build-time constants on qcache — per-step args are unused.
+        packed, indptr = quest_backend.pack_indices(qcache, selected_indices[0])
+        # Optionally also run the SDPA path for verification (writes to same
+        # buffers; result discarded unless verify).
+        if _profile_attn_backend.verify and cfg.unselected_mode == "drop":
+            final_k, final_v = assemble_kv_drop_triton(
+                paged_k, paged_v,
+                sink_k, sink_v, recent_k, recent_v,
+                selected_indices,
+                None, None,
+                out_k=self._final_k_buf,
+                out_v=self._final_v_buf,
+                out_sel_idx=self._sel_idx_buf,
+                original_position_rope=False,
+            )
     else:
-        raise NotImplementedError("profile_decode only supports the current drop-mode default path.")
+        if cfg.unselected_mode == "drop":
+            final_k, final_v = assemble_kv_drop_triton(
+                paged_k, paged_v,
+                sink_k, sink_v, recent_k, recent_v,
+                selected_indices,
+                None, None,
+                out_k=self._final_k_buf,
+                out_v=self._final_v_buf,
+                out_sel_idx=self._sel_idx_buf,
+                original_position_rope=False,
+            )
+        else:
+            raise NotImplementedError("profile_decode only supports the current drop-mode default path.")
 
     if _enabled:
         _rec(8)
 
-    attn_output = F.scaled_dot_product_attention(
-        query_states, final_k, final_v,
-        is_causal=False,
-        enable_gqa=True,
-    )
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    # Step 8: attention (SDPA or Quest paged kernel).
+    if _backend == "quest":
+        import quest_backend
+        rope_theta = float(getattr(self.config, "rope_theta", 1e4))
+        quest_out = quest_backend.quest_decode_attention(
+            query_states, _quest_cache_ref[0], packed, indptr, self.layer_idx,
+            rope_scale=1.0, rope_theta=rope_theta,
+        )  # (1, num_qo_heads, 1, head_dim)
+
+        if _profile_attn_backend.verify:
+            sdpa_out = F.scaled_dot_product_attention(
+                query_states, final_k, final_v,
+                is_causal=False, enable_gqa=True,
+            )
+            max_diff = (quest_out - sdpa_out).abs().max().item()
+            if not hasattr(self, "_verify_diffs"):
+                self._verify_diffs = []
+            self._verify_diffs.append(max_diff)
+            # Use SDPA output for downstream layers so errors do not compound.
+            attn_output = sdpa_out.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+        else:
+            attn_output = quest_out.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+    else:
+        attn_output = F.scaled_dot_product_attention(
+            query_states, final_k, final_v,
+            is_causal=False, enable_gqa=True,
+        )
+        attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
 
     if _enabled:
         _rec(9)
@@ -471,11 +641,13 @@ def profiled_dct_page_attention_forward(
 
     if _enabled:
         _rec(10)
+        step7_label = "7_pack_indices" if _backend == "quest" else "7_assemble_drop"
+        step8_label = "8_quest_attn" if _backend == "quest" else "8_sdpa"
         step_names = [
             "1_qkv_proj", "2_rope_and_cache_append", "3_segment",
             "4_compress", "5a_score_cache_update", "5b_score_pages_kernel",
-            "6_topk", "7_assemble_drop",
-            "8_sdpa", "9_o_proj",
+            "6_topk", step7_label,
+            step8_label, "9_o_proj",
         ]
         for i, name in enumerate(step_names):
             _pending_events.append((name, ev[i], ev[i + 1]))
@@ -513,7 +685,7 @@ def profiled_baseline_forward(
     hidden_shape = (*input_shape, -1, self.head_dim)
     bsz, q_len = input_shape
 
-    if not _enabled or q_len > 1:
+    if q_len > 1:
         # Prefill — standard path
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
@@ -539,18 +711,20 @@ def profiled_baseline_forward(
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
-    # ---- Instrumented decode path (chained events) ----
-    _dev = hidden_states.device
-    _stream = torch.cuda.current_stream(_dev)
-    ev = [torch.cuda.Event(enable_timing=True) for _ in range(5)]
-    ev[0].record(_stream)
+    # ---- Decode path (fast SDPA; events only when _enabled) ----
+    if _enabled:
+        _dev = hidden_states.device
+        _stream = torch.cuda.current_stream(_dev)
+        ev = [torch.cuda.Event(enable_timing=True) for _ in range(5)]
+        ev[0].record(_stream)
 
     # Step 1: QKV projection
     query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-    ev[1].record(_stream)
+    if _enabled:
+        ev[1].record(_stream)
 
     # Step 2: RoPE + KV cache update
     cos, sin = position_embeddings
@@ -561,7 +735,8 @@ def profiled_baseline_forward(
             key_states, value_states, self.layer_idx, cache_kwargs
         )
 
-    ev[2].record(_stream)
+    if _enabled:
+        ev[2].record(_stream)
 
     # Step 8: SDPA (matches DCT's step 8 label for the comparison table)
     attn_output = F.scaled_dot_product_attention(
@@ -571,15 +746,16 @@ def profiled_baseline_forward(
     )
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
 
-    ev[3].record(_stream)
+    if _enabled:
+        ev[3].record(_stream)
 
     attn_output = self.o_proj(attn_output)
 
-    ev[4].record(_stream)
-
-    step_names = ["1_qkv_proj", "2_rope_and_cache_append", "8_sdpa", "9_o_proj"]
-    for i, name in enumerate(step_names):
-        _pending_events.append((name, ev[i], ev[i + 1]))
+    if _enabled:
+        ev[4].record(_stream)
+        step_names = ["1_qkv_proj", "2_rope_and_cache_append", "8_sdpa", "9_o_proj"]
+        for i, name in enumerate(step_names):
+            _pending_events.append((name, ev[i], ev[i + 1]))
 
     return attn_output, None
 
@@ -629,7 +805,35 @@ def parse_args():
     p.add_argument("--benchmark_topk", action="store_true",
                    help="Run a standalone micro-benchmark of the three topk "
                         "implementations over representative shapes and exit.")
+    p.add_argument("--cudagraph", action="store_true",
+                   help="After the per-step profile, also capture one decode step "
+                        "into a CUDA graph and benchmark replay throughput. "
+                        "Measures the kernel-launch-overhead-free ceiling at the "
+                        "given context length. During replay the KV cache is "
+                        "overwritten in-place at the same slot each iteration, "
+                        "so the output is not used — pure perf measurement.")
+    p.add_argument("--cudagraph_replays", type=int, default=0,
+                   help="Number of graph replays to time (0 = use --num_decode_steps).")
+    p.add_argument("--attention_backend", choices=["sdpa", "quest"], default="sdpa",
+                   help="Attention kernel used in the DCT decode path. "
+                        "'sdpa' assembles selected pages then runs "
+                        "F.scaled_dot_product_attention (current default). "
+                        "'quest' skips the gather and calls Quest's FlashInfer "
+                        "paged decode kernel directly on selected pages.")
+    p.add_argument("--verify_quest", action="store_true",
+                   help="Run both SDPA and Quest paths per layer and log "
+                        "max-abs-diff (bf16 tolerance). Implies --attention_backend quest.")
+    p.add_argument("--sdpa_backend",
+                   choices=["auto", "flash", "mem_efficient", "math", "cudnn"],
+                   default="flash",
+                   help="Pin PyTorch's SDPA dispatcher to a single backend for "
+                        "fair comparison. 'flash' = FA2 only (raises if SDPA "
+                        "can't route there). 'auto' = PyTorch's default heuristic. "
+                        "A one-step torch.profiler probe before the measured loop "
+                        "prints which backend actually fired.")
     args = p.parse_args()
+    if args.verify_quest:
+        args.attention_backend = "quest"
     return args
 
 
@@ -681,6 +885,60 @@ def run_benchmark_topk():
 
 
 # ---------------------------------------------------------------------------
+# CUDA graph capture + replay benchmark
+# ---------------------------------------------------------------------------
+def _capture_and_benchmark(model, past_key_values, next_token, current_pos,
+                           num_replays):
+    """Capture one decode step into a CUDA graph, benchmark N replays.
+
+    Called after warmup/profile so kernels are JIT'd and buffers pre-allocated.
+    The returned tok/s is the steady-state ceiling at the current context
+    length: every replay overwrites the same KV slot, so real text generation
+    would diverge numerically — this is strictly a performance measurement.
+    """
+    global _enabled
+    _enabled = False  # no CUDA event recording inside capture/replay
+
+    device = next_token.device
+    static_input = next_token.clone()
+    static_pos = torch.tensor([current_pos], device=device, dtype=torch.long)
+
+    # Prime on a side stream (torch.cuda.graph requires this for correct
+    # allocator state before capture).
+    s = torch.cuda.Stream(device=device)
+    s.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            with torch.no_grad():
+                model(static_input, past_key_values=past_key_values,
+                      use_cache=True, cache_position=static_pos)
+    torch.cuda.current_stream(device).wait_stream(s)
+    torch.cuda.synchronize(device)
+
+    print(f"  Capturing CUDA graph...")
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        with torch.no_grad():
+            model(static_input, past_key_values=past_key_values,
+                  use_cache=True, cache_position=static_pos)
+
+    # Warm-up replays before timing (first few replays have minor one-time cost)
+    for _ in range(5):
+        g.replay()
+    torch.cuda.synchronize(device)
+
+    print(f"  Replaying graph ({num_replays} steps)...")
+    t0 = time.perf_counter()
+    for _ in range(num_replays):
+        g.replay()
+    torch.cuda.synchronize(device)
+    total_ms = (time.perf_counter() - t0) * 1000
+    per_replay_ms = total_ms / num_replays
+    tok_s = 1000.0 / per_replay_ms
+    return per_replay_ms, tok_s
+
+
+# ---------------------------------------------------------------------------
 # Run profiled decode
 # ---------------------------------------------------------------------------
 def run_profiled_decode(model, tokenizer, args, mode):
@@ -719,49 +977,158 @@ def run_profiled_decode(model, tokenizer, args, mode):
     past_key_values = pre_allocate_cache(past_key_values, extra_tokens=extra)
     print(f"  Converted to pre-allocated cache (+{extra} tokens)")
 
-    # Warmup decode steps (not profiled)
-    print(f"  Warming up ({args.warmup_steps} steps)...")
-    for step in range(args.warmup_steps):
-        cache_position = torch.tensor([prefill_len + step], device=device)
-        with torch.no_grad():
-            out = model(next_token, past_key_values=past_key_values,
-                        use_cache=True, cache_position=cache_position)
-        past_key_values = out.past_key_values
-        next_token = out.logits[:, -1:].argmax(dim=-1)
-    torch.cuda.synchronize()
-
-    # Profiled decode steps
-    print(f"  Profiling ({args.num_decode_steps} steps)...")
-    _step_timings.clear()
-    _cpu_timings.clear()
-    _enabled = True
-
-    total_times = []
-    for step in range(args.num_decode_steps):
-        _current_layer = 0
-        cache_position = torch.tensor(
-            [prefill_len + args.warmup_steps + step], device=device
+    # Build Quest paged KV cache (post-prefill one-time copy) if this is the
+    # DCT run and the Quest attention backend was requested. The baseline run
+    # never uses Quest.
+    _quest_cache_ref[0] = None
+    if mode == "dct" and args.attention_backend == "quest":
+        import quest_backend
+        cfg_model = model.config
+        num_kv_heads = cfg_model.num_key_value_heads
+        num_qo_heads = cfg_model.num_attention_heads
+        head_dim = cfg_model.hidden_size // num_qo_heads
+        num_layers = cfg_model.num_hidden_layers
+        num_sink_pages = (args.sink_size + args.page_size - 1) // args.page_size
+        # Fixed number of EXPLICIT recent pages per step (strictly before
+        # last_page_idx; the partially-filled last page is attended via the
+        # kernel's paged_kv_last_page_* path on top of this). The variable
+        # count would oscillate between ceil(recent/ps) - 1 and ceil(recent/ps)
+        # + 1 over a page_size-cycle; fixing to the max keeps
+        # total_selected constant (required for CUDA-graph capture) and
+        # overshoots the recent window by ≤1 page on the partial-page steps.
+        num_recent_pages_fixed = (args.recent_size + args.page_size - 1) // args.page_size + 1
+        max_total_selected = num_sink_pages + args.top_k + num_recent_pages_fixed
+        max_decode_steps = args.warmup_steps + args.num_decode_steps + 16
+        print(f"  Building Quest paged cache (layers={num_layers}, "
+              f"page_size={args.page_size}, num_sink_pages={num_sink_pages}, "
+              f"top_k={args.top_k}, num_recent_pages_fixed={num_recent_pages_fixed}, "
+              f"max_total_selected={max_total_selected})...")
+        _quest_cache_ref[0] = quest_backend.build_quest_paged_cache(
+            preallocated_layers=past_key_values.layers,
+            prefill_len=prefill_len,
+            page_size=args.page_size,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            num_qo_heads=num_qo_heads,
+            num_layers=num_layers,
+            max_decode_steps=max_decode_steps,
+            dtype=past_key_values.layers[0].keys.dtype,
+            device=device,
+            num_sink_pages=num_sink_pages,
+            top_k=args.top_k,
+            num_recent_pages_fixed=num_recent_pages_fixed,
         )
+        print(f"  Quest cache ready: {_quest_cache_ref[0].capacity_pages} pages "
+              f"allocated, cur_seqlen={_quest_cache_ref[0].cur_seqlen}, "
+              f"last_page_idx={_quest_cache_ref[0].last_page_idx}, "
+              f"last_page_len={_quest_cache_ref[0].last_page_len}")
 
+    # SDPA backend context: pins PyTorch's SDPA dispatcher to the user-chosen
+    # backend for the whole measured region (warmup + profile + cudagraph
+    # capture). 'auto' = default dispatcher. Anything else = whitelist ONE
+    # backend so SDPA raises rather than silently falling back. A fresh
+    # context manager is created at each `with` site (sdpa_kernel isn't
+    # guaranteed re-entrant across multiple `with` blocks on the same object).
+    sdpa_backend_str = getattr(args, 'sdpa_backend', 'flash')
+    _label_map = {
+        "flash": "FlashAttention-2", "mem_efficient": "memory-efficient",
+        "math": "math (unfused)", "cudnn": "cuDNN attention", "auto": None,
+    }
+    _probe_sdpa_backend._requested_label = _label_map.get(sdpa_backend_str)
+    print(f"  SDPA backend: --sdpa_backend={sdpa_backend_str} "
+          f"(requested: {_probe_sdpa_backend._requested_label or 'PyTorch default'})")
+
+    # Probe once (before warmup) to report which kernel actually fires.
+    try:
+        _probe_sdpa_backend(
+            model, past_key_values, next_token,
+            current_pos=prefill_len,
+            backend_ctx=_sdpa_backend_context(sdpa_backend_str),
+            mode_label=mode,
+        )
+    except Exception as e:
+        print(f"  [SDPA probe skipped: {type(e).__name__}: {e}]")
+
+    with _sdpa_backend_context(sdpa_backend_str):
+        # Warmup decode steps (not profiled)
+        print(f"  Warming up ({args.warmup_steps} steps)...")
+        for step in range(args.warmup_steps):
+            cache_position = torch.tensor([prefill_len + step], device=device)
+            with torch.no_grad():
+                out = model(next_token, past_key_values=past_key_values,
+                            use_cache=True, cache_position=cache_position)
+            past_key_values = out.past_key_values
+            next_token = out.logits[:, -1:].argmax(dim=-1)
         torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        with torch.no_grad():
-            out = model(next_token, past_key_values=past_key_values,
-                        use_cache=True, cache_position=cache_position)
-        _flush_events()  # single sync + compute all step elapsed times
-        total_ms = (time.perf_counter() - t0) * 1000
-        total_times.append(total_ms)
 
-        past_key_values = out.past_key_values
-        next_token = out.logits[:, -1:].argmax(dim=-1)
+        # Profiled decode steps
+        print(f"  Profiling ({args.num_decode_steps} steps)...")
+        _step_timings.clear()
+        _cpu_timings.clear()
+        _enabled = True
 
-    _enabled = False
+        total_times = []
+        for step in range(args.num_decode_steps):
+            _current_layer = 0
+            cache_position = torch.tensor(
+                [prefill_len + args.warmup_steps + step], device=device
+            )
+
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            with torch.no_grad():
+                out = model(next_token, past_key_values=past_key_values,
+                            use_cache=True, cache_position=cache_position)
+            _flush_events()  # single sync + compute all step elapsed times
+            total_ms = (time.perf_counter() - t0) * 1000
+            total_times.append(total_ms)
+
+            past_key_values = out.past_key_values
+            next_token = out.logits[:, -1:].argmax(dim=-1)
+
+        _enabled = False
 
     # Summarize
     avg_model_total = sum(total_times) / len(total_times)
     tok_s = 1000.0 / avg_model_total
 
-    return avg_model_total, tok_s, dict(_step_timings), total_times, dict(_cpu_timings)
+    # Verify-mode summary: aggregate per-layer max-abs-diff collected inside
+    # the forward on `self._verify_diffs`.
+    if _profile_attn_backend.verify and mode == "dct":
+        per_layer_max = {}
+        per_layer_mean = {}
+        for mod in model.modules():
+            diffs = getattr(mod, "_verify_diffs", None)
+            if diffs:
+                lid = getattr(mod, "layer_idx", None)
+                per_layer_max[lid] = max(diffs)
+                per_layer_mean[lid] = sum(diffs) / len(diffs)
+        if per_layer_max:
+            print(f"\n  [verify] Quest vs SDPA max-abs-diff across {len(per_layer_max)} layers:")
+            for lid in sorted(k for k in per_layer_max if k is not None):
+                print(f"    layer {lid:>2}: max={per_layer_max[lid]:.4f}  mean={per_layer_mean[lid]:.4f}")
+            worst = max(per_layer_max.values())
+            print(f"  [verify] worst layer max-abs-diff = {worst:.4f} "
+                  f"(bf16 tolerance ~0.01)")
+
+    # Optional: CUDA graph capture + replay benchmark on the same warmed state.
+    # Pre-allocated KV cache has headroom for the +3 priming + 1 capture steps
+    # (extra = warmup + num_decode_steps + 16). Captured UNDER the SDPA backend
+    # context so the baked-in SDPA kernel matches the measured loop.
+    graph_stats = None
+    if getattr(args, 'cudagraph', False):
+        num_replays = args.cudagraph_replays or args.num_decode_steps
+        current_pos = prefill_len + args.warmup_steps + args.num_decode_steps
+        try:
+            with _sdpa_backend_context(sdpa_backend_str):
+                graph_stats = _capture_and_benchmark(
+                    model, past_key_values, next_token, current_pos, num_replays
+                )
+        except Exception as e:
+            print(f"  CUDA graph benchmark failed: {type(e).__name__}: {e}")
+            graph_stats = None
+
+    return avg_model_total, tok_s, dict(_step_timings), total_times, dict(_cpu_timings), graph_stats
 
 
 # ---------------------------------------------------------------------------
@@ -832,6 +1199,8 @@ def main():
         return
 
     _profile_topk_impl.value = args.topk_impl
+    _profile_attn_backend.value = args.attention_backend
+    _profile_attn_backend.verify = args.verify_quest
 
     import types
     import transformers
@@ -859,11 +1228,16 @@ def main():
             if isinstance(module, attn_cls) and hasattr(module, "_old_forward"):
                 module._old_forward = types.MethodType(profiled_baseline_forward, module)
 
-        avg_total, tok_s, timings, total_times, cpu_timings = run_profiled_decode(
+        avg_total, tok_s, timings, total_times, cpu_timings, graph_stats = run_profiled_decode(
             model, tokenizer, args, "baseline"
         )
         print_profile("baseline", avg_total, tok_s, timings, num_layers, cpu_timings)
-        results["baseline"] = (avg_total, tok_s, timings)
+        if graph_stats is not None:
+            gp, gts = graph_stats
+            print(f"\n  CUDA graph: {gp:.3f} ms/step  ({gts:.1f} tok/s)")
+            print(f"  Speedup (graph vs profiled): {avg_total / gp:.2f}x  "
+                  f"(saved {avg_total - gp:.2f} ms/step)")
+        results["baseline"] = (avg_total, tok_s, timings, graph_stats)
 
         # Clean up KV cache
         del total_times
@@ -889,19 +1263,24 @@ def main():
         assert attn_cls.__dict__['forward'] is profiled_dct_page_attention_forward, \
             "Patching failed: LlamaAttention.forward is not profiled_dct_page_attention_forward"
 
-        avg_total, tok_s, timings, total_times, cpu_timings = run_profiled_decode(
+        avg_total, tok_s, timings, total_times, cpu_timings, graph_stats = run_profiled_decode(
             model, tokenizer, args, "dct"
         )
         print_profile("dct", avg_total, tok_s, timings, num_layers, cpu_timings)
-        results["dct"] = (avg_total, tok_s, timings)
+        if graph_stats is not None:
+            gp, gts = graph_stats
+            print(f"\n  CUDA graph: {gp:.3f} ms/step  ({gts:.1f} tok/s)")
+            print(f"  Speedup (graph vs profiled): {avg_total / gp:.2f}x  "
+                  f"(saved {avg_total - gp:.2f} ms/step)")
+        results["dct"] = (avg_total, tok_s, timings, graph_stats)
 
         del total_times
         torch.cuda.empty_cache()
 
     # Comparison
     if "baseline" in results and "dct" in results:
-        b_avg, b_tok, b_timings = results["baseline"]
-        d_avg, d_tok, d_timings = results["dct"]
+        b_avg, b_tok, b_timings, b_graph = results["baseline"]
+        d_avg, d_tok, d_timings, d_graph = results["dct"]
 
         def _per_token(timings_dict, step, n_layers):
             vals = timings_dict.get(step, [])
@@ -939,6 +1318,14 @@ def main():
                 diff_str = "\u2014"
 
             print(f"  {step:<25} {b_str:>15} {d_str:>15} {diff_str:>12}")
+
+        if b_graph is not None and d_graph is not None:
+            b_gp, b_gts = b_graph
+            d_gp, d_gts = d_graph
+            print(f"\n  {'CUDA GRAPH':<25} {'Baseline':>15} {'DCT':>15} {'Diff':>12}")
+            print(f"  {'-'*25} {'-'*15} {'-'*15} {'-'*12}")
+            print(f"  {'ms/step':<25} {b_gp:>15.3f} {d_gp:>15.3f} {d_gp-b_gp:>+12.3f}")
+            print(f"  {'tok/s':<25} {b_gts:>15.1f} {d_gts:>15.1f} {d_gts-b_gts:>+12.1f}")
 
 
 if __name__ == "__main__":

@@ -440,7 +440,7 @@ def build_summary(results, args):
         from duo_attn.config import DUO_ATTN_CONFIG
         summary["duo_attn_config"] = DUO_ATTN_CONFIG
     elif args.mode == "inf_llm":
-        from inf_llm.config import INF_LLM_CONFIG
+        from infllm.config import INF_LLM_CONFIG
         summary["inf_llm_config"] = INF_LLM_CONFIG
 
     return summary
@@ -651,7 +651,7 @@ def main():
         # strip rope_scaling up front (InfLLM replaces RoPE anyway).
         inf_llm_config_override = {}
         if args.mode == "inf_llm":
-            from inf_llm import load_llama_config_stripped_rope
+            from infllm import load_llama_config_stripped_rope
             inf_llm_config_override["config"] = load_llama_config_stripped_rope(args.base_model)
         # Old transformers envs (duo_attention, inf_llm) only accept torch_dtype=;
         # transformers 5.x (main DCT-Page env) only accepts dtype=.
@@ -684,12 +684,12 @@ def main():
             init_duo_attention(model, DUO_ATTN_CONFIG)
 
         if args.mode == "inf_llm":
-            from inf_llm import (
+            from infllm import (
                 assert_llama_only,
                 build_inf_llm_generator,
                 init_inf_llm,
             )
-            from inf_llm.config import INF_LLM_CONFIG
+            from infllm.config import INF_LLM_CONFIG
             assert_llama_only(args.base_model)
             INF_LLM_CONFIG["base_model"] = args.base_model
             INF_LLM_CONFIG["n_init"] = args.inf_llm_n_init

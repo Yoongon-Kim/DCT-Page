@@ -1035,7 +1035,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     # Model
-    p.add_argument("--base_model", type=str, default="Qwen/Qwen3-8B")
+    p.add_argument("--base_model", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
     p.add_argument("--cuda_device", type=int, default=0)
     p.add_argument("--local_files_only", action="store_true")
 
@@ -1061,7 +1061,7 @@ def parse_args() -> argparse.Namespace:
 
     # Fake-quantize the compressed K proxy (simulates low-precision comp-KV
     # storage). Applied AFTER the DCT projection, BEFORE scoring.
-    p.add_argument("--comp_kv_quant", type=str, default="none",
+    p.add_argument("--comp_kv_quant", type=str, default="fp8_e4m3",
                    choices=["none", "fp8_e4m3", "fp8_e5m2", "int8", "int4"])
     p.add_argument("--comp_kv_quant_granularity", type=str, default="per_page",
                    choices=["per_page", "per_comp_token"])
