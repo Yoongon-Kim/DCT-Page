@@ -903,11 +903,32 @@ def _capture_and_benchmark(model, past_key_values, next_token, current_pos,
     static_input = next_token.clone()
     static_pos = torch.tensor([current_pos], device=device, dtype=torch.long)
 
+    # Release default-pool cached free blocks back to CUDA. Prefill + warmup
+    # leave several GiB of cached-but-free blocks in the default allocator pool
+    # that the graph's private pool cannot reuse. On smaller GPUs at long
+    # context, this is enough to OOM during graph capture even though no live
+    # tensor is over the limit.
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+
+    # Mint one allocator pool shared between priming and capture. Without this,
+    # priming's freed blocks (in a side-stream pool) cannot be reused by the
+    # captured graph's private pool — the two pools each hold a full forward's
+    # worth of activation memory. Sharing collapses that to one. `MemPool` is
+    # the object form (works with `use_mem_pool`); its `.id` is the tuple form
+    # `torch.cuda.graph(pool=...)` requires.
+    pool = torch.cuda.MemPool()
+
+    torch.cuda.reset_peak_memory_stats(device)
+    mem_before_alloc = torch.cuda.memory_allocated(device)
+    mem_before_resv = torch.cuda.memory_reserved(device)
+
     # Prime on a side stream (torch.cuda.graph requires this for correct
-    # allocator state before capture).
+    # allocator state before capture). `use_mem_pool(pool)` routes priming's
+    # allocations into the shared pool so the captured graph reuses them.
     s = torch.cuda.Stream(device=device)
     s.wait_stream(torch.cuda.current_stream(device))
-    with torch.cuda.stream(s):
+    with torch.cuda.stream(s), torch.cuda.use_mem_pool(pool):
         for _ in range(3):
             with torch.no_grad():
                 model(static_input, past_key_values=past_key_values,
@@ -917,10 +938,19 @@ def _capture_and_benchmark(model, past_key_values, next_token, current_pos,
 
     print(f"  Capturing CUDA graph...")
     g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
+    with torch.cuda.graph(g, pool=pool.id):
         with torch.no_grad():
             model(static_input, past_key_values=past_key_values,
                   use_cache=True, cache_position=static_pos)
+
+    mem_peak_alloc = torch.cuda.max_memory_allocated(device)
+    mem_peak_resv = torch.cuda.max_memory_reserved(device)
+    print(
+        f"  Graph capture peak: alloc {mem_peak_alloc/(1024**3):.2f} GiB "
+        f"(+{(mem_peak_alloc - mem_before_alloc)/(1024**3):.2f}), "
+        f"reserved {mem_peak_resv/(1024**3):.2f} GiB "
+        f"(+{(mem_peak_resv - mem_before_resv)/(1024**3):.2f})"
+    )
 
     # Warm-up replays before timing (first few replays have minor one-time cost)
     for _ in range(5):

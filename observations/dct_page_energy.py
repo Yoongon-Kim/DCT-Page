@@ -217,6 +217,79 @@ def render_plot(run_dir: Path, per_layer: list[dict], summary: dict, page_size: 
     print(f"[plot] {out}")
 
 
+def render_per_layer_grid(
+    run_dir: Path,
+    per_layer: list[dict],
+    page_size: int,
+    title: str,
+    layer_cols: int = 4,
+) -> None:
+    import math
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if not per_layer:
+        print("[per-layer plot] no layers to render")
+        return
+
+    bin_x = np.arange(page_size)
+    kept_x = np.arange(1, page_size + 1)
+
+    num_layers = len(per_layer)
+    nrows = math.ceil(num_layers / layer_cols)
+    ncols = 2 * layer_cols
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(2.6 * ncols, 2.0 * nrows),
+        squeeze=False,
+    )
+
+    for idx, r in enumerate(per_layer):
+        row = idx // layer_cols
+        col_pair = idx % layer_cols
+        ax_frac = axes[row][2 * col_pair]
+        ax_cum = axes[row][2 * col_pair + 1]
+
+        ax_frac.plot(bin_x, r["k_energy_fraction"], color="C0", linewidth=1.2)
+        ax_frac.set_yscale("log")
+        ax_frac.set_title(f"L{r['layer_idx']} fraction", fontsize=9)
+        if row == nrows - 1:
+            ax_frac.set_xlabel("DCT bin", fontsize=8)
+        if col_pair == 0:
+            ax_frac.set_ylabel("energy frac", fontsize=8)
+        ax_frac.tick_params(labelsize=7)
+
+        ax_cum.plot(kept_x, r["k_cumulative"], color="C0", linewidth=1.2)
+        for c in HEADLINE_CUTOFFS:
+            if c <= page_size:
+                ax_cum.axvline(c, color="red", alpha=0.25, linestyle="--")
+        ax_cum.axhline(0.9, color="black", alpha=0.3, linestyle=":")
+        ax_cum.axhline(0.99, color="black", alpha=0.3, linestyle=":")
+        ax_cum.set_ylim(0.0, 1.02)
+        ax_cum.set_title(f"L{r['layer_idx']} cumulative", fontsize=9)
+        if row == nrows - 1:
+            ax_cum.set_xlabel("bins kept", fontsize=8)
+        ax_cum.tick_params(labelsize=7)
+
+    total_cells = nrows * layer_cols
+    for idx in range(num_layers, total_cells):
+        row = idx // layer_cols
+        col_pair = idx % layer_cols
+        axes[row][2 * col_pair].set_visible(False)
+        axes[row][2 * col_pair + 1].set_visible(False)
+
+    fig.suptitle(f"{title}\nper-layer K energy (page_size={page_size})", fontsize=11)
+    plt.tight_layout()
+    fig.subplots_adjust(top=1.0 - 0.6 / max(nrows, 1))
+    out = run_dir / "energy_curve_per_layer.png"
+    plt.savefig(out, dpi=120)
+    plt.close(fig)
+    print(f"[per-layer plot] {out}")
+
+
 def render_compare(run_dirs: list[Path]) -> None:
     import matplotlib
     matplotlib.use("Agg")
@@ -351,17 +424,18 @@ def run_measurement(args: argparse.Namespace) -> None:
     if args.plot:
         title = f"{model_family} @ {args.context_len} ({args.task})"
         render_plot(run_dir, per_layer_rows, summary, args.page_size, title)
+        render_per_layer_grid(run_dir, per_layer_rows, args.page_size, title)
 
     print_headline_table(run_name, summary, args.page_size)
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--model_name_or_path", default="Qwen/Qwen3-8B")
+    p.add_argument("--model_name_or_path", default="meta-llama/Llama-3.1-8B-Instruct")
     p.add_argument("--context_len", type=int, default=32768)
     p.add_argument("--task", default="niah_single_1")
-    p.add_argument("--num_samples", type=int, default=1)
-    p.add_argument("--page_size", type=int, default=32)
+    p.add_argument("--num_samples", type=int, default=25)
+    p.add_argument("--page_size", type=int, default=16)
     p.add_argument("--sink_size", type=int, default=4)
     p.add_argument("--recent_size", type=int, default=128)
     p.add_argument("--data_root", type=Path, default=_REPO_ROOT / "benchmark" / "data" / "ruler_data")
@@ -396,6 +470,7 @@ def replot(run_dir: Path) -> None:
                 per_layer.append(json.loads(line))
     title = f"{cfg.get('model_family', run_dir.name)} @ {cfg.get('context_len', '?')} ({cfg.get('task', '?')})"
     render_plot(run_dir, per_layer, summary, cfg["page_size"], title)
+    render_per_layer_grid(run_dir, per_layer, cfg["page_size"], title)
     print_headline_table(cfg.get("run_name", run_dir.name), summary, cfg["page_size"])
 
 

@@ -63,16 +63,28 @@ class QuestAttention(nn.Module):
     def _init_rope(self):
         self.rope_theta = getattr(self.config, 'rope_theta', 1e4)
         # rope_theta is default to 1e4, as set in RoPE kernel API.
-        if getattr(self.config, 'rope_scaling', None) is None:
+        rope_scaling = getattr(self.config, 'rope_scaling', None)
+        if rope_scaling is None:
             self.rotary_emb = None  # RoPE applied by FlashInfer kernel
             self.rope_scale = 1.0
+            return
+
+        scaling_type = rope_scaling.get("type") or rope_scaling.get("rope_type")
+        if scaling_type in (None, "default"):
+            self.rotary_emb = None
+            self.rope_scale = 1.0
+        elif scaling_type == "linear":
+            # support for Longchat-v1.5.
+            self.rotary_emb = None
+            self.rope_scale = rope_scaling["factor"]
+        elif scaling_type in ("llama3", "dynamic", "yarn", "longrope"):
+            # Non-uniform per-dim scaling cannot be expressed as a scalar
+            # rope_scale. Fall back to HF's rotary embedding and skip the
+            # fused FlashInfer RoPE kernel for this layer.
+            self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
+            self.rope_scale = None  # signals "use self.rotary_emb in forward"
         else:
-            scaling_type = self.config.rope_scaling["type"]
-            if scaling_type == "linear":
-                # support for Longchat-v1.5.
-                self.rope_scale = self.config.rope_scaling["factor"]
-            else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+            raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -125,7 +137,22 @@ class QuestAttention(nn.Module):
             key_states = self.k_norm(key_states)
 
         torch.cuda.nvtx.range_push("RoPE")
-        quest_attn.utils.apply_rope_in_place(query_states, key_states, iController.kv_cache.seqlen - q_len, rope_scale=self.rope_scale, rope_theta=self.rope_theta)
+        if self.rope_scale is not None:
+            quest_attn.utils.apply_rope_in_place(query_states, key_states, iController.kv_cache.seqlen - q_len, rope_scale=self.rope_scale, rope_theta=self.rope_theta)
+        else:
+            # Non-uniform RoPE (e.g. Llama-3 piecewise scaling): use HF rotary.
+            past_len = iController.kv_cache.seqlen - q_len
+            position_ids = torch.arange(
+                past_len, past_len + q_len,
+                device=query_states.device, dtype=torch.long,
+            ).unsqueeze(0)
+            # [N, H, D] -> [1, H, N, D] for HF apply_rotary_pos_emb
+            q4d = query_states.unsqueeze(0).transpose(1, 2)
+            k4d = key_states.unsqueeze(0).transpose(1, 2)
+            cos, sin = self.rotary_emb(q4d, position_ids)
+            q4d, k4d = apply_rotary_pos_emb(q4d, k4d, cos, sin)
+            query_states = q4d.transpose(1, 2).squeeze(0).contiguous()
+            key_states = k4d.transpose(1, 2).squeeze(0).contiguous()
         torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("append_kv")

@@ -420,7 +420,9 @@ def load_model_and_tokenizer(args):
         base_model = args.base_model
         page_size = args.page_size
         token_budget = args.page_size * args.top_k  # top_k used as page_budget
-        max_seq_len = QUEST_ATTN_CONFIG["max_seq_len"]
+        # Size the preallocated KV pool to the actual eval workload (with headroom
+        # for generation), not the 128k default in QUEST_ATTN_CONFIG.
+        max_seq_len = max(args.seq_lengths) + 4096
 
         model_name_lower = base_model.lower()
         if "qwen3" in model_name_lower:

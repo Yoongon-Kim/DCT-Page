@@ -13,6 +13,7 @@ from torch.nn import CrossEntropyLoss
 
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -386,7 +387,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         )
 
 
-class Qwen3ForCausalLM(Qwen3PreTrainedModel):
+class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     # Qwen3 does not tie word embeddings
     _tied_weights_keys = []
 
@@ -529,19 +530,24 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel):
         )
 
     def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None,
+        is_first_iteration=False, **kwargs
     ):
-        if past_key_values:
+        # Quest manages its KV state via iController; transformers >= 5 passes a
+        # truthy empty Cache on the first call so past_key_values is unreliable.
+        # Use is_first_iteration instead.
+        is_decode = not is_first_iteration
+        if is_decode:
             input_ids = input_ids[:, -1:]
 
         position_ids = kwargs.get("position_ids", None)
         if attention_mask is not None and position_ids is None:
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
+            if is_decode:
                 position_ids = position_ids[:, -1].unsqueeze(-1)
 
-        if inputs_embeds is not None and past_key_values is None:
+        if inputs_embeds is not None and is_first_iteration:
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
             model_inputs = {"input_ids": input_ids}

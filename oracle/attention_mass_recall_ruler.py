@@ -5,8 +5,8 @@ Attention-mass recall on RULER — dense-trajectory reference.
 Generation runs under the **unmodified full-KV forward** (no DCT patch, no
 selector drives decoding). A recording hook mirrors HF's own attention
 forward 1:1 and only observes (Q, K, V) post-RoPE / post-cache-update, so
-every selector — DCT Haar proxy, Quest, ShadowKV, oracle_max — is evaluated
-against the same neutral Q at each decode step. This removes the
+every selector — DCT Haar proxy, Quest, ShadowKV, InfLLM, oracle_max — is
+evaluated against the same neutral Q at each decode step. This removes the
 "home-field" bias of scoring Quest/oracle on a Q already shaped by DCT's
 earlier page choices.
 
@@ -27,6 +27,7 @@ Reports per-query-head metrics grouped into three families.
   mass_recall_proxy       = sink + recent + Σ m[p] over DCT proxy's top-K
   mass_recall_quest       = sink + recent + Σ m[p] over Quest's top-K
   mass_recall_shadowkv    = sink + recent + Σ m[p] over ShadowKV's top-K
+  mass_recall_infllm      = sink + recent + Σ m[p] over InfLLM's top-K
   mass_recall_oracle_max  = sink + recent + Σ m[p] over oracle_max's top-K
   mass_recall_mass_topk   = sink + recent + Σ m[p] over top-K by page mass  (ceiling)
   set_recall              = |DCT ∩ oracle_max| / K                         (page-set baseline)
@@ -37,6 +38,7 @@ Reports per-query-head metrics grouped into three families.
   selected_mass_proxy       = Σ_{p∈DCT topK} m[p]        = 1 − sink − recent − Σ_{unselected} m[p]
   selected_mass_quest       = Σ_{p∈Quest topK} m[p]
   selected_mass_shadowkv    = Σ_{p∈ShadowKV topK} m[p]
+  selected_mass_infllm      = Σ_{p∈InfLLM topK} m[p]
   selected_mass_oracle_max  = Σ_{p∈oracle_max topK} m[p]
   selected_mass_mass_topk   = Σ_{p∈mass topK} m[p]                         (ceiling)
 
@@ -50,11 +52,13 @@ By construction:
   paged_mass_recall_proxy       = Σ_{p∈DCT topK} m[p]       / Σ_p m[p]
   paged_mass_recall_quest       = Σ_{p∈Quest topK} m[p]     / Σ_p m[p]
   paged_mass_recall_shadowkv    = Σ_{p∈ShadowKV topK} m[p]  / Σ_p m[p]
+  paged_mass_recall_infllm      = Σ_{p∈InfLLM topK} m[p]    / Σ_p m[p]
   paged_mass_recall_oracle_max  = Σ_{p∈oracle_max topK} m[p]/ Σ_p m[p]
   paged_mass_recall_mass_topk   = Σ_{p∈mass topK} m[p]      / Σ_p m[p]   (ceiling)
   paged_mass_ratio_proxy        = paged_mass_recall_proxy / paged_mass_recall_mass_topk
   paged_mass_ratio_quest        = paged_mass_recall_quest / paged_mass_recall_mass_topk
   paged_mass_ratio_shadowkv     = paged_mass_recall_shadowkv / paged_mass_recall_mass_topk
+  paged_mass_ratio_infllm       = paged_mass_recall_infllm / paged_mass_recall_mass_topk
 
 Paged-only strips the always-kept sink + recent floor from both numerator
 and denominator, so values are the fraction of **paged** attention mass
@@ -73,6 +77,7 @@ attention outputs — V-aware, the actual downstream signal):
   output_fidelity_proxy      = cos(full_output, DCT drop output)
   output_fidelity_quest      = cos(full_output, Quest drop output)
   output_fidelity_shadowkv   = cos(full_output, ShadowKV drop output)
+  output_fidelity_infllm     = cos(full_output, InfLLM drop output)
   output_fidelity_oracle_max = cos(full_output, oracle_max drop output)
 
 Mass recall can be high while output fidelity diverges — two selections can
@@ -92,6 +97,20 @@ landmark vector = per-channel mean of its keys:
 ShadowKV's outlier-page bypass and SVD V-reconstruction are omitted (they are
 orthogonal to page ranking and would change the effective K budget).
 
+InfLLM scoring (Xiao et al., 2024) represents each block by the mean of its
+``repr_topk`` representative tokens, scored at decode against current Q:
+    qk[h, p, s]    = (q[h] · K[p, s, :]) / √d
+    repr_idx       = top-repr_topk(qk[h, p, :])
+    block_repr[h,p]= mean_{s ∈ repr_idx} K[p, s, :]
+    score[h, p]    = (q[h] · block_repr[h, p]) / √d
+Upstream InfLLM picks the representative tokens by an accumulated local-
+attention score that this dense-trajectory diagnostic does not maintain;
+we substitute the natural Q-aware analogue (per-block top-``repr_topk``
+tokens by current Q·K) so InfLLM's *block-representative* scoring rule is
+isolated from its stateful prefill bookkeeping. Block layout is the
+script's page grid (n_init↔sink_size, n_local↔recent_size, block_size↔
+page_size), so the only InfLLM-specific knob is ``--infllm_repr_topk``.
+
 All selectors share the same sink/recent configuration as DCT; only the
 page-ranking rule differs.
 
@@ -102,7 +121,7 @@ so their mass contributes to every selector). Sources of loss:
   1.0 − ceiling        : unavoidable mass loss from budget-K sparsity
   ceiling − oracle_max : max(Q·K)'s own blind spot vs true mass
   oracle_max − proxy   : DCT proxy's approximation gap vs max(Q·K)
-  proxy vs quest vs shadowkv : different proxy families against each other
+  proxy vs quest vs shadowkv vs infllm : different proxy families against each other
 
 Reuses the dense recording-forward plumbing from
 ``attention_mass_recall_ruler_quest.py`` (``_install_recording_forward``,
@@ -197,6 +216,7 @@ MASS_METRIC_KEYS = [
     "mass_recall_proxy",
     "mass_recall_quest",
     "mass_recall_shadowkv",
+    "mass_recall_infllm",
     "mass_recall_oracle_max",
     "mass_recall_mass_topk",
     "set_recall",
@@ -209,6 +229,7 @@ MASS_METRIC_KEYS = [
     "selected_mass_proxy",
     "selected_mass_quest",
     "selected_mass_shadowkv",
+    "selected_mass_infllm",
     "selected_mass_oracle_max",
     "selected_mass_mass_topk",
 ]
@@ -221,17 +242,20 @@ DERIVED_PAGED_KEYS = [
     "paged_mass_recall_proxy",
     "paged_mass_recall_quest",
     "paged_mass_recall_shadowkv",
+    "paged_mass_recall_infllm",
     "paged_mass_recall_oracle_max",
     "paged_mass_recall_mass_topk",
     "paged_mass_ratio_proxy",
     "paged_mass_ratio_quest",
     "paged_mass_ratio_shadowkv",
+    "paged_mass_ratio_infllm",
 ]
 
 FIDELITY_METRIC_KEYS = [
     "output_fidelity_proxy",
     "output_fidelity_quest",
     "output_fidelity_shadowkv",
+    "output_fidelity_infllm",
     "output_fidelity_oracle_max",
 ]
 
@@ -558,6 +582,68 @@ def compute_shadowkv_scores(
     return scores.squeeze(0)                                      # [H_kv, P]
 
 
+def compute_infllm_scores(
+    query_states: torch.Tensor,
+    paged_k: torch.Tensor,
+    num_kv_groups: int,
+    repr_topk: int,
+    group_agg_method: str,
+) -> torch.Tensor:
+    """InfLLM block-representative page scoring (Xiao et al., 2024).
+
+    InfLLM splits KV into fixed-size blocks; each block is represented by
+    the mean of its ``repr_topk`` "representative" tokens. Upstream picks
+    representatives by an accumulated local-attention score that this
+    dense-trajectory diagnostic does not maintain, so we substitute the
+    natural Q-aware analogue: per (query head, page), pick the top-
+    ``repr_topk`` tokens by current Q·K (apples-to-apples with Quest's own
+    use of current Q for its upper bound).
+
+        for each (h, p):
+            qk[h, p, s]    = (q[h] · K[p, s, :]) / √d
+            repr_idx       = top-repr_topk(qk[h, p, :])
+            block_repr[h,p]= mean_{s ∈ repr_idx} K[p, s, :]
+            score[h, p]    = (q[h] · block_repr[h, p]) / √d
+
+    Reduce across the GQA group via ``group_agg_method``; ``mean`` matches
+    InfLLM's ``.mean(dim=1)`` over unit_size in
+    ``ContextManager.get_batched_topk`` (context_manager.py L597-602).
+
+    Args:
+        query_states: [bsz=1, H_q, 1, d] — post-RoPE / post-QK-norm.
+        paged_k:      [bsz=1, H_kv, P, S, d] — post-RoPE, baked in from cache.
+        num_kv_groups: H_q // H_kv.
+        repr_topk:    Representative tokens per page (clamped to S).
+        group_agg_method: "mean" | "max" | "topp" (topp falls back to mean).
+
+    Returns:
+        scores: [H_kv, P] — one InfLLM score per (kv-head, page).
+    """
+    bsz, H_q, q_len, d = query_states.shape
+    assert bsz == 1 and q_len == 1, f"decode-step only, got shape {query_states.shape}"
+    _, H_kv, P, S, _ = paged_k.shape
+    assert H_q == H_kv * num_kv_groups
+    scale = 1.0 / math.sqrt(d)
+    actual_repr = min(repr_topk, S)
+
+    k_q = paged_k.repeat_interleave(num_kv_groups, dim=1).float()    # [1, H_q, P, S, d]
+    q = query_states.float()                                         # [1, H_q, 1, d]
+
+    qk = torch.einsum("bhqd,bhpsd->bhps", q, k_q) * scale            # [1, H_q, P, S]
+    repr_idx = qk.topk(actual_repr, dim=-1).indices                  # [1, H_q, P, R]
+    repr_idx_exp = repr_idx[..., None].expand(*repr_idx.shape, d)
+    repr_k = torch.gather(k_q, 3, repr_idx_exp)                      # [1, H_q, P, R, d]
+    block_repr = repr_k.mean(dim=-2)                                 # [1, H_q, P, d]
+    score_q = torch.einsum("bhqd,bhpd->bhp", q, block_repr) * scale  # [1, H_q, P]
+
+    score_g = score_q.view(bsz, H_kv, num_kv_groups, P)
+    if group_agg_method == "max":
+        scores = score_g.max(dim=2).values
+    else:
+        scores = score_g.mean(dim=2)
+    return scores.squeeze(0)                                         # [H_kv, P]
+
+
 # ---------------------------------------------------------------------------
 # Attention-output fidelity (V-aware downstream quality)
 # ---------------------------------------------------------------------------
@@ -650,6 +736,7 @@ def compute_all_metrics(
     oracle_page_scores: torch.Tensor, # [H_kv, P]
     quest_scores: torch.Tensor,       # [H_kv, P]
     shadowkv_scores: torch.Tensor,    # [H_kv, P]
+    infllm_scores: torch.Tensor,      # [H_kv, P]
     num_kv_groups: int,
 ) -> dict[str, torch.Tensor]:
     """Compute mass-recall metrics. Returns dict of [H_q] float32 tensors.
@@ -670,6 +757,9 @@ def compute_all_metrics(
     assert shadowkv_scores.shape == (H_kv, P), (
         f"shadowkv_scores shape {shadowkv_scores.shape} != ({H_kv}, {P})"
     )
+    assert infllm_scores.shape == (H_kv, P), (
+        f"infllm_scores shape {infllm_scores.shape} != ({H_kv}, {P})"
+    )
 
     page_mass = page_mass.float()
     sink_mass = sink_mass.float()
@@ -678,6 +768,7 @@ def compute_all_metrics(
     oracle_page_scores = oracle_page_scores.float()
     quest_scores = quest_scores.float()
     shadowkv_scores = shadowkv_scores.float()
+    infllm_scores = infllm_scores.float()
     selected_indices = selected_indices.long()
 
     # Same kv-head selection is consumed by every query in the group; expand
@@ -701,6 +792,13 @@ def compute_all_metrics(
         torch.gather(page_mass, -1, shadowkv_topk_q).sum(-1) + extra_mass
     )
 
+    # (3b) mass_recall_infllm: sink + recent + InfLLM's top-K.
+    infllm_topk = torch.topk(infllm_scores, K, dim=-1).indices                 # [H_kv, K]
+    infllm_topk_q = infllm_topk.repeat_interleave(num_kv_groups, dim=0)        # [H_q, K]
+    mass_recall_infllm = (
+        torch.gather(page_mass, -1, infllm_topk_q).sum(-1) + extra_mass
+    )
+
     # (4) mass_recall_oracle_max: sink + recent + oracle_max's top-K.
     oracle_topk = torch.topk(oracle_page_scores, K, dim=-1).indices            # [H_kv, K]
     oracle_topk_q = oracle_topk.repeat_interleave(num_kv_groups, dim=0)        # [H_q, K]
@@ -722,6 +820,8 @@ def compute_all_metrics(
         raise AssertionError("mass_recall_mass_topk < mass_recall_quest — ceiling violated")
     if not (mass_recall_mass_topk + tol >= mass_recall_shadowkv).all():
         raise AssertionError("mass_recall_mass_topk < mass_recall_shadowkv — ceiling violated")
+    if not (mass_recall_mass_topk + tol >= mass_recall_infllm).all():
+        raise AssertionError("mass_recall_mass_topk < mass_recall_infllm — ceiling violated")
     if not (mass_recall_mass_topk + tol >= mass_recall_oracle_max).all():
         raise AssertionError("mass_recall_mass_topk < mass_recall_oracle_max — ceiling violated")
 
@@ -738,6 +838,7 @@ def compute_all_metrics(
     selected_mass_proxy = mass_recall_proxy - extra_mass
     selected_mass_quest = mass_recall_quest - extra_mass
     selected_mass_shadowkv = mass_recall_shadowkv - extra_mass
+    selected_mass_infllm = mass_recall_infllm - extra_mass
     selected_mass_oracle_max = mass_recall_oracle_max - extra_mass
     selected_mass_mass_topk = mass_recall_mass_topk - extra_mass
 
@@ -754,12 +855,14 @@ def compute_all_metrics(
         "mass_recall_proxy": mass_recall_proxy,
         "mass_recall_quest": mass_recall_quest,
         "mass_recall_shadowkv": mass_recall_shadowkv,
+        "mass_recall_infllm": mass_recall_infllm,
         "mass_recall_oracle_max": mass_recall_oracle_max,
         "mass_recall_mass_topk": mass_recall_mass_topk,
         "set_recall": set_recall,
         "selected_mass_proxy": selected_mass_proxy,
         "selected_mass_quest": selected_mass_quest,
         "selected_mass_shadowkv": selected_mass_shadowkv,
+        "selected_mass_infllm": selected_mass_infllm,
         "selected_mass_oracle_max": selected_mass_oracle_max,
         "selected_mass_mass_topk": selected_mass_mass_topk,
     }
@@ -784,10 +887,10 @@ def _derive_paged_metrics(metrics: dict[str, float]) -> dict[str, float]:
     pm = float(metrics.get("pages_mass", 0.0))
     smm = float(metrics.get("selected_mass_mass_topk", 0.0))
     out: dict[str, float] = {}
-    for sel in ("proxy", "quest", "shadowkv", "oracle_max", "mass_topk"):
+    for sel in ("proxy", "quest", "shadowkv", "infllm", "oracle_max", "mass_topk"):
         sm = float(metrics.get(f"selected_mass_{sel}", 0.0))
         out[f"paged_mass_recall_{sel}"] = (sm / pm) if pm > 1e-12 else 0.0
-    for sel in ("proxy", "quest", "shadowkv"):
+    for sel in ("proxy", "quest", "shadowkv", "infllm"):
         sm = float(metrics.get(f"selected_mass_{sel}", 0.0))
         out[f"paged_mass_ratio_{sel}"] = (sm / smm) if smm > 1e-12 else 0.0
     return out
@@ -893,6 +996,7 @@ class MassRecallRecorder:
         comp_size: int,
         scoring_method: str,
         group_agg_method: str,
+        infllm_repr_topk: int,
         comp_kv_quant: str = "none",
         comp_kv_quant_granularity: str = "per_page",
     ):
@@ -904,6 +1008,7 @@ class MassRecallRecorder:
         self.comp_size = comp_size
         self.scoring_method = scoring_method
         self.group_agg_method = group_agg_method
+        self.infllm_repr_topk = infllm_repr_topk
         self.comp_kv_quant = comp_kv_quant
         self.comp_kv_quant_granularity = comp_kv_quant_granularity
         self.records: list[dict[str, Any]] = []
@@ -978,6 +1083,12 @@ class MassRecallRecorder:
             )
             shadowkv_scores = shadowkv_scores_gpu.float().cpu()
 
+            infllm_scores_gpu = compute_infllm_scores(
+                query_states, paged_k, num_kv_groups,
+                self.infllm_repr_topk, self.group_agg_method,
+            )
+            infllm_scores = infllm_scores_gpu.float().cpu()
+
             oracle_scores_gpu = compute_oracle_max_scores(
                 query_states, paged_k, num_kv_groups, self.group_agg_method,
             )
@@ -989,6 +1100,9 @@ class MassRecallRecorder:
             shadowkv_topk_gpu = torch.topk(
                 shadowkv_scores_gpu, actual_top_k, dim=-1,
             ).indices
+            infllm_topk_gpu = torch.topk(
+                infllm_scores_gpu, actual_top_k, dim=-1,
+            ).indices
             oracle_topk_gpu = torch.topk(oracle_scores_gpu, actual_top_k, dim=-1).indices
 
             fidelity_gpu = compute_output_fidelity(
@@ -997,6 +1111,7 @@ class MassRecallRecorder:
                     "output_fidelity_proxy": proxy_topk_gpu,
                     "output_fidelity_quest": quest_topk_gpu,
                     "output_fidelity_shadowkv": shadowkv_topk_gpu,
+                    "output_fidelity_infllm": infllm_topk_gpu,
                     "output_fidelity_oracle_max": oracle_topk_gpu,
                 },
                 num_kv_groups,
@@ -1007,7 +1122,8 @@ class MassRecallRecorder:
 
         mass_metrics = compute_all_metrics(
             page_mass, sink_mass, recent_mass, selected_indices,
-            oracle_scores, quest_scores, shadowkv_scores, num_kv_groups,
+            oracle_scores, quest_scores, shadowkv_scores, infllm_scores,
+            num_kv_groups,
         )
         metrics = {**mass_metrics, **fidelity}
 
@@ -1049,6 +1165,7 @@ def generate_with_mass_traces(
     comp_size: int,
     scoring_method: str,
     group_agg_method: str,
+    infllm_repr_topk: int,
     comp_kv_quant: str,
     comp_kv_quant_granularity: str,
 ) -> tuple[list[dict[str, Any]], int]:
@@ -1069,6 +1186,7 @@ def generate_with_mass_traces(
         comp_size=comp_size,
         scoring_method=scoring_method,
         group_agg_method=group_agg_method,
+        infllm_repr_topk=infllm_repr_topk,
         comp_kv_quant=comp_kv_quant,
         comp_kv_quant_granularity=comp_kv_quant_granularity,
     )
@@ -1291,6 +1409,13 @@ def parse_args() -> argparse.Namespace:
                    choices=["mean", "max", "sum"])
     p.add_argument("--group_agg_method", type=str, default="max",
                    choices=["mean", "max"])
+
+    # InfLLM block-representative scoring (current Q·K substitutes for the
+    # stateful local-score history that the diagnostic does not maintain).
+    p.add_argument("--infllm_repr_topk", type=int, default=4,
+                   help="InfLLM: representative tokens per page used to build "
+                        "the block representative. The diagnostic substitutes "
+                        "upstream InfLLM's stateful local-score with current Q·K.")
 
     # Fake-quantize the compressed K proxy (simulates low-precision comp-KV
     # storage). Applied AFTER the DCT projection, BEFORE scoring.
@@ -1851,6 +1976,7 @@ def main() -> None:
                     comp_size=comp_size,
                     scoring_method=args.scoring_method,
                     group_agg_method=args.group_agg_method,
+                    infllm_repr_topk=args.infllm_repr_topk,
                     comp_kv_quant=args.comp_kv_quant,
                     comp_kv_quant_granularity=args.comp_kv_quant_granularity,
                 )
@@ -1906,32 +2032,37 @@ def main() -> None:
                         f"  [{sample_idx}/{len(samples)}] "
                         f"sink={o['mass_recall_sink']:.3f} "
                         f"recent={o['mass_recall_recent']:.3f}  "
-                        f"mass[p/q/s/o/c] = "
+                        f"mass[p/q/s/i/o/c] = "
                         f"{o['mass_recall_proxy']:.3f}/"
                         f"{o['mass_recall_quest']:.3f}/"
                         f"{o['mass_recall_shadowkv']:.3f}/"
+                        f"{o['mass_recall_infllm']:.3f}/"
                         f"{o['mass_recall_oracle_max']:.3f}/"
                         f"{o['mass_recall_mass_topk']:.3f}  "
-                        f"sel[p/q/s/o/c] = "
+                        f"sel[p/q/s/i/o/c] = "
                         f"{o['selected_mass_proxy']:.3f}/"
                         f"{o['selected_mass_quest']:.3f}/"
                         f"{o['selected_mass_shadowkv']:.3f}/"
+                        f"{o['selected_mass_infllm']:.3f}/"
                         f"{o['selected_mass_oracle_max']:.3f}/"
                         f"{o['selected_mass_mass_topk']:.3f}  "
-                        f"paged[p/q/s/o/c] = "
+                        f"paged[p/q/s/i/o/c] = "
                         f"{o['paged_mass_recall_proxy']:.3f}/"
                         f"{o['paged_mass_recall_quest']:.3f}/"
                         f"{o['paged_mass_recall_shadowkv']:.3f}/"
+                        f"{o['paged_mass_recall_infllm']:.3f}/"
                         f"{o['paged_mass_recall_oracle_max']:.3f}/"
                         f"{o['paged_mass_recall_mass_topk']:.3f}  "
-                        f"ratio[p/q/s] = "
+                        f"ratio[p/q/s/i] = "
                         f"{o['paged_mass_ratio_proxy']:.3f}/"
                         f"{o['paged_mass_ratio_quest']:.3f}/"
-                        f"{o['paged_mass_ratio_shadowkv']:.3f}  "
-                        f"fid[p/q/s/o] = "
+                        f"{o['paged_mass_ratio_shadowkv']:.3f}/"
+                        f"{o['paged_mass_ratio_infllm']:.3f}  "
+                        f"fid[p/q/s/i/o] = "
                         f"{o['output_fidelity_proxy']:.3f}/"
                         f"{o['output_fidelity_quest']:.3f}/"
                         f"{o['output_fidelity_shadowkv']:.3f}/"
+                        f"{o['output_fidelity_infllm']:.3f}/"
                         f"{o['output_fidelity_oracle_max']:.3f}"
                     )
 
@@ -1952,26 +2083,27 @@ def main() -> None:
             o = per_task_results[task]["overall"]
             print(
                 f"  TASK SUMMARY\n"
-                f"    sink / recent (floor)                   = "
+                f"    sink / recent (floor)                          = "
                 f"{o['mass_recall_sink']:.3f} / {o['mass_recall_recent']:.3f}\n"
-                f"    mass   [proxy/quest/shadow/oracle/ceil] = "
+                f"    mass   [proxy/quest/shadow/infllm/oracle/ceil] = "
                 f"{o['mass_recall_proxy']:.3f} / {o['mass_recall_quest']:.3f} / "
-                f"{o['mass_recall_shadowkv']:.3f} / {o['mass_recall_oracle_max']:.3f} / "
-                f"{o['mass_recall_mass_topk']:.3f}\n"
-                f"    select [proxy/quest/shadow/oracle/ceil] = "
+                f"{o['mass_recall_shadowkv']:.3f} / {o['mass_recall_infllm']:.3f} / "
+                f"{o['mass_recall_oracle_max']:.3f} / {o['mass_recall_mass_topk']:.3f}\n"
+                f"    select [proxy/quest/shadow/infllm/oracle/ceil] = "
                 f"{o['selected_mass_proxy']:.3f} / {o['selected_mass_quest']:.3f} / "
-                f"{o['selected_mass_shadowkv']:.3f} / {o['selected_mass_oracle_max']:.3f} / "
-                f"{o['selected_mass_mass_topk']:.3f}\n"
-                f"    paged  [proxy/quest/shadow/oracle/ceil] = "
+                f"{o['selected_mass_shadowkv']:.3f} / {o['selected_mass_infllm']:.3f} / "
+                f"{o['selected_mass_oracle_max']:.3f} / {o['selected_mass_mass_topk']:.3f}\n"
+                f"    paged  [proxy/quest/shadow/infllm/oracle/ceil] = "
                 f"{o['paged_mass_recall_proxy']:.3f} / {o['paged_mass_recall_quest']:.3f} / "
-                f"{o['paged_mass_recall_shadowkv']:.3f} / {o['paged_mass_recall_oracle_max']:.3f} / "
-                f"{o['paged_mass_recall_mass_topk']:.3f}\n"
-                f"    ratio  [proxy/quest/shadow vs ceil]     = "
+                f"{o['paged_mass_recall_shadowkv']:.3f} / {o['paged_mass_recall_infllm']:.3f} / "
+                f"{o['paged_mass_recall_oracle_max']:.3f} / {o['paged_mass_recall_mass_topk']:.3f}\n"
+                f"    ratio  [proxy/quest/shadow/infllm vs ceil]     = "
                 f"{o['paged_mass_ratio_proxy']:.3f} / {o['paged_mass_ratio_quest']:.3f} / "
-                f"{o['paged_mass_ratio_shadowkv']:.3f}\n"
-                f"    fidelity[proxy/quest/shadow/oracle]     = "
+                f"{o['paged_mass_ratio_shadowkv']:.3f} / {o['paged_mass_ratio_infllm']:.3f}\n"
+                f"    fidelity[proxy/quest/shadow/infllm/oracle]     = "
                 f"{o['output_fidelity_proxy']:.3f} / {o['output_fidelity_quest']:.3f} / "
-                f"{o['output_fidelity_shadowkv']:.3f} / {o['output_fidelity_oracle_max']:.3f}\n"
+                f"{o['output_fidelity_shadowkv']:.3f} / {o['output_fidelity_infllm']:.3f} / "
+                f"{o['output_fidelity_oracle_max']:.3f}\n"
                 f"    set_recall = {o['set_recall']:.3f}"
             )
 
@@ -1994,6 +2126,7 @@ def main() -> None:
                 "comp_size": comp_size,
                 "scoring_method": args.scoring_method,
                 "group_agg_method": args.group_agg_method,
+                "infllm_repr_topk": args.infllm_repr_topk,
                 "comp_kv_quant": args.comp_kv_quant,
                 "comp_kv_quant_granularity": args.comp_kv_quant_granularity,
             },
