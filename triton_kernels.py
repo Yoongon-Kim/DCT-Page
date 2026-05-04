@@ -792,12 +792,12 @@ def topk_sort(
 # ---------------------------------------------------------------------------
 @triton.jit
 def _topk_sort_and_pack_kernel(
-    scores_ptr,            # [bsz * num_kv_heads, num_pages] (flat, fp32)
-    indices_buf_ptr,       # [bsz * num_kv_heads, page_budget] (flat, int32)
-    last_page_idx_ptr,     # [bsz] int32
-    recent_offsets_ptr,    # [NUM_RECENT] int32 (static: typically [-R, -R+1, ..., -1])
-    s_stride_bh,
-    o_stride_bh,
+    scores_ptr,            # (bsz, num_kv_heads, num_pages) fp32
+    indices_buf_ptr,       # (bsz, num_kv_heads, page_budget) int32 — possibly non-contig
+    last_page_idx_ptr,     # [bsz] int32 (already batch-biased physical IDs)
+    recent_offsets_ptr,    # [NUM_RECENT] int32 (static: typically [-R+1, ..., 0])
+    s_stride_b, s_stride_h,
+    o_stride_b, o_stride_h,
     num_pages,
     NUM_KV_HEADS: tl.constexpr,
     NUM_SINK_PAGES: tl.constexpr,
@@ -805,25 +805,28 @@ def _topk_sort_and_pack_kernel(
     BLOCK_P: tl.constexpr,
     NUM_RECENT: tl.constexpr,
     NUM_RECENT_PADDED: tl.constexpr,   # next_pow2(NUM_RECENT), >= 1
+    PAGES_PER_BATCH: tl.constexpr,     # 0 == bsz=1 (no bias); else physical pool size per batch
     SORT_ASCENDING: tl.constexpr,
 ):
     """One program per (batch, kv_head). Finds top-k page indices and writes
     the middle+recent regions of a preallocated `indices_buf` in one pass.
 
-    Layout produced:
-      indices_buf[b, h, 0                       : NUM_SINK_PAGES)            : NOT TOUCHED (static, written once at cache init)
-      indices_buf[b, h, NUM_SINK_PAGES          : NUM_SINK_PAGES + TOP_K)    : topk(scores[b, h]) + NUM_SINK_PAGES
-      indices_buf[b, h, NUM_SINK_PAGES + TOP_K  : NUM_SINK_PAGES + TOP_K + NUM_RECENT) : last_page_idx[b] + recent_offsets
+    Layout produced (with batch-bias `b * PAGES_PER_BATCH` applied to all
+    physical IDs):
+      indices_buf[b, h, 0                       : NUM_SINK_PAGES)            : NOT TOUCHED (static, biased at cache init)
+      indices_buf[b, h, NUM_SINK_PAGES          : NUM_SINK_PAGES + TOP_K)    : topk(scores[b, h]) + NUM_SINK_PAGES + b*PAGES_PER_BATCH
+      indices_buf[b, h, NUM_SINK_PAGES + TOP_K  : NUM_SINK_PAGES + TOP_K + NUM_RECENT) : last_page_idx[b] + recent_offsets   (last_page_idx already biased)
 
-    Top-k phase is identical to `_topk_sort_kernel`; only the write-back
-    target and offset differ. Register footprint matches the unfused kernel
-    (no new accumulators) — we only add a handful of int32 loads/adds/stores
-    for the recent tail.
+    Strides for both inputs and outputs are passed separately for the b and h
+    dimensions so the kernel works with non-contiguous (head-major-storage,
+    permuted) `indices_buf` layouts. PAGES_PER_BATCH=0 short-circuits the
+    bias add for bsz=1 callers (no register-pressure regression).
     """
     pid = tl.program_id(0)
     b = pid // NUM_KV_HEADS
-    base_s = scores_ptr + pid * s_stride_bh
-    base_o = indices_buf_ptr + pid * o_stride_bh
+    h = pid - b * NUM_KV_HEADS
+    base_s = scores_ptr + b * s_stride_b + h * s_stride_h
+    base_o = indices_buf_ptr + b * o_stride_b + h * o_stride_h
 
     p_idx = tl.arange(0, BLOCK_P)
     mask = p_idx < num_pages
@@ -843,17 +846,22 @@ def _topk_sort_and_pack_kernel(
     else:
         topk_out = sorted_indices
 
-    # --- Phase 2: Pack write — topk region with +NUM_SINK_PAGES offset ---
-    topk_with_offset = topk_out + NUM_SINK_PAGES
+    # --- Phase 2: Pack write — topk region with batch-bias + sink offset ---
+    if PAGES_PER_BATCH > 0:
+        topk_with_offset = topk_out + (NUM_SINK_PAGES + b * PAGES_PER_BATCH)
+    else:
+        topk_with_offset = topk_out + NUM_SINK_PAGES
     tl.store(
         base_o + NUM_SINK_PAGES + p_idx,
         topk_with_offset,
         mask=p_idx < TOP_K,
     )
 
-    # --- Phase 3: Pack write — recent region = last_page_idx + recent_offsets ---
+    # --- Phase 3: Pack write — recent region = last_page_idx[b] + recent_offsets ---
+    # last_page_idx[b] is already pre-biased by b*PAGES_PER_BATCH at the
+    # Python side, so no extra add is needed here.
     if NUM_RECENT > 0:
-        last_idx = tl.load(last_page_idx_ptr + b)  # int32 scalar
+        last_idx = tl.load(last_page_idx_ptr + b)  # int32 scalar (biased)
         r_idx = tl.arange(0, NUM_RECENT_PADDED)
         r_mask = r_idx < NUM_RECENT
         offsets = tl.load(recent_offsets_ptr + r_idx, mask=r_mask, other=0)
@@ -867,30 +875,35 @@ def _topk_sort_and_pack_kernel(
 
 @triton.jit
 def _topk_merge_and_pack_kernel(
-    scratch_ptr,           # [bsz * num_kv_heads, TOTAL] int64 packed
-    indices_buf_ptr,       # [bsz * num_kv_heads, page_budget] int32
-    last_page_idx_ptr,     # [bsz] int32
+    scratch_ptr,           # (bsz, num_kv_heads, TOTAL) int64 packed
+    indices_buf_ptr,       # (bsz, num_kv_heads, page_budget) int32 — possibly non-contig
+    last_page_idx_ptr,     # [bsz] int32 (already batch-biased physical IDs)
     recent_offsets_ptr,    # [NUM_RECENT] int32
-    sc_stride_bh,
-    o_stride_bh,
+    sc_stride_b, sc_stride_h,
+    o_stride_b, o_stride_h,
     NUM_KV_HEADS: tl.constexpr,
     NUM_SINK_PAGES: tl.constexpr,
     TOP_K: tl.constexpr,
     TOTAL: tl.constexpr,         # NUM_CHUNKS * TOP_K, must be pow2
     NUM_RECENT: tl.constexpr,
     NUM_RECENT_PADDED: tl.constexpr,
+    PAGES_PER_BATCH: tl.constexpr,   # 0 == bsz=1 (no bias); else physical pool size per batch
     SORT_ASCENDING: tl.constexpr,
 ):
     """Stage 2 (two-stage topk) with fused pack-indices write.
 
     Same layout as `_topk_sort_and_pack_kernel`; only the local-chunk topk
     staging differs — Stage 1 (`_topk_local_kernel`) is reused unchanged.
+    Like the single-stage kernel, biases topk physical IDs by
+    `b * PAGES_PER_BATCH` for multibatch (PAGES_PER_BATCH=0 short-circuits
+    the add for bsz=1).
     """
     pid = tl.program_id(0)
     b = pid // NUM_KV_HEADS
+    h = pid - b * NUM_KV_HEADS
     idx = tl.arange(0, TOTAL)
 
-    sc_base = scratch_ptr + pid * sc_stride_bh
+    sc_base = scratch_ptr + b * sc_stride_b + h * sc_stride_h
     packed = tl.load(sc_base + idx)
     sorted_packed = tl.sort(packed)
 
@@ -901,8 +914,11 @@ def _topk_merge_and_pack_kernel(
     else:
         topk_out = sorted_indices
 
-    base_o = indices_buf_ptr + pid * o_stride_bh
-    topk_with_offset = topk_out + NUM_SINK_PAGES
+    base_o = indices_buf_ptr + b * o_stride_b + h * o_stride_h
+    if PAGES_PER_BATCH > 0:
+        topk_with_offset = topk_out + (NUM_SINK_PAGES + b * PAGES_PER_BATCH)
+    else:
+        topk_with_offset = topk_out + NUM_SINK_PAGES
     tl.store(
         base_o + NUM_SINK_PAGES + idx,
         topk_with_offset,
@@ -910,6 +926,7 @@ def _topk_merge_and_pack_kernel(
     )
 
     if NUM_RECENT > 0:
+        # last_page_idx[b] is already batch-biased.
         last_idx = tl.load(last_page_idx_ptr + b)
         r_idx = tl.arange(0, NUM_RECENT_PADDED)
         r_mask = r_idx < NUM_RECENT
@@ -932,6 +949,8 @@ def topk_sort_and_pack_triton(
     scratch: torch.Tensor = None,        # (bsz, num_kv_heads, >= 8*top_k) int64, for two-stage
     sort_ascending: bool = False,
     num_chunks: int = 8,
+    pages_per_batch: int = 0,            # 0 == single-batch / no bias
+    allow_head_local_multibatch: bool = False,
 ) -> torch.Tensor:
     """Fused top-k + pack-indices write. Replaces `topk_sort(...)` followed by
     a Python `pack_indices(...)` call that copies/offsets into a preallocated
@@ -939,8 +958,8 @@ def topk_sort_and_pack_triton(
 
     Layout written into `indices_buf[b, h, :]`:
       [0, num_sink_pages)                              : NOT TOUCHED — static, caller writes once
-      [num_sink_pages, num_sink_pages + top_k)         : topk indices + num_sink_pages
-      [num_sink_pages + top_k, page_budget)            : last_page_idx[b] + recent_offsets
+      [num_sink_pages, num_sink_pages + top_k)         : topk indices + num_sink_pages + b*pages_per_batch
+      [num_sink_pages + top_k, page_budget)            : last_page_idx[b] + recent_offsets   (last_page_idx already batch-biased)
 
     `indices_buf` must be shape (bsz, num_kv_heads, page_budget) int32 where
     `page_budget == num_sink_pages + top_k + recent_offsets.numel()`. The
@@ -951,6 +970,19 @@ def topk_sort_and_pack_triton(
     attention). With `sort_ascending=True` the topk slice is sorted ascending
     by page index — matches `topk_sort(sort_ascending=True)` semantics for
     bit-identical comparison against sequential topk + pack.
+
+    `pages_per_batch=0` (default) preserves the original bsz=1 behavior
+    (no batch bias on topk physical IDs). For multibatch FlashInfer cache,
+    pass `cache.pages_per_batch` so each batch's topk IDs land in its
+    dedicated physical-page pool.
+
+    `allow_head_local_multibatch=True` (opt-in) permits `bsz > 1` with
+    `pages_per_batch == 0` — used by the upstream-FlashInfer adapter where
+    pools are per-(batch, KV head) and the per-vbatch bias is applied at a
+    later refresh step (`refresh_upstream_indices_flat`), not by this
+    kernel. Default `False` keeps the fork-side guardrail intact: any
+    fork-side caller that forgets `pages_per_batch=` at bsz>1 still trips
+    the assert.
 
     Dispatch: single-stage for `num_pages <= 1024`; two-stage (reusing
     `_topk_local_kernel`) above that, same threshold as `topk_sort`.
@@ -973,12 +1005,23 @@ def topk_sort_and_pack_triton(
     )
     if num_recent > 0:
         assert recent_offsets.dtype == torch.int32, "recent_offsets must be int32"
+    if bsz > 1 and pages_per_batch == 0:
+        assert allow_head_local_multibatch, (
+            f"bsz={bsz} with pages_per_batch=0 requires "
+            f"allow_head_local_multibatch=True. By default, bsz>1 needs "
+            f"pages_per_batch>0 so topk physical IDs are biased into per-batch "
+            f"page pools. The upstream-FlashInfer adapter sets the flag True "
+            f"because its pools are per-(batch, KV head) and bias is applied "
+            f"at refresh time, not in this kernel."
+        )
 
     is_pow2_top_k = top_k > 0 and (top_k & (top_k - 1)) == 0
     use_twostage = num_pages >= _TOPK_TWOSTAGE_MIN_PAGES and is_pow2_top_k
 
-    s_stride_bh = page_scores.stride(1)
-    o_stride_bh = indices_buf.stride(1)
+    s_stride_b = page_scores.stride(0)
+    s_stride_h = page_scores.stride(1)
+    o_stride_b = indices_buf.stride(0)
+    o_stride_h = indices_buf.stride(1)
     # next_pow2(max(NUM_RECENT, 1)) so tl.arange is always valid.
     NUM_RECENT_PADDED = 1 if num_recent == 0 else triton.next_power_of_2(num_recent)
 
@@ -992,7 +1035,12 @@ def topk_sort_and_pack_triton(
                 bsz, num_kv_heads, TOTAL,
                 dtype=torch.int64, device=page_scores.device,
             )
-        sc_stride_bh = scratch.stride(1)
+        sc_stride_b = scratch.stride(0)
+        sc_stride_h = scratch.stride(1)
+        # _topk_local_kernel still uses single bh-flat stride convention; pass
+        # `s_stride_h` (= num_pages for contig score buffers) as its bh stride.
+        s_stride_bh = s_stride_h
+        sc_stride_bh = sc_stride_h
 
         grid1 = (bsz * num_kv_heads, num_chunks)
         grid2 = (bsz * num_kv_heads,)
@@ -1010,13 +1058,15 @@ def topk_sort_and_pack_triton(
             _topk_merge_and_pack_kernel[grid2](
                 scratch, indices_buf,
                 last_page_idx, recent_offsets,
-                sc_stride_bh, o_stride_bh,
+                sc_stride_b, sc_stride_h,
+                o_stride_b, o_stride_h,
                 NUM_KV_HEADS=num_kv_heads,
                 NUM_SINK_PAGES=num_sink_pages,
                 TOP_K=top_k,
                 TOTAL=TOTAL,
                 NUM_RECENT=num_recent,
                 NUM_RECENT_PADDED=NUM_RECENT_PADDED,
+                PAGES_PER_BATCH=pages_per_batch,
                 SORT_ASCENDING=sort_ascending,
                 num_warps=1,
                 num_stages=1,
@@ -1029,7 +1079,8 @@ def topk_sort_and_pack_triton(
             _topk_sort_and_pack_kernel[grid](
                 page_scores, indices_buf,
                 last_page_idx, recent_offsets,
-                s_stride_bh, o_stride_bh,
+                s_stride_b, s_stride_h,
+                o_stride_b, o_stride_h,
                 num_pages,
                 NUM_KV_HEADS=num_kv_heads,
                 NUM_SINK_PAGES=num_sink_pages,
@@ -1037,6 +1088,7 @@ def topk_sort_and_pack_triton(
                 BLOCK_P=BLOCK_P,
                 NUM_RECENT=num_recent,
                 NUM_RECENT_PADDED=NUM_RECENT_PADDED,
+                PAGES_PER_BATCH=pages_per_batch,
                 SORT_ASCENDING=sort_ascending,
                 num_warps=1,
                 num_stages=1,

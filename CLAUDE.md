@@ -8,7 +8,7 @@ DCT-Page is a research platform for **decode-time sparse page attention** on lon
 
 KV layout at decode time:
 ```
-[sink (first N tokens)] [page 0] [page 1] ... [page N-1] [recent (last M tokens)]
+[sink (first S pages)] [page 0] [page 1] ... [page P-1] [recent (last R pages, includes open page)]
 ```
 
 Modes:
@@ -46,8 +46,8 @@ Key kernels in `triton_kernels.py` (every kernel has a PyTorch fallback):
 |---|---|---|
 | `page_size` | `32` | Tokens per page |
 | `top_k` | `64` | Pages selected for full attention |
-| `sink_size` | `4` | Initial tokens always kept (attention sink) |
-| `recent_size` | `128` | Recent tokens always kept (absorbs last partial page) |
+| `num_sink_pages` | `1` | First N physical pages always attended (sink) |
+| `num_recent_pages` | `5` | Last M physical pages always attended (recent), INCLUDES the currently-open partial page |
 | `compress_ratio` | `0.03125` | Per-page compression (e.g. 32 → 1 token) |
 | `min_decode_kv_len_for_paging` | `8192` | Fallback to baseline decode attention below this KV length |
 | `scoring_method` | `"max"` | `"mean" \| "max" \| "sum"` |

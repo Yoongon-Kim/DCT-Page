@@ -43,8 +43,8 @@ if [[ -n "$TASKS" ]]; then
 fi
 
 # Fixed params
-SINK_SIZE=4
-RECENT_SIZE=128
+NUM_SINK_PAGES=1
+NUM_RECENT_PAGES=5
 SCORING_METHOD="max"
 GROUP_AGG_METHOD="max"
 # ---- Sweep (page_size, top_k) x compress_ratio x mode x compressed_token_rope x weight_compressed_by_population ----
@@ -77,8 +77,8 @@ for PS_TK in "16,128" "16,64" "32,64" "32,32"; do
                 --run_name "$RUN_NAME" \
                 --page_size "$PAGE_SIZE" \
                 --top_k "$TOP_K" \
-                --sink_size "$SINK_SIZE" \
-                --recent_size "$RECENT_SIZE" \
+                --num_sink_pages "$NUM_SINK_PAGES" \
+                --num_recent_pages "$NUM_RECENT_PAGES" \
                 --compress_ratio "$COMPRESS_RATIO" \
                 --scoring_method "$SCORING_METHOD" \
                 --group_agg_method "$GROUP_AGG_METHOD" \

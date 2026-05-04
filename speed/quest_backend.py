@@ -15,15 +15,11 @@ Quest's paged KV layout (NHD): (num_layers, capacity_pages, 2, page_size,
 num_kv_heads, head_dim). DCT-Page's PreAllocatedLayer stores flat (1,
 num_kv_heads, alloc_len, head_dim) per layer with separate K and V tensors.
 
-Alignment note: DCT-Page's logical segmentation places the sink region at
-tokens [0, sink_size), and "page 0" of the paged region starts at
-token sink_size. This adapter reframes the whole cache as pages aligned with
-token 0, so Quest's page 0 = tokens [0, page_size) covers both DCT's sink
-and the first (page_size - sink_size) tokens of DCT's paged region. Quest
-page (i + num_sink_pages) maps approximately to DCT's page i, with a within-
-page token offset equal to (num_sink_pages * page_size - sink_size). For
-sink_size=4, page_size=32, that offset is 28 tokens — acceptable for a
-Phase-1 proof-of-concept; we quantify the drift empirically via --verify_quest.
+Alignment note: under the page-unit contract, page 0 covers tokens
+[0, page_size) and is treated entirely as sink. Quest page (i + num_sink_pages)
+maps directly to DCT-Page logical page i, with no within-page offset. This
+adapter reframes the cache as pages aligned with token 0; we quantify any
+residual drift empirically via --verify_quest.
 """
 from __future__ import annotations
 

@@ -12,8 +12,8 @@ PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-2048}"
 OUTPUT_DIR="${OUTPUT_DIR:-results/results_longbench_v2/page_attention}"
 
 # DCT Page Attention defaults
-SINK_SIZE=4
-RECENT_SIZE=128
+NUM_SINK_PAGES=1
+NUM_RECENT_PAGES=2
 SCORING_METHOD="mean"
 GROUP_AGG_METHOD="mean"
 MODE="drop"
@@ -52,8 +52,8 @@ for PS_TK in "128,4" "128,8" "128,16" "128,32"; do
                         --run_name "qwen3_page_attn_ps${PAGE_SIZE}_topk${TOP_K}_cr${COMPRESS_RATIO}_${SCORING_METHOD}_${GAM}_${MODE}" \
                         --page_size "$PAGE_SIZE" \
                         --top_k "$TOP_K" \
-                        --sink_size "$SINK_SIZE" \
-                        --recent_size "$RECENT_SIZE" \
+                        --num_sink_pages "$NUM_SINK_PAGES" \
+                        --num_recent_pages "$NUM_RECENT_PAGES" \
                         --compress_ratio "$COMPRESS_RATIO" \
                         --scoring_method "$SCORING_METHOD" \
                         --group_agg_method "$GAM" \

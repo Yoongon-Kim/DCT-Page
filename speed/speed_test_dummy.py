@@ -94,8 +94,8 @@ def apply_dct_patch(args, model=None):
     patch_kwargs = dict(
         page_size=args.page_size,
         top_k=args.top_k,
-        sink_size=args.sink_size,
-        recent_size=args.recent_size,
+        num_sink_pages=args.num_sink_pages,
+        num_recent_pages=args.num_recent_pages,
         compress_ratio=args.compress_ratio,
         scoring_method=args.scoring_method,
         group_agg_method=args.group_agg_method,
@@ -334,8 +334,8 @@ def parse_args():
     dct = p.add_argument_group("DCT Page Attention config")
     dct.add_argument("--page_size", type=int, default=32)
     dct.add_argument("--top_k", type=int, default=64)
-    dct.add_argument("--sink_size", type=int, default=4)
-    dct.add_argument("--recent_size", type=int, default=128)
+    dct.add_argument("--num_sink_pages", type=int, default=1)
+    dct.add_argument("--num_recent_pages", type=int, default=5)
     dct.add_argument("--compress_ratio", type=float, default=0.125)
     dct.add_argument("--scoring_method", default="max",
                      choices=["mean", "max"])
@@ -525,8 +525,8 @@ def save_summary(stats, run_dir, args, label):
         summary.update({
             "page_size": args.page_size,
             "top_k": args.top_k,
-            "sink_size": args.sink_size,
-            "recent_size": args.recent_size,
+            "num_sink_pages": args.num_sink_pages,
+            "num_recent_pages": args.num_recent_pages,
             "compress_ratio": args.compress_ratio,
             "scoring_method": args.scoring_method,
             "unselected_mode": args.unselected_mode,

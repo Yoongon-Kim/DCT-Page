@@ -121,8 +121,8 @@ import torch
 replace_llama_attn(
     page_size=32,
     top_k=64,
-    sink_size=4,
-    recent_size=128,
+    num_sink_pages=1,
+    num_recent_pages=5,
     compress_ratio=0.03125,
     scoring_method="max",
     group_agg_method="mean",
@@ -148,8 +148,8 @@ For Qwen3-8B use `replace_qwen3_attn(...)`.
 |---|---:|
 | `page_size` | `32` |
 | `top_k` | `64` |
-| `sink_size` | `4` |
-| `recent_size` | `128` |
+| `num_sink_pages` | `1` |
+| `num_recent_pages` | `5` |
 | `compress_ratio` | `0.03125` |
 | `min_decode_kv_len_for_paging` | `8192` |
 | `scoring_method` | `"max"` |
@@ -331,7 +331,7 @@ python speed/speed_test_dummy.py \
   --model meta-llama/Llama-3.1-8B-Instruct \
   --context_lengths 8192,16384,32768 \
   --warmup_steps 1 --num_repeats 3 --max_new_tokens 128 \
-  --page_size 32 --top_k 64 --sink_size 4 --recent_size 128 \
+  --page_size 32 --top_k 64 --num_sink_pages 1 --num_recent_pages 5 \
   --compress_ratio 0.03125 \
   --unselected_mode drop
 ```
@@ -345,7 +345,7 @@ python speed/profile_decode.py \
   --context_length 32768 \
   --model meta-llama/Llama-3.1-8B-Instruct \
   --page_size 32 --top_k 64 \
-  --sink_size 4 --recent_size 128 \
+  --num_sink_pages 1 --num_recent_pages 5 \
   --compress_ratio 0.03125 \
   --unselected_mode drop
 ```

@@ -132,8 +132,8 @@ def apply_dct_patch(args: argparse.Namespace) -> None:
     common_kwargs = dict(
         page_size=args.dct_page_size,
         top_k=args.dct_top_k,
-        sink_size=args.dct_sink_size,
-        recent_size=args.dct_recent_size,
+        num_sink_pages=args.dct_num_sink_pages,
+        num_recent_pages=args.dct_num_recent_pages,
         compress_ratio=args.dct_compress_ratio,
         scoring_method=args.dct_scoring_method,
         group_agg_method=args.dct_group_agg_method,
@@ -197,8 +197,8 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--dct_page_size", type=int, default=32)
     p.add_argument("--dct_top_k", type=int, default=64)
-    p.add_argument("--dct_sink_size", type=int, default=4)
-    p.add_argument("--dct_recent_size", type=int, default=128)
+    p.add_argument("--dct_num_sink_pages", type=int, default=1)
+    p.add_argument("--dct_num_recent_pages", type=int, default=5)
     p.add_argument("--dct_compress_ratio", type=float, default=0.125)
     p.add_argument("--dct_scoring_method", type=str, default="max",
                    choices=["mean", "max"])
@@ -415,8 +415,8 @@ def main() -> None:
         "dct": {
             "page_size": args.dct_page_size,
             "top_k": args.dct_top_k,
-            "sink_size": args.dct_sink_size,
-            "recent_size": args.dct_recent_size,
+            "num_sink_pages": args.dct_num_sink_pages,
+            "num_recent_pages": args.dct_num_recent_pages,
             "compress_ratio": args.dct_compress_ratio,
             "scoring_method": args.dct_scoring_method,
             "group_agg_method": args.dct_group_agg_method,

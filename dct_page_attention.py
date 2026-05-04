@@ -51,7 +51,14 @@ class PreAllocatedLayer(DynamicLayer):
     Instead of torch.cat (O(seq_len) alloc+copy per step), uses index
     assignment into a pre-allocated buffer (O(1) write per step).
     Strides remain fixed across all decode steps.
+
+    FI mode (`_fi_mode=True`): the FlashInfer paged buf is the single source
+    of truth at decode time. `keys`/`values` are freed after FI build, and
+    `update()` becomes a counter-only shim — it advances `_seen` and returns
+    `None, None`. Decode forwards must read KV from `cache.buf` directly.
     """
+
+    _fi_mode = False  # class default; flipped to True on each layer at FI build
 
     @classmethod
     def from_dynamic_layer(cls, layer, extra_tokens):
@@ -77,9 +84,14 @@ class PreAllocatedLayer(DynamicLayer):
 
     def update(self, key_states, value_states, cache_kwargs=None):
         seq_len = key_states.shape[-2]
+        if self._fi_mode:
+            # Counter-only shim: flat keys/values were freed at FI build.
+            self._seen += seq_len
+            return None, None
+
         start = self._seen
         end = start + seq_len
-        
+
         if end > self._alloc_len:
             # Grow the buffer by 4*page_size
             new_alloc = max(end, self._alloc_len + _dct_page_cfg.page_size*4)
@@ -443,19 +455,20 @@ def segment_kv(key_states, value_states, cfg):
     """
     bsz, num_kv_heads, kv_len, head_dim = key_states.shape
 
-    pageable_len = kv_len - cfg.sink_size - cfg.recent_size
+    sink_tokens = cfg.num_sink_pages * cfg.page_size
+    recent_tokens_min = (cfg.num_recent_pages - 1) * cfg.page_size
+    pageable_len = kv_len - sink_tokens - recent_tokens_min
     num_pages = pageable_len // cfg.page_size
-    leftover = pageable_len % cfg.page_size
-    actual_recent = cfg.recent_size + leftover
+    actual_recent = kv_len - sink_tokens - num_pages * cfg.page_size
 
-    sink_k = key_states[:, :, :cfg.sink_size]
-    sink_v = value_states[:, :, :cfg.sink_size]
+    sink_k = key_states[:, :, :sink_tokens]
+    sink_v = value_states[:, :, :sink_tokens]
 
-    pages_end = cfg.sink_size + num_pages * cfg.page_size
-    paged_k = key_states[:, :, cfg.sink_size:pages_end].view(
+    pages_end = sink_tokens + num_pages * cfg.page_size
+    paged_k = key_states[:, :, sink_tokens:pages_end].view(
         bsz, num_kv_heads, num_pages, cfg.page_size, head_dim
     )
-    paged_v = value_states[:, :, cfg.sink_size:pages_end].view(
+    paged_v = value_states[:, :, sink_tokens:pages_end].view(
         bsz, num_kv_heads, num_pages, cfg.page_size, head_dim
     )
 
@@ -463,6 +476,44 @@ def segment_kv(key_states, value_states, cfg):
     recent_v = value_states[:, :, pages_end:]
 
     return sink_k, sink_v, paged_k, paged_v, recent_k, recent_v, num_pages, actual_recent
+
+
+def paged_views_from_buf(buf_layer, num_sink_pages, num_pages, bsz=1, pages_per_batch=None):
+    """Zero-copy view of the middle-page range of a FlashInfer paged buffer
+    in the layout `_update_comp_cache` expects.
+
+    `buf_layer` is `cache.buf[layer_idx]` with shape
+        (capacity_pages, 2, page_size, num_kv_heads, head_dim).
+
+    bsz=1 fast path: returns `(paged_k, paged_v)` each shaped
+        (1, num_kv_heads, num_pages, page_size, head_dim)
+    via stride-only permute+unsqueeze. `stride(-1) == 1` is preserved, so
+    `_compress_pages` keeps its triton fast path.
+
+    bsz>1: gathers the per-batch middle slice
+    `buf_layer[b*pages_per_batch + num_sink_pages : b*pages_per_batch +
+    num_sink_pages + num_pages]` for each b and stacks into
+        (bsz, num_kv_heads, num_pages, page_size, head_dim).
+    Each batch's middle-page block is contiguous in `buf_layer` so the per-batch
+    slice is still a stride-only view; `torch.stack` of these views materializes
+    a fresh contiguous tensor only on the leading bsz dim.
+    """
+    if bsz == 1:
+        middle = buf_layer[num_sink_pages : num_sink_pages + num_pages]   # (num_pages, 2, ps, nkv, d)
+        paged_k = middle[:, 0].permute(2, 0, 1, 3).unsqueeze(0)            # (1, nkv, num_pages, ps, d)
+        paged_v = middle[:, 1].permute(2, 0, 1, 3).unsqueeze(0)
+        return paged_k, paged_v
+    assert pages_per_batch is not None, "pages_per_batch must be provided for bsz>1"
+    paged_ks = []
+    paged_vs = []
+    for b in range(bsz):
+        base = b * pages_per_batch
+        middle = buf_layer[base + num_sink_pages : base + num_sink_pages + num_pages]
+        paged_ks.append(middle[:, 0].permute(2, 0, 1, 3))   # (nkv, num_pages, ps, d)
+        paged_vs.append(middle[:, 1].permute(2, 0, 1, 3))
+    paged_k = torch.stack(paged_ks, dim=0)   # (bsz, nkv, num_pages, ps, d)
+    paged_v = torch.stack(paged_vs, dim=0)
+    return paged_k, paged_v
 
 
 # ---------------------------------------------------------------------------
@@ -566,8 +617,9 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
         # pre-multiplied by alpha, we must divide the returned values by alpha**2 (one alpha
         # to remove the forward scaling, another alpha to apply the 1/alpha inverse scaling).
         if cur_strategy == "block_center":
-            start_pos = cfg.sink_size + n_cached * page_size
-            end_pos = cfg.sink_size + num_pages * page_size
+            sink_tokens = cfg.num_sink_pages * cfg.page_size
+            start_pos = sink_tokens + n_cached * page_size
+            end_pos = sink_tokens + num_pages * page_size
             positions = torch.arange(start_pos, end_pos, device=new_k.device)
             cos, sin = _compute_rope_cos_sin(
                 positions, attn_module.config, new_k.device, new_k.dtype
@@ -589,7 +641,7 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
         # Step C: re-apply RoPE to compressed K at block-center positions (still bf16).
         if cur_strategy == "block_center":
             new_positions = _block_center_positions(
-                n_cached, n_new, cfg.page_size, comp_size, cfg.sink_size, new_comp_k.device,
+                n_cached, n_new, cfg.page_size, comp_size, cfg.num_sink_pages, new_comp_k.device,
             ).reshape(-1)
             cos_new, sin_new = _compute_rope_cos_sin(
                 new_positions, attn_module.config, new_comp_k.device, new_comp_k.dtype
@@ -907,7 +959,7 @@ def _compress_pages(attn_module, paged_x, comp_size):
     return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
 
 
-def _block_center_positions(start_page_idx, n_pages, page_size, comp_size, sink_size, device):
+def _block_center_positions(start_page_idx, n_pages, page_size, comp_size, num_sink_pages, device):
     """Compute the center position of each compressed block within a page.
 
     For comp_size=4 and page_size=128, each page is split into 4 blocks of 32.
@@ -915,7 +967,7 @@ def _block_center_positions(start_page_idx, n_pages, page_size, comp_size, sink_
     Returns: [n_pages, comp_size] integer tensor of absolute positions.
     """
     page_ids = torch.arange(start_page_idx, start_page_idx + n_pages, device=device, dtype=torch.long)
-    page_bases = sink_size + page_ids[:, None] * page_size
+    page_bases = num_sink_pages * page_size + page_ids[:, None] * page_size
     starts = torch.tensor(
         [(idx * page_size) // comp_size for idx in range(comp_size)],
         device=device, dtype=torch.long,
@@ -928,16 +980,17 @@ def _block_center_positions(start_page_idx, n_pages, page_size, comp_size, sink_
     return page_bases + proxy_offsets[None, :]
 
 
-def _apply_original_position_rope_to_paged_k(paged_k, sink_size, model_config):
+def _apply_original_position_rope_to_paged_k(paged_k, num_sink_pages, page_size_cfg, model_config):
     """Apply original-position RoPE to full paged keys for debug/oracle scoring."""
     bsz, num_kv_heads, num_pages, page_size, head_dim = paged_k.shape
     flat_k = paged_k.reshape(bsz, num_kv_heads, num_pages * page_size, head_dim)
-    positions = torch.arange(sink_size + num_pages * page_size, device=paged_k.device)
+    sink_tokens = num_sink_pages * page_size_cfg
+    positions = torch.arange(sink_tokens + num_pages * page_size, device=paged_k.device)
     cos_pages, sin_pages = _compute_rope_cos_sin(
         positions, model_config, paged_k.device, paged_k.dtype
     )
-    cos_pages = cos_pages[:, :, sink_size:]
-    sin_pages = sin_pages[:, :, sink_size:]
+    cos_pages = cos_pages[:, :, sink_tokens:]
+    sin_pages = sin_pages[:, :, sink_tokens:]
     flat_k_rope = _apply_rope(flat_k, cos_pages, sin_pages)
     return flat_k_rope.reshape(bsz, num_kv_heads, num_pages, page_size, head_dim)
 
@@ -951,7 +1004,7 @@ def _compute_debug_oracle_page_scores(attn_module, query_states, paged_k, cfg, c
             query_states, query_states, cos, sin
         )
         oracle_paged_k = _apply_original_position_rope_to_paged_k(
-            paged_k, cfg.sink_size, attn_module.config
+            paged_k, cfg.num_sink_pages, cfg.page_size, attn_module.config
         )
     return score_pages_triton(
         oracle_query_states,
@@ -975,9 +1028,10 @@ def _apply_original_position_rope_to_final_k(
     bsz, num_kv_heads, _, head_dim = final_k.shape
     actual_top_k = selected_indices.shape[2]
     selected_indices_long = selected_indices.to(torch.long)
+    sink_tokens = cfg.num_sink_pages * cfg.page_size
     cos_table, sin_table = _get_or_build_original_position_rope_tables(
         attn_module,
-        num_pages * cfg.page_size + cfg.sink_size + actual_recent,
+        num_pages * cfg.page_size + sink_tokens + actual_recent,
         model_config,
         final_k.device,
         final_k.dtype,
@@ -986,13 +1040,13 @@ def _apply_original_position_rope_to_final_k(
     cos_parts = []
     sin_parts = []
 
-    if cfg.sink_size > 0:
-        sink_cos = cos_table[:cfg.sink_size].view(1, 1, cfg.sink_size, head_dim)
-        sink_sin = sin_table[:cfg.sink_size].view(1, 1, cfg.sink_size, head_dim)
+    if sink_tokens > 0:
+        sink_cos = cos_table[:sink_tokens].view(1, 1, sink_tokens, head_dim)
+        sink_sin = sin_table[:sink_tokens].view(1, 1, sink_tokens, head_dim)
         cos_parts.append(sink_cos.expand(bsz, num_kv_heads, -1, -1))
         sin_parts.append(sink_sin.expand(bsz, num_kv_heads, -1, -1))
 
-    middle_start = cfg.sink_size
+    middle_start = sink_tokens
     middle_end = middle_start + num_pages * cfg.page_size
     if actual_top_k > 0:
         page_cos_table = cos_table[middle_start:middle_end].view(num_pages, cfg.page_size, head_dim)
@@ -1098,7 +1152,7 @@ def dct_page_attention_forward(
     bsz, q_len = input_shape     
     _maybe_reset_dct_runtime_state(self, past_key_values)
     min_len_for_paging = max(
-        cfg.sink_size + cfg.page_size * (cfg.top_k + 1) + cfg.recent_size,
+        (cfg.num_sink_pages + cfg.top_k + 1 + cfg.num_recent_pages) * cfg.page_size,
         getattr(cfg, "min_decode_kv_len_for_paging", 0),
     )
 
@@ -1294,8 +1348,8 @@ def dct_page_attention_forward(
                 "num_pages": int(num_pages),
                 "actual_top_k": int(actual_top_k),
                 "page_size": int(cfg.page_size),
-                "sink_size": int(cfg.sink_size),
-                "recent_size": int(cfg.recent_size),
+                "num_sink_pages": int(cfg.num_sink_pages),
+                "num_recent_pages": int(cfg.num_recent_pages),
 
                 "cache_position": None
                 if cache_position is None
@@ -1321,7 +1375,7 @@ def dct_page_attention_forward(
     bias_out_arg = None  # Set in compressed branch when weight_compressed_by_population is on
 
     if cfg.unselected_mode == "drop":
-        assembled_len = cfg.sink_size + actual_top_k * cfg.page_size + actual_recent
+        assembled_len = cfg.num_sink_pages * cfg.page_size + actual_top_k * cfg.page_size + actual_recent
 
         # Pre-allocate or expand output buffers
         _buf_len = getattr(self, '_assemble_buf_len', 0)
@@ -1359,7 +1413,7 @@ def dct_page_attention_forward(
 
         if effective_num_comp == 0:
             # ---- Path C: no compressed pages — equivalent to drop mode ----
-            assembled_len = cfg.sink_size + actual_top_k * cfg.page_size + actual_recent
+            assembled_len = cfg.num_sink_pages * cfg.page_size + actual_top_k * cfg.page_size + actual_recent
 
             _buf_len = getattr(self, '_assemble_buf_len', 0)
             if assembled_len > _buf_len:
@@ -1400,17 +1454,17 @@ def dct_page_attention_forward(
             count_comp_before_sel = torch.searchsorted(_comp_long, _sel_long)
             _ranks_sel = torch.arange(actual_top_k, device=paged_k.device).view(1, 1, -1)
             selected_write_offsets = (
-                cfg.sink_size + _ranks_sel * cfg.page_size + count_comp_before_sel * comp_size
+                cfg.num_sink_pages * cfg.page_size + _ranks_sel * cfg.page_size + count_comp_before_sel * comp_size
             )
             # For each compressed page: how many selected pages come before it?
             count_full_before_comp = torch.searchsorted(_sel_long, _comp_long)
             _ranks_comp = torch.arange(effective_num_comp, device=paged_k.device).view(1, 1, -1)
             compressed_write_offsets = (
-                cfg.sink_size + count_full_before_comp * cfg.page_size + _ranks_comp * comp_size
+                cfg.num_sink_pages * cfg.page_size + count_full_before_comp * cfg.page_size + _ranks_comp * comp_size
             )
 
             middle_len = actual_top_k * cfg.page_size + effective_num_comp * comp_size
-            assembled_len = cfg.sink_size + middle_len + actual_recent
+            assembled_len = cfg.num_sink_pages * cfg.page_size + middle_len + actual_recent
 
             # Population weighting
             weight_pop = (
@@ -1445,8 +1499,9 @@ def dct_page_attention_forward(
             final_v = self._final_v_buf[:, :, :assembled_len, :]
 
             # --- Sink ---
-            final_k[:, :, :cfg.sink_size, :] = sink_k
-            final_v[:, :, :cfg.sink_size, :] = sink_v
+            _sink_tokens = cfg.num_sink_pages * cfg.page_size
+            final_k[:, :, :_sink_tokens, :] = sink_k
+            final_v[:, :, :_sink_tokens, :] = sink_v
 
             # --- Scatter selected pages (full KV) ---
             _sel_idx_exp = _sel_long.unsqueeze(-1).unsqueeze(-1).expand(
@@ -1491,7 +1546,7 @@ def dct_page_attention_forward(
         else:
             # ---- Path A: all unselected pages compressed — existing Triton assembly ----
             middle_len = actual_top_k * cfg.page_size + num_unselected * comp_size
-            assembled_len = cfg.sink_size + middle_len + actual_recent
+            assembled_len = cfg.num_sink_pages * cfg.page_size + middle_len + actual_recent
 
             # Population weighting
             weight_pop = (
@@ -1652,7 +1707,7 @@ def dct_page_attention_forward_flashinfer(
     # Short-KV fallback: delegate to the SDPA forward. This peeks at the
     # cached length pre-projection so we don't double-update the cache.
     min_len_for_paging = max(
-        cfg.sink_size + cfg.page_size * (cfg.top_k + 1) + cfg.recent_size,
+        (cfg.num_sink_pages + cfg.top_k + 1 + cfg.num_recent_pages) * cfg.page_size,
         getattr(cfg, "min_decode_kv_len_for_paging", 0),
     )
     if past_key_values is not None:
@@ -1682,12 +1737,14 @@ def dct_page_attention_forward_flashinfer(
     key_states = key_states.transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-    # Step 2: RoPE + cache update (post-RoPE stored, both DCT cache and FI cache).
+    # Step 2: RoPE + bookkeeping. The FI paged buf is the single source of
+    # truth at decode time; `past_key_values.update()` is a counter-only shim
+    # that advances `_seen` (flat keys/values were freed at FI build).
     cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     if past_key_values is not None:
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        key_states, value_states = past_key_values.update(
+        past_key_values.update(
             key_states, value_states, self.layer_idx, cache_kwargs
         )
 
@@ -1726,11 +1783,18 @@ def dct_page_attention_forward_flashinfer(
         self.layer_idx,
     )
 
-    # Step 4: Segment DCT's cache and build the compressed proxy for scoring.
+    # Step 4: Build paged views over cache.buf and update the compressed
+    # proxy for scoring. `num_pages` matches FI's eligible middle range so
+    # comp_cache and FI selection see the same page set. `last_page_idx_py`
+    # is the per-batch LOGICAL page index (lockstep across batch).
+    num_pages = (
+        cache.last_page_idx_py - cache.num_sink_pages
+        - cache.num_recent_pages_fixed + 1
+    )
     comp_size = max(1, int(cfg.page_size * cfg.compress_ratio))
-    (sink_k, sink_v, paged_k, paged_v,
-     recent_k, recent_v, num_pages, actual_recent) = segment_kv(
-        key_states, value_states, cfg
+    paged_k, paged_v = paged_views_from_buf(
+        cache.buf[self.layer_idx], cache.num_sink_pages, num_pages,
+        bsz=cache.bsz, pages_per_batch=cache.pages_per_batch,
     )
     comp_k, comp_v = _update_comp_cache(
         self, paged_k, paged_v, num_pages, comp_size, cfg,
@@ -1764,27 +1828,21 @@ def dct_page_attention_forward_flashinfer(
             out=self._page_scores_buf[:, :, :num_pages],
         )
 
-    # Step 6: FI-aligned eligible middle range. FI's num_middle_pages is
-    # the count of pages between sink and recent (excluding the open page).
-    # DCT's num_pages can exceed num_middle_pages by 1 on steps where
-    # leftover = 0 (see Stage 6 SUMMARY §Alignment). Truncate in that case:
-    # FI already attends to the extra page via its recent window.
-    num_middle_pages = (
-        cache.last_page_idx_py - cache.num_sink_pages
-        - cache.num_recent_pages_fixed + 1
-    )
-    if num_middle_pages < cache.top_k:
+    # Step 6: num_pages already matches FI's eligible middle range (count of
+    # pages between sink and recent, excluding the open page). Score the full
+    # range — no truncation needed in the unified paged-buf layout.
+    if num_pages < cache.top_k:
         raise RuntimeError(
-            f"num_middle_pages ({num_middle_pages}) < cache.top_k ({cache.top_k}). "
+            f"num_pages ({num_pages}) < cache.top_k ({cache.top_k}). "
             f"Configure min_decode_kv_len_for_paging to keep decode in the "
             f"steady-state regime before enabling FlashInfer."
         )
-    effective_num_pages = min(num_pages, num_middle_pages)
-    eff_scores = page_scores[:, :, :effective_num_pages]
+    eff_scores = page_scores[:, :, :num_pages]
 
     # Step 7: Fused topk + pack. Writes indices_buf[:, :, num_sink:num_sink+top_k]
-    # with (topk_indices + num_sink_pages) and the recent slice with
-    # (last_page_idx + recent_offsets). Sink slice was filled at cache init.
+    # with (topk_indices + num_sink_pages + b*pages_per_batch) and the recent
+    # slice with (last_page_idx[b] + recent_offsets) where last_page_idx is
+    # already batch-biased. Sink slice was filled at cache init (also biased).
     topk_sort_and_pack_triton(
         eff_scores,
         cache.indices_buf,
@@ -1793,6 +1851,7 @@ def dct_page_attention_forward_flashinfer(
         last_page_idx=cache.last_page_idx,
         recent_offsets=cache.recent_offsets,
         sort_ascending=False,  # drop mode — order-invariant middle
+        pages_per_batch=(cache.pages_per_batch if cache.bsz > 1 else 0),
     )
 
     # Step 8: FlashInfer paged decode attention. Native bf16 end-to-end.
@@ -1802,23 +1861,31 @@ def dct_page_attention_forward_flashinfer(
 
     # Optional verify: gather the SAME pages FI used and run SDPA, then
     # compare. Identical K/V coverage on both sides, so the diff measures
-    # kernel numerics only (bf16 floor + split_kv drift).
+    # kernel numerics only (bf16 floor + split_kv drift). Per-(b, h) gather
+    # — `cache.indices_buf[b, h]` holds batch-biased physical IDs that index
+    # `cache.buf[layer_idx]` directly.
     if getattr(self, "_verify_flashinfer", False):
         buf_l = cache.buf[self.layer_idx]       # (cap, 2, ps, nkv, d)
         page_budget = cache.page_budget
         last_page_len = cache.last_page_len_py
         full_len = (page_budget - 1) * cache.page_size + last_page_len
-        k_pages = []
-        v_pages = []
-        for h in range(_num_kv_heads):
-            sel_h = cache.indices_buf[0, h].long()
-            kv_h = buf_l[sel_h][:, :, :, h, :]    # (page_budget, 2, ps, d)
-            k_h = kv_h[:, 0].reshape(page_budget * cache.page_size, self.head_dim)
-            v_h = kv_h[:, 1].reshape(page_budget * cache.page_size, self.head_dim)
-            k_pages.append(k_h[:full_len])
-            v_pages.append(v_h[:full_len])
-        k_flat = torch.stack(k_pages, dim=0).unsqueeze(0)   # (1, nkv, full_len, d)
-        v_flat = torch.stack(v_pages, dim=0).unsqueeze(0)
+        cache_bsz = cache.bsz
+        batch_kv = []
+        for b in range(cache_bsz):
+            k_pages = []
+            v_pages = []
+            for h in range(_num_kv_heads):
+                sel_h = cache.indices_buf[b, h].long()
+                kv_h = buf_l[sel_h][:, :, :, h, :]    # (page_budget, 2, ps, d)
+                k_h = kv_h[:, 0].reshape(page_budget * cache.page_size, self.head_dim)
+                v_h = kv_h[:, 1].reshape(page_budget * cache.page_size, self.head_dim)
+                k_pages.append(k_h[:full_len])
+                v_pages.append(v_h[:full_len])
+            k_b = torch.stack(k_pages, dim=0)      # (nkv, full_len, d)
+            v_b = torch.stack(v_pages, dim=0)
+            batch_kv.append((k_b, v_b))
+        k_flat = torch.stack([kv[0] for kv in batch_kv], dim=0)   # (bsz, nkv, full_len, d)
+        v_flat = torch.stack([kv[1] for kv in batch_kv], dim=0)
         sdpa_out = F.scaled_dot_product_attention(
             query_states, k_flat, v_flat,
             is_causal=False, enable_gqa=True,
@@ -1859,8 +1926,8 @@ def _select_dct_forward(attention_backend):
 def replace_qwen2_attn(
     page_size=32,
     top_k=64,
-    sink_size=4,
-    recent_size=128,
+    num_sink_pages=1,
+    num_recent_pages=5,
     compress_ratio=0.03125,
     min_decode_kv_len_for_paging=8192,
     scoring_method="max",
@@ -1886,8 +1953,8 @@ def replace_qwen2_attn(
     _dct_page_cfg = DCTPageConfig(
         page_size=page_size,
         top_k=top_k,
-        sink_size=sink_size,
-        recent_size=recent_size,
+        num_sink_pages=num_sink_pages,
+        num_recent_pages=num_recent_pages,
         compress_ratio=compress_ratio,
         min_decode_kv_len_for_paging=min_decode_kv_len_for_paging,
         scoring_method=scoring_method,
@@ -1907,7 +1974,7 @@ def replace_qwen2_attn(
     comp_size = max(1, int(page_size * compress_ratio))
     print(f"DCT Page Attention config:")
     print(f"  page_size={page_size}, top_k={top_k}")
-    print(f"  sink_size={sink_size}, recent_size={recent_size}")
+    print(f"  num_sink_pages={num_sink_pages}, num_recent_pages={num_recent_pages}")
     print(f"  compress_ratio={compress_ratio} ({page_size} -> {comp_size} tokens)")
     print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}")
     print(f"  unselected_mode={unselected_mode}, compressed_token_rope={compressed_token_rope}")
@@ -1929,8 +1996,8 @@ def replace_qwen2_attn(
 def replace_qwen3_attn(
     page_size=32,
     top_k=64,
-    sink_size=4,
-    recent_size=128,
+    num_sink_pages=1,
+    num_recent_pages=5,
     compress_ratio=0.03125,
     min_decode_kv_len_for_paging=8192,
     scoring_method="max",
@@ -1958,8 +2025,8 @@ def replace_qwen3_attn(
     _dct_page_cfg = DCTPageConfig(
         page_size=page_size,
         top_k=top_k,
-        sink_size=sink_size,
-        recent_size=recent_size,
+        num_sink_pages=num_sink_pages,
+        num_recent_pages=num_recent_pages,
         compress_ratio=compress_ratio,
         min_decode_kv_len_for_paging=min_decode_kv_len_for_paging,
         scoring_method=scoring_method,
@@ -1979,7 +2046,7 @@ def replace_qwen3_attn(
     comp_size = max(1, int(page_size * compress_ratio))
     print(f"DCT Page Attention config (Qwen3):")
     print(f"  page_size={page_size}, top_k={top_k}")
-    print(f"  sink_size={sink_size}, recent_size={recent_size}")
+    print(f"  num_sink_pages={num_sink_pages}, num_recent_pages={num_recent_pages}")
     print(f"  compress_ratio={compress_ratio} ({page_size} -> {comp_size} tokens)")
     print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}")
     print(f"  unselected_mode={unselected_mode}, compressed_token_rope={compressed_token_rope}")
@@ -2001,8 +2068,8 @@ def replace_qwen3_attn(
 def replace_llama_attn(
     page_size=32,
     top_k=64,
-    sink_size=4,
-    recent_size=128,
+    num_sink_pages=1,
+    num_recent_pages=5,
     compress_ratio=0.03125,
     min_decode_kv_len_for_paging=8192,
     scoring_method="max",
@@ -2034,8 +2101,8 @@ def replace_llama_attn(
     _dct_page_cfg = DCTPageConfig(
         page_size=page_size,
         top_k=top_k,
-        sink_size=sink_size,
-        recent_size=recent_size,
+        num_sink_pages=num_sink_pages,
+        num_recent_pages=num_recent_pages,
         compress_ratio=compress_ratio,
         min_decode_kv_len_for_paging=min_decode_kv_len_for_paging,
         scoring_method=scoring_method,
@@ -2055,7 +2122,7 @@ def replace_llama_attn(
     comp_size = max(1, int(page_size * compress_ratio))
     print(f"DCT Page Attention config (Llama):")
     print(f"  page_size={page_size}, top_k={top_k}")
-    print(f"  sink_size={sink_size}, recent_size={recent_size}")
+    print(f"  num_sink_pages={num_sink_pages}, num_recent_pages={num_recent_pages}")
     print(f"  compress_ratio={compress_ratio} ({page_size} -> {comp_size} tokens)")
     print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}")
     print(f"  unselected_mode={unselected_mode}, compressed_token_rope={compressed_token_rope}")

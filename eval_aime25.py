@@ -211,8 +211,8 @@ def parse_args():
     # DCT Page Attention params
     parser.add_argument("--page_size", type=int, default=32)
     parser.add_argument("--top_k", type=int, default=64)
-    parser.add_argument("--sink_size", type=int, default=4)
-    parser.add_argument("--recent_size", type=int, default=128)
+    parser.add_argument("--num_sink_pages", type=int, default=1)
+    parser.add_argument("--num_recent_pages", type=int, default=5)
     parser.add_argument("--compress_ratio", type=float, default=0.03125)
     parser.add_argument("--scoring_method", type=str, default="max",
                         choices=["mean", "max"])

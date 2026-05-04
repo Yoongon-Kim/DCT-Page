@@ -216,28 +216,30 @@ def segment_kv_from_cache(
     key_states: torch.Tensor,    # [bsz, kv_heads, kv_len, head_dim]
     value_states: torch.Tensor,  # [bsz, kv_heads, kv_len, head_dim]
     page_size: int,
-    sink_size: int,
-    recent_size: int,
+    num_sink_pages: int,
+    num_recent_pages: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor, int]:
     """Split flat KV cache into sink / paged / recent segments.
 
     Returns:
-        sink_k, sink_v:     [bsz, kv_heads, sink_size, head_dim]
+        sink_k, sink_v:     [bsz, kv_heads, num_sink_pages * page_size, head_dim]
         paged_k, paged_v:   [bsz, kv_heads, num_pages, page_size, head_dim]
         recent_k, recent_v: [bsz, kv_heads, actual_recent, head_dim]
         num_pages
     """
     bsz, kv_heads, kv_len, head_dim = key_states.shape
-    pageable_len = kv_len - sink_size - recent_size
+    sink_tokens = num_sink_pages * page_size
+    recent_tokens_min = (num_recent_pages - 1) * page_size
+    pageable_len = kv_len - sink_tokens - recent_tokens_min
     num_pages = pageable_len // page_size
-    pages_end = sink_size + num_pages * page_size
+    pages_end = sink_tokens + num_pages * page_size
 
-    sink_k = key_states[:, :, :sink_size]
-    sink_v = value_states[:, :, :sink_size]
-    paged_k = key_states[:, :, sink_size:pages_end].reshape(
+    sink_k = key_states[:, :, :sink_tokens]
+    sink_v = value_states[:, :, :sink_tokens]
+    paged_k = key_states[:, :, sink_tokens:pages_end].reshape(
         bsz, kv_heads, num_pages, page_size, head_dim)
-    paged_v = value_states[:, :, sink_size:pages_end].reshape(
+    paged_v = value_states[:, :, sink_tokens:pages_end].reshape(
         bsz, kv_heads, num_pages, page_size, head_dim)
     recent_k = key_states[:, :, pages_end:]
     recent_v = value_states[:, :, pages_end:]
@@ -312,9 +314,9 @@ def compute_output_contribution(
     paged_k: torch.Tensor,        # [bsz, kv_heads, num_pages, page_size, head_dim]
     paged_v: torch.Tensor,        # [bsz, kv_heads, num_pages, page_size, head_dim]
     num_kv_groups: int,
-    sink_k: torch.Tensor | None = None,    # [bsz, kv_heads, sink_size, head_dim]
+    sink_k: torch.Tensor | None = None,    # [bsz, kv_heads, num_sink_pages*page_size, head_dim]
     sink_v: torch.Tensor | None = None,
-    recent_k: torch.Tensor | None = None,  # [bsz, kv_heads, recent_size, head_dim]
+    recent_k: torch.Tensor | None = None,  # [bsz, kv_heads, actual_recent, head_dim]
     recent_v: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute per-page output contribution: || sum_{i in page} softmax(s_i) * v_i ||.
@@ -1243,8 +1245,8 @@ def parse_args() -> argparse.Namespace:
     # DCT page config
     p.add_argument("--page_size", type=int, default=32)
     p.add_argument("--top_k", type=int, default=64)
-    p.add_argument("--sink_size", type=int, default=4)
-    p.add_argument("--recent_size", type=int, default=128)
+    p.add_argument("--num_sink_pages", type=int, default=1)
+    p.add_argument("--num_recent_pages", type=int, default=5)
     p.add_argument("--compress_ratio", type=float, default=0.125)
     p.add_argument("--lambdas", default="0.25,0.5,1.0,1.5,2.0",
                    help="Comma-separated lambda values for DC+AC scoring")
@@ -1384,8 +1386,8 @@ def _score_one_layer(
     num_kv_groups: int,
     comp_size: int,
     page_size: int,
-    sink_size: int,
-    recent_size: int,
+    num_sink_pages: int,
+    num_recent_pages: int,
     top_k: int,
     lambdas: list[float],
     betas: list[float],
@@ -1405,7 +1407,9 @@ def _score_one_layer(
     or None if there are not enough tokens for at least one page.
     """
     kv_len = key_states.shape[2]
-    pageable_len = kv_len - sink_size - recent_size
+    sink_tokens = num_sink_pages * page_size
+    recent_tokens_min = (num_recent_pages - 1) * page_size
+    pageable_len = kv_len - sink_tokens - recent_tokens_min
     if pageable_len < page_size:
         return None
 
@@ -1418,7 +1422,7 @@ def _score_one_layer(
     hidden_states = hidden_states.to(score_device)
 
     sink_k, sink_v, paged_k, paged_v, recent_k, recent_v, num_pages = \
-        segment_kv_from_cache(key_states, value_states, page_size, sink_size, recent_size)
+        segment_kv_from_cache(key_states, value_states, page_size, num_sink_pages, num_recent_pages)
 
     query_states = recompute_query(attn_module, hidden_states, kv_len, config, score_device, dtype)
 
@@ -1815,7 +1819,7 @@ def main() -> None:
                         all_scores = _score_one_layer(
                             attn, h, key_cache, value_cache,
                             model.config, num_kv_groups, comp_size,
-                            args.page_size, args.sink_size, args.recent_size,
+                            args.page_size, args.num_sink_pages, args.num_recent_pages,
                             args.top_k, lambdas, betas, device, dtype,
                             layouts=layouts,
                             ucb_levels=ucb_levels,

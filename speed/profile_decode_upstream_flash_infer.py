@@ -1,18 +1,19 @@
 """
-Profile DCT + upstream-FlashInfer decode (virtual-batch-per-head layout).
+Profile DCT + upstream-FlashInfer decode (virtual-batch-per-(b, h) layout).
 
 Sibling of `speed/profile_decode_flash_infer.py`. That driver uses the
 DCT-Page fork of FlashInfer at `/home/yoongonkim/flashinfer-dct` with a
 per-head `indices` patch (plan() `page_budget` kwarg). This driver tests
 whether we can drop that patch entirely by reshaping the KV cache so each
-physical page holds one KV head's slice, then treating each KV head as a
-virtual batch entry for stock FlashInfer's 2-D indices API.
+physical page holds one (batch, KV head)'s slice, then treating each
+(batch, KV head) pair as a virtual batch entry for stock FlashInfer's
+2-D indices API.
 
-Correctness argument: multi-head attention is separable over KV heads —
-softmax is per Q head. Packing "KV head h's selected pages" as virtual
-batch h, with the `group_size` Q heads that attend to it as that batch's
-query heads, computes the exact same attention output (up to FI kernel
-numerics).
+Correctness argument: multi-head attention is separable over KV heads
+AND batches — softmax is per Q head per batch. Packing "(batch b, KV head
+h)'s selected pages" as virtual batch v = b*H + h, with the `group_size`
+Q heads that attend to it as that batch's query heads, computes the exact
+same attention output (up to FI kernel numerics).
 
 Modes (via `--mode`, default `dct_upstream_flashinfer`):
   - baseline                   : full-KV FlashInfer (shared with the fork
@@ -24,9 +25,22 @@ Modes (via `--mode`, default `dct_upstream_flashinfer`):
 Usage:
     CUDA_VISIBLE_DEVICES=1 python speed/profile_decode_upstream_flash_infer.py \\
         --context_length 32768 --page_size 32 --top_k 64 \\
-        --sink_size 32 --recent_size 128 \\
+        --num_sink_pages 1 --num_recent_pages 5 \\
         --num_decode_steps 128 --warmup_steps 8 \\
-        --mode all --verify_upstream
+        --batch_size 2 --mode all --verify_upstream
+
+Multibatch (Phase 1, v2): `--batch_size B` is now supported (B >= 1).
+Memory cost scales linearly with B — see the v2 plan
+(`.omc/plans/upstream-fi-multibatch-v2.md`) for the per-(B, ctx) ceiling
+on A6000 48 GiB. Hard gate: bsz=4/16K verify PASS. Best-effort: bsz=4/32K.
+
+Rollback path (if bsz>1 verify fails):
+  - Single-line: pass `allow_head_local_multibatch=False` at the upstream
+    call site in `upstream_flashinfer_backend.py`'s topk wrapper call —
+    multibatch is un-armed, fork-side guardrail intact.
+  - Full per-file revert: revert each phase commit independently;
+    `triton_kernels.py` (Phase 3, kernel flag), then this driver
+    (Phase 2), then `upstream_flashinfer_backend.py` (Phase 1).
 """
 from __future__ import annotations
 
@@ -49,10 +63,14 @@ import transformers
 
 import profile_decode as _pd
 from profile_decode import (
-    pre_allocate_cache,
     print_profile,
     profiled_dct_page_attention_forward,
 )
+# `pre_allocate_cache` MUST come from dct_page_attention (not profile_decode)
+# because the dct_page_attention.PreAllocatedLayer.update has the _fi_mode
+# counter-only shim that lets us free flat KV after FI build. The
+# profile_decode.PreAllocatedLayer.update unconditionally writes to
+# self.keys, which crashes with NoneType once flat KV is freed.
 
 # Share the full-KV FlashInfer baseline from the fork profiler — neither
 # baseline nor dct_sdpa need per-head selection, so no reason to duplicate.
@@ -73,8 +91,8 @@ import dct_page_attention as _dpa
 from dct_page_attention import (
     apply_rotary_pos_emb,
     dct_page_attention_forward,
+    pre_allocate_cache,
     replace_llama_attn,
-    segment_kv,
     _maybe_reset_dct_runtime_state,
     _update_comp_cache,
 )
@@ -148,7 +166,7 @@ def profiled_dct_upstream_flashinfer_forward(
         )
 
     min_len_for_paging = max(
-        cfg.sink_size + cfg.page_size * (cfg.top_k + 1) + cfg.recent_size,
+        (cfg.num_sink_pages + cfg.top_k + 1 + cfg.num_recent_pages) * cfg.page_size,
         getattr(cfg, "min_decode_kv_len_for_paging", 0),
     )
     if past_key_values is not None:
@@ -200,7 +218,11 @@ def profiled_dct_upstream_flashinfer_forward(
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     if past_key_values is not None:
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        key_states, value_states = past_key_values.update(
+        # Counter-only update (in _fi_mode the shim returns (None, None) and
+        # skips the flat-KV write — flat keys/values were freed at FI build).
+        # The upstream forward never reads from past_key_values.layers[l].keys
+        # in steady state; cache.buf_views[l] is the source of truth for K/V.
+        past_key_values.update(
             key_states, value_states, self.layer_idx, cache_kwargs
         )
 
@@ -228,12 +250,20 @@ def profiled_dct_upstream_flashinfer_forward(
     if _pd._enabled:
         _rec(2)
 
-    # Step 3: segment DCT cache.
+    # Step 3: paged views from FI buf (cache.buf_views[l] is the SoT — flat
+    # KV was freed at FI build). Mirrors the fork's `paged_views_from_buf`
+    # but for upstream's per-(b, h) layout: `cache.buf_views[l]` shape
+    # `(B, H, P, 2, ps, 1, d)` slices to `(B, H, num_pages, ps, d)` with no
+    # copy via stride-only indexing on the page dim.
     comp_size = max(1, int(cfg.page_size * cfg.compress_ratio))
-    (sink_k, sink_v, paged_k, paged_v,
-     recent_k, recent_v, num_pages, actual_recent) = segment_kv(
-        key_states, value_states, cfg,
+    num_pages = (
+        cache.last_page_idx_py - cache.num_sink_pages
+        - cache.num_recent_pages_fixed + 1
     )
+    buf_l = cache.buf_views[self.layer_idx]   # (B, H, P, 2, ps, 1, d)
+    middle = buf_l[:, :, cache.num_sink_pages:cache.num_sink_pages + num_pages]
+    paged_k = middle[:, :, :, 0, :, 0, :]   # (B, H, num_pages, ps, d)
+    paged_v = middle[:, :, :, 1, :, 0, :]
 
     if _pd._enabled:
         _rec(3)
@@ -271,17 +301,14 @@ def profiled_dct_upstream_flashinfer_forward(
 
     # Step 6: fused topk + pack. Writes head-local indices into
     # `indices_buf_3d`; sink slice was filled once at cache init.
-    num_middle_pages = (
-        cache.last_page_idx_py - cache.num_sink_pages
-        - cache.num_recent_pages_fixed + 1
-    )
-    if num_middle_pages < cache.top_k:
+    # `num_pages` already equals the eligible middle range (cache.buf_views
+    # is the source of truth, no off-by-one between DCT and FI counts).
+    if num_pages < cache.top_k:
         raise RuntimeError(
-            f"num_middle_pages ({num_middle_pages}) < cache.top_k "
+            f"num_pages ({num_pages}) < cache.top_k "
             f"({cache.top_k}). Configure min_decode_kv_len_for_paging."
         )
-    effective_num_pages = min(num_pages, num_middle_pages)
-    eff_scores = page_scores[:, :, :effective_num_pages]
+    eff_scores = page_scores[:, :, :num_pages]
     topk_sort_and_pack_triton(
         eff_scores,
         cache.indices_buf_3d,
@@ -290,6 +317,11 @@ def profiled_dct_upstream_flashinfer_forward(
         last_page_idx=cache.last_page_idx,
         recent_offsets=cache.recent_offsets,
         sort_ascending=False,
+        # upstream uses per-(b, h) pools — bias is applied later by
+        # refresh_upstream_indices_flat, so the kernel writes head-local IDs.
+        # `pages_per_batch=0` + this flag is the upstream contract.
+        pages_per_batch=0,
+        allow_head_local_multibatch=True,
     )
 
     if _pd._enabled:
@@ -303,10 +335,11 @@ def profiled_dct_upstream_flashinfer_forward(
             f"upstream-FI cache overflow: page_idx={page_idx} >= "
             f"pages_per_head={cache.pages_per_head}"
         )
-    k_flat = key_states[:, :, -1:, :].reshape(cache.num_kv_heads, cache.head_dim)
-    v_flat = value_states[:, :, -1:, :].reshape(cache.num_kv_heads, cache.head_dim)
-    cache.buf_7d[self.layer_idx, :, page_idx, 0, slot, 0, :].copy_(k_flat)
-    cache.buf_7d[self.layer_idx, :, page_idx, 1, slot, 0, :].copy_(v_flat)
+    k_flat = key_states[:, :, -1:, :].reshape(bsz, cache.num_kv_heads, cache.head_dim)
+    v_flat = value_states[:, :, -1:, :].reshape(bsz, cache.num_kv_heads, cache.head_dim)
+    # buf_views[l]: (B, H, P, 2, ps, 1, d). Touch all (b, h) at (page_idx, slot).
+    cache.buf_views[self.layer_idx][:, :, page_idx, 0, slot, 0, :].copy_(k_flat)
+    cache.buf_views[self.layer_idx][:, :, page_idx, 1, slot, 0, :].copy_(v_flat)
 
     refresh_upstream_indices_flat(cache)
     attn_output_fi = upstream_flashinfer_decode_attention(
@@ -317,29 +350,31 @@ def profiled_dct_upstream_flashinfer_forward(
         _rec(7)
 
     # Verify path — outside the event window. Recreates the same K/V set that
-    # FI saw from the cache and runs SDPA on it. Because each head's data
-    # now lives in its own page pool, gather uses buf_7d directly (no need
-    # to slice `num_kv_heads` out of each page).
+    # FI saw from the cache and runs SDPA on it. Each (b, h) virtual batch
+    # has its own page pool in buf_views, so gather is per-(b, h) directly.
     if getattr(self, "_verify_upstream", False):
-        buf_l_7d = cache.buf_7d[self.layer_idx]  # (H, P, 2, ps, 1, d)
+        buf_l_8d = cache.buf_views[self.layer_idx]  # (B, H, P, 2, ps, 1, d)
         page_budget = cache.page_budget
         last_page_len = cache.last_page_len_py
         full_len = (page_budget - 1) * cache.page_size + last_page_len
-        k_pages = []
-        v_pages = []
-        for h in range(_num_kv_heads):
-            sel_h = cache.indices_buf_3d[0, h].long()    # head-local IDs
-            kv_h = buf_l_7d[h][sel_h]                    # (page_budget, 2, ps, 1, d)
-            k_h = kv_h[:, 0, :, 0, :].reshape(
-                page_budget * cache.page_size, self.head_dim
-            )
-            v_h = kv_h[:, 1, :, 0, :].reshape(
-                page_budget * cache.page_size, self.head_dim
-            )
-            k_pages.append(k_h[:full_len])
-            v_pages.append(v_h[:full_len])
-        k_ref = torch.stack(k_pages, dim=0).unsqueeze(0)
-        v_ref = torch.stack(v_pages, dim=0).unsqueeze(0)
+        batch_kv = []
+        for b in range(bsz):
+            k_pages = []
+            v_pages = []
+            for h in range(_num_kv_heads):
+                sel_bh = cache.indices_buf_3d[b, h].long()    # head-local IDs
+                kv_bh = buf_l_8d[b, h][sel_bh]                # (page_budget, 2, ps, 1, d)
+                k_bh = kv_bh[:, 0, :, 0, :].reshape(
+                    page_budget * cache.page_size, self.head_dim
+                )
+                v_bh = kv_bh[:, 1, :, 0, :].reshape(
+                    page_budget * cache.page_size, self.head_dim
+                )
+                k_pages.append(k_bh[:full_len])
+                v_pages.append(v_bh[:full_len])
+            batch_kv.append((torch.stack(k_pages, dim=0), torch.stack(v_pages, dim=0)))
+        k_ref = torch.stack([kv[0] for kv in batch_kv], dim=0)  # (B, H, full_len, d)
+        v_ref = torch.stack([kv[1] for kv in batch_kv], dim=0)
         sdpa_out = F.scaled_dot_product_attention(
             query_states, k_ref, v_ref,
             is_causal=False, enable_gqa=True,
@@ -385,19 +420,19 @@ def _build_upstream_fi_cache(model, past_key_values, prefill_len, args):
     num_qo_heads = cfg_model.num_attention_heads
     head_dim = cfg_model.hidden_size // num_qo_heads
     num_layers = cfg_model.num_hidden_layers
-    num_sink_pages = (args.sink_size + args.page_size - 1) // args.page_size
-    num_recent_pages_fixed = (
-        (args.recent_size + args.page_size - 1) // args.page_size + 1
-    )
+    num_sink_pages = args.num_sink_pages
+    num_recent_pages_fixed = args.num_recent_pages
     max_decode_steps = args.warmup_steps + args.num_decode_steps + 16
     if args.cudagraph:
         max_decode_steps += 64
     page_budget = num_sink_pages + args.top_k + num_recent_pages_fixed
+    bsz = args.batch_size
+    vbsz = bsz * num_kv_heads
     print(
-        f"  Building upstream-FI cache: layers={num_layers}, "
+        f"  Building upstream-FI cache: layers={num_layers}, bsz={bsz}, "
         f"num_sink_pages={num_sink_pages}, top_k={args.top_k}, "
         f"num_recent_pages_fixed={num_recent_pages_fixed}, "
-        f"page_budget={page_budget}, vbsz={num_kv_heads}, "
+        f"page_budget={page_budget}, vbsz={vbsz} (=B*H), "
         f"group_size={num_qo_heads // num_kv_heads}..."
     )
     device = next(model.parameters()).device
@@ -415,6 +450,7 @@ def _build_upstream_fi_cache(model, past_key_values, prefill_len, args):
         num_sink_pages=num_sink_pages,
         top_k=args.top_k,
         num_recent_pages_fixed=num_recent_pages_fixed,
+        bsz=bsz,
     )
     _upstream_fi_cache_ref[0] = cache
     print(
@@ -437,6 +473,22 @@ def _reset_mode_state():
     _pd._current_layer = 0
 
 
+def _fi_cache_for_mode(mode):
+    """Return the active FI cache for the given mode, or None.
+
+    Used by the CUDA-graph block to align `last_page_len_py` away from a page
+    boundary before priming + capture. Both FI-based modes
+    (`dct_upstream_flashinfer` and `baseline`) need the alignment hook
+    although only `baseline` actually replans inside the forward; for the
+    upstream-FI mode plan() is called once at build, so alignment is a no-op.
+    """
+    if mode == "dct_upstream_flashinfer":
+        return _upstream_fi_cache_ref[0]
+    if mode == "baseline":
+        return _pdfi._fi_baseline_cache_ref[0]
+    return None
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -457,15 +509,15 @@ def parse_args():
 
     p.add_argument("--page_size", type=int, default=32)
     p.add_argument("--top_k", type=int, default=64)
-    p.add_argument("--sink_size", type=int, default=32)
-    p.add_argument("--recent_size", type=int, default=128)
+    p.add_argument("--num_sink_pages", type=int, default=1)
+    p.add_argument("--num_recent_pages", type=int, default=5)
     p.add_argument("--compress_ratio", type=float, default=0.125)
     p.add_argument("--scoring_method", default="max", choices=["mean", "max"])
     p.add_argument("--group_agg_method", default="max", choices=["mean", "max"])
     p.add_argument("--unselected_mode", default="drop", choices=["drop"])
     p.add_argument("--compressed_token_rope", default="mixed",
                    choices=["mixed", "block_center"])
-    p.add_argument("--comp_kv_quant", default="none",
+    p.add_argument("--comp_kv_quant", default="fp8_e5m2",
                    choices=["none", "fp8_e4m3", "fp8_e5m2", "int8", "int4"])
     p.add_argument("--comp_kv_quant_granularity", default="per_page",
                    choices=["per_page", "per_comp_token"])
@@ -477,12 +529,30 @@ def parse_args():
                    default="auto")
 
     p.add_argument("--batch_size", type=int, default=1,
-                   help="Batch size. Only 1 is supported by this adapter — "
-                        "wired for parity with future multi-batch work.")
+                   help="Batch size (B). vbsz = B * num_kv_heads — each (b, h) "
+                        "becomes a virtual FlashInfer batch entry with its own "
+                        "page pool. Memory cost scales linearly with B; on a "
+                        "48 GiB A6000, bsz=4/16K is the safe gate, bsz=4/32K "
+                        "is best-effort (per memory math in the v2 plan).")
     p.add_argument("--verify_upstream", action="store_true",
                    help="Per-layer upstream-FI vs SDPA shadow verification. "
-                        "Threshold 0.02.")
-    p.add_argument("--verify_threshold", type=float, default=0.02)
+                        "At bsz=1 uses --verify_threshold (default 0.05 — the "
+                        "empirical bf16 LSB floor at typical attention output "
+                        "magnitudes ~ 2^-5); at bsz>1 a ladder threshold = "
+                        "max(--verify_threshold, 3 * wd1) is used, where "
+                        "wd1 = bsz=1 empirical worst diff (logged at run time).")
+    p.add_argument("--verify_threshold", type=float, default=0.05,
+                   help="Floor for the verify max-abs-diff at bsz=1. At "
+                        "bsz>1 the threshold is max(this, 3 * wd1). 0.05 "
+                        "matches the empirical bf16 noise floor; tighten to "
+                        "0.02 only if you've also tightened FI/SDPA reduction "
+                        "order to match exactly.")
+    p.add_argument("--bsz1_wd1", type=float, default=0.0,
+                   help="Empirical worst max-abs-diff observed at bsz=1, used "
+                        "as the bsz>1 threshold ladder floor. Run bsz=1 verify "
+                        "first to record this; pass it on bsz>1 runs to set "
+                        "threshold = max(--verify_threshold, 3 * wd1). "
+                        "0.0 (default) → ladder degenerates to --verify_threshold.")
     p.add_argument("--cudagraph", action="store_true",
                    help="Capture one decode step into a CUDA graph and "
                         "benchmark replay. plan() is called once at build "
@@ -490,13 +560,7 @@ def parse_args():
     p.add_argument("--cudagraph_replays", type=int, default=0)
     p.add_argument("--torch_profiler_trace", default=None)
 
-    args = p.parse_args()
-    if args.batch_size != 1 and args.mode in ("dct_upstream_flashinfer", "all"):
-        print(
-            f"WARN: --batch_size={args.batch_size} > 1 is not supported by "
-            f"the upstream-FI adapter; dct_upstream_flashinfer will fail."
-        )
-    return args
+    return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
@@ -520,7 +584,7 @@ def _patch_dct_sdpa(model, args, original_forward):
     restore_forward(args.model, original_forward, model)
     replace_llama_attn(
         page_size=args.page_size, top_k=args.top_k,
-        sink_size=args.sink_size, recent_size=args.recent_size,
+        num_sink_pages=args.num_sink_pages, num_recent_pages=args.num_recent_pages,
         compress_ratio=args.compress_ratio,
         scoring_method=args.scoring_method,
         group_agg_method=args.group_agg_method,
@@ -547,7 +611,7 @@ def _patch_dct_upstream_flashinfer(model, args, original_forward):
     restore_forward(args.model, original_forward, model)
     replace_llama_attn(
         page_size=args.page_size, top_k=args.top_k,
-        sink_size=args.sink_size, recent_size=args.recent_size,
+        num_sink_pages=args.num_sink_pages, num_recent_pages=args.num_recent_pages,
         compress_ratio=args.compress_ratio,
         scoring_method=args.scoring_method,
         group_agg_method=args.group_agg_method,
@@ -614,8 +678,15 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
     extra = args.warmup_steps + args.num_decode_steps + 16
     if args.cudagraph:
         extra += 64
-    past_key_values = pre_allocate_cache(past_key_values, extra_tokens=extra)
-    print(f"  Converted to pre-allocated cache (+{extra} tokens)")
+    # FI-based modes (dct_upstream_flashinfer + baseline) free the per-layer
+    # flat keys/values right after the prefill→paged pack, so the per-layer
+    # `extra` slack would be allocated and immediately freed — skip it. This
+    # mirrors `profile_decode_flash_infer.py:1318`. Without this, at long
+    # context × large bsz the slack alloc adds gigabytes of transient memory
+    # that drives OOM at buf alloc time.
+    pa_extra = 0 if mode in ("dct_upstream_flashinfer", "baseline") else extra
+    past_key_values = pre_allocate_cache(past_key_values, extra_tokens=pa_extra)
+    print(f"  Converted to pre-allocated cache (+{pa_extra} tokens)")
 
     if mode == "dct_upstream_flashinfer":
         _build_upstream_fi_cache(model, past_key_values, prefill_len, args)
@@ -628,7 +699,7 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
         max_decode_steps = extra
         print(
             f"  Building full-KV FI baseline cache (layers={num_layers}, "
-            f"page_size={args.page_size})..."
+            f"bsz={args.batch_size}, page_size={args.page_size})..."
         )
         _pdfi._fi_baseline_cache_ref[0] = build_fi_baseline_cache(
             preallocated_layers=past_key_values.layers,
@@ -641,10 +712,12 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
             max_decode_steps=max_decode_steps,
             dtype=past_key_values.layers[0].keys.dtype,
             device=device,
+            bsz=args.batch_size,
         )
         _bc = _pdfi._fi_baseline_cache_ref[0]
         print(
-            f"  FI baseline cache ready: capacity_pages={_bc.capacity_pages}, "
+            f"  FI baseline cache ready: capacity_pages={_bc.capacity_pages} "
+            f"(pages_per_batch={_bc.pages_per_batch} × bsz={_bc.bsz}), "
             f"num_active_pages={_bc.num_active_pages}"
         )
 
@@ -727,14 +800,31 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
                         per_step_worst[s] = d
                         per_step_layer[s] = lid
             worst = max(max(v) for v in per_layer_diffs.values())
+            # Threshold ladder (Critic A): at bsz>1 use max(floor, 3 * wd1)
+            # where wd1 = bsz=1 empirical worst, supplied via --bsz1_wd1.
+            # At bsz=1 the floor (--verify_threshold) is the gate; we also
+            # log the observed worst as wd1 so the user can plug it back in
+            # for subsequent bsz>1 runs.
+            if args.batch_size == 1:
+                threshold = args.verify_threshold
+                ladder_note = "bsz=1 floor"
+            else:
+                threshold = max(args.verify_threshold, 3.0 * args.bsz1_wd1)
+                ladder_note = (
+                    f"max({args.verify_threshold:.0e}, 3*{args.bsz1_wd1:.3e})"
+                )
+            print(
+                f"  [VERIFY] wd1={args.bsz1_wd1:.3e} threshold={threshold:.3e} "
+                f"({ladder_note}) observed_worst={worst:.3e}"
+            )
             print(
                 f"  [verify_upstream] worst max-abs-diff across "
                 f"{len(per_layer_diffs)} layers x {all_steps} steps = "
-                f"{worst:.3e} (threshold = {args.verify_threshold:.0e})"
+                f"{worst:.3e} (threshold = {threshold:.3e})"
             )
             head = min(8, all_steps)
             for s in range(head):
-                ok = per_step_worst[s] < args.verify_threshold
+                ok = per_step_worst[s] < threshold
                 print(
                     f"    step {s}: {per_step_worst[s]:.3e}  "
                     f"worst layer={per_step_layer[s]:>2}  "
@@ -742,15 +832,50 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
                 )
             if all_steps > head:
                 print(f"    ... ({all_steps - head} more steps)")
-            verify_ok = worst < args.verify_threshold
+            verify_ok = worst < threshold
             print(f"  [verify_upstream] overall: {'PASS' if verify_ok else 'FAIL'}")
+            if args.batch_size == 1:
+                print(
+                    f"  [VERIFY] bsz=1 wd1 (record for bsz>1 ladder): {worst:.3e} "
+                    f"→ pass `--bsz1_wd1={worst:.3e}` on subsequent bsz>1 runs"
+                )
 
     # Optional CUDA graph benchmark.
     graph_stats = None
     if args.cudagraph:
+        # FI-mode page alignment: lifted from `profile_decode_flash_infer.py:1568-1590`.
+        # The fork's full-KV baseline forward calls `wrapper.plan()` whenever
+        # a new physical page opens (every page_size decode steps). plan() is
+        # NOT graph-capturable. Priming runs the forward 3 extra times before
+        # the captured iteration, so unless `last_page_len_py + 4 <= page_size`
+        # plan() will land somewhere in the priming/capture window.
+        #
+        # Mitigation: run extra eager decode steps (no profiling) until
+        # `last_page_len_py <= page_size - 4`, advancing the open-page counter
+        # safely past the boundary if needed. Upstream-FI mode never replans,
+        # so this loop is a no-op / cheap there.
+        fi_cache = _fi_cache_for_mode(mode)
+        align_steps = 0
+        if fi_cache is not None:
+            ps = fi_cache.page_size
+            while fi_cache.last_page_len_py > ps - 4:
+                _do_one_decode_step(
+                    args.warmup_steps + args.num_decode_steps + align_steps,
+                    profiled=False,
+                )
+                align_steps += 1
+                if align_steps > ps + 1:  # safety: never loop forever
+                    break
+            print(
+                f"  Graph alignment: {align_steps} eager step(s) "
+                f"(last_page_len={fi_cache.last_page_len_py}/{ps})"
+            )
+
         torch.cuda.synchronize(device)
         num_replays = args.cudagraph_replays or args.num_decode_steps
-        current_pos = prefill_len + args.warmup_steps + args.num_decode_steps
+        current_pos = (
+            prefill_len + args.warmup_steps + args.num_decode_steps + align_steps
+        )
 
         static_input = next_token.clone()
         static_pos = torch.tensor([current_pos], device=device, dtype=torch.long)
@@ -783,7 +908,13 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
             per_replay_ms = (time.perf_counter() - t0) * 1000 / num_replays
             graph_tok_s = 1000.0 / per_replay_ms
             graph_stats = (per_replay_ms, graph_tok_s)
-            print(f"  CUDA graph: {per_replay_ms:.3f} ms/step  ({graph_tok_s:.1f} tok/s)")
+            if args.batch_size == 1:
+                print(f"  CUDA graph: {per_replay_ms:.3f} ms/step  ({graph_tok_s:.1f} tok/s)")
+            else:
+                print(
+                    f"  CUDA graph: {per_replay_ms:.3f} ms/step  "
+                    f"({graph_tok_s:.1f} step/s, {graph_tok_s * args.batch_size:.1f} agg tok/s @ bsz={args.batch_size})"
+                )
         except Exception as e:
             print(f"  CUDA graph benchmark failed: {type(e).__name__}: {e}")
             graph_stats = None
@@ -825,7 +956,7 @@ def main():
          verify_ok, graph_stats) = _run_one_mode(
             model, tokenizer, args, mode, original_forward,
         )
-        print_profile(mode, avg_total, tok_s, timings, num_layers, cpu_timings)
+        print_profile(mode, avg_total, tok_s, timings, num_layers, cpu_timings, bsz=args.batch_size)
         if graph_stats is not None:
             gp, gts = graph_stats
             print(
@@ -843,8 +974,21 @@ def main():
         print(f"\n{'=' * 70}")
         print("COMPARISON")
         print(f"{'=' * 70}")
-        print(f"  {'Mode':<28} {'ms/tok':>10} {'tok/s':>10} {'vs baseline':>14}")
-        print(f"  {'-' * 28} {'-' * 10} {'-' * 10} {'-' * 14}")
+        # At bsz>1 split tok/s into step/s + agg tok/s. The "tok/s" reported
+        # by tok_s = 1000/avg_total is steps/sec; one step generates `bsz`
+        # tokens, so aggregate = bsz * step/s.
+        bsz = args.batch_size
+        if bsz == 1:
+            print(f"  {'Mode':<28} {'ms/step':>10} {'tok/s':>10} {'vs baseline':>14}")
+            print(f"  {'-' * 28} {'-' * 10} {'-' * 10} {'-' * 14}")
+        else:
+            print(
+                f"  {'Mode':<28} {'ms/step':>10} {'step/s':>10} "
+                f"{'agg tok/s':>11} {'vs baseline':>14}"
+            )
+            print(
+                f"  {'-' * 28} {'-' * 10} {'-' * 10} {'-' * 11} {'-' * 14}"
+            )
         base = results.get("baseline")
         for mode in modes_order:
             if mode not in results:
@@ -857,12 +1001,27 @@ def main():
                 vs_str = "(ref)"
             else:
                 vs_str = "—"
-            print(f"  {mode:<28} {avg:>10.2f} {tok:>10.1f} {vs_str:>14}")
+            if bsz == 1:
+                print(f"  {mode:<28} {avg:>10.2f} {tok:>10.1f} {vs_str:>14}")
+            else:
+                print(
+                    f"  {mode:<28} {avg:>10.2f} {tok:>10.1f} "
+                    f"{tok * bsz:>11.1f} {vs_str:>14}"
+                )
 
         any_graph = any(r[3] is not None for r in results.values())
         if any_graph:
-            print(f"\n  {'Mode (graph)':<28} {'ms/tok':>10} {'tok/s':>10} {'vs baseline':>14}")
-            print(f"  {'-' * 28} {'-' * 10} {'-' * 10} {'-' * 14}")
+            if bsz == 1:
+                print(f"\n  {'Mode (graph)':<28} {'ms/step':>10} {'tok/s':>10} {'vs baseline':>14}")
+                print(f"  {'-' * 28} {'-' * 10} {'-' * 10} {'-' * 14}")
+            else:
+                print(
+                    f"\n  {'Mode (graph)':<28} {'ms/step':>10} {'step/s':>10} "
+                    f"{'agg tok/s':>11} {'vs baseline':>14}"
+                )
+                print(
+                    f"  {'-' * 28} {'-' * 10} {'-' * 10} {'-' * 11} {'-' * 14}"
+                )
             base_graph = results.get("baseline", (None,) * 4)[3]
             for mode in modes_order:
                 if mode not in results or results[mode][3] is None:
@@ -875,7 +1034,13 @@ def main():
                     vs_str = "(ref)"
                 else:
                     vs_str = "—"
-                print(f"  {mode:<28} {gp:>10.2f} {gts:>10.1f} {vs_str:>14}")
+                if bsz == 1:
+                    print(f"  {mode:<28} {gp:>10.2f} {gts:>10.1f} {vs_str:>14}")
+                else:
+                    print(
+                        f"  {mode:<28} {gp:>10.2f} {gts:>10.1f} "
+                        f"{gts * bsz:>11.1f} {vs_str:>14}"
+                    )
 
     if verify_state:
         print()

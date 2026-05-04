@@ -47,8 +47,8 @@ def apply_dct_patch(args, model=None):
     patch_kwargs = dict(
         page_size=args.page_size,
         top_k=args.top_k,
-        sink_size=args.sink_size,
-        recent_size=args.recent_size,
+        num_sink_pages=args.num_sink_pages,
+        num_recent_pages=args.num_recent_pages,
         compress_ratio=args.compress_ratio,
         scoring_method=args.scoring_method,
         group_agg_method=args.group_agg_method,
@@ -361,7 +361,7 @@ def profiled_dct_page_attention_forward(
     projected_kv_len = prev_len + q_len
 
     min_len_for_paging = max(
-        cfg.sink_size + cfg.page_size * (cfg.top_k + 1) + cfg.recent_size,
+        (cfg.num_sink_pages + cfg.top_k + 1 + cfg.num_recent_pages) * cfg.page_size,
         getattr(cfg, "min_decode_kv_len_for_paging", 0),
     )
     if projected_kv_len < min_len_for_paging:
@@ -541,11 +541,11 @@ def profiled_dct_page_attention_forward(
         _rec(7)
 
     if cfg.unselected_mode == "drop":
-        assembled_len = cfg.sink_size + actual_top_k * cfg.page_size + actual_recent
+        assembled_len = cfg.num_sink_pages * cfg.page_size + actual_top_k * cfg.page_size + actual_recent
     else:
         num_unselected = num_pages - actual_top_k
         middle_len = actual_top_k * cfg.page_size + num_unselected * comp_size
-        assembled_len = cfg.sink_size + middle_len + actual_recent
+        assembled_len = cfg.num_sink_pages * cfg.page_size + middle_len + actual_recent
 
     # Pre-allocate or expand output buffers (avoids torch.empty per step).
     # Only needed for the SDPA path — Quest reads directly from its own cache.
@@ -776,8 +776,8 @@ def parse_args():
     # DCT config
     p.add_argument("--page_size", type=int, default=32)
     p.add_argument("--top_k", type=int, default=64)
-    p.add_argument("--sink_size", type=int, default=4)
-    p.add_argument("--recent_size", type=int, default=128)
+    p.add_argument("--num_sink_pages", type=int, default=1)
+    p.add_argument("--num_recent_pages", type=int, default=5)
     p.add_argument("--compress_ratio", type=float, default=0.125)
     p.add_argument("--scoring_method", default="max", choices=["mean", "max"])
     p.add_argument("--group_agg_method", default="max", choices=["mean", "max"])
@@ -1018,15 +1018,10 @@ def run_profiled_decode(model, tokenizer, args, mode):
         num_qo_heads = cfg_model.num_attention_heads
         head_dim = cfg_model.hidden_size // num_qo_heads
         num_layers = cfg_model.num_hidden_layers
-        num_sink_pages = (args.sink_size + args.page_size - 1) // args.page_size
-        # Fixed number of EXPLICIT recent pages per step (strictly before
-        # last_page_idx; the partially-filled last page is attended via the
-        # kernel's paged_kv_last_page_* path on top of this). The variable
-        # count would oscillate between ceil(recent/ps) - 1 and ceil(recent/ps)
-        # + 1 over a page_size-cycle; fixing to the max keeps
-        # total_selected constant (required for CUDA-graph capture) and
-        # overshoots the recent window by ≤1 page on the partial-page steps.
-        num_recent_pages_fixed = (args.recent_size + args.page_size - 1) // args.page_size + 1
+        num_sink_pages = args.num_sink_pages
+        # num_recent_pages INCLUDES the currently-open page; fixing the count
+        # keeps total_selected constant (required for CUDA-graph capture).
+        num_recent_pages_fixed = args.num_recent_pages
         max_total_selected = num_sink_pages + args.top_k + num_recent_pages_fixed
         max_decode_steps = args.warmup_steps + args.num_decode_steps + 16
         print(f"  Building Quest paged cache (layers={num_layers}, "
@@ -1164,7 +1159,7 @@ def run_profiled_decode(model, tokenizer, args, mode):
 # ---------------------------------------------------------------------------
 # Print results
 # ---------------------------------------------------------------------------
-def print_profile(mode, avg_model_total, tok_s, timings, num_layers=32, cpu_timings=None):
+def print_profile(mode, avg_model_total, tok_s, timings, num_layers=32, cpu_timings=None, bsz=1):
     print(f"\n{'=' * 70}")
     print(f"PROFILE: {mode.upper()}")
     print(f"{'=' * 70}")
@@ -1180,8 +1175,19 @@ def print_profile(mode, avg_model_total, tok_s, timings, num_layers=32, cpu_timi
     # Attention total = exact sum of all steps (guaranteed by chained events)
     attn_total = sum(step_per_token.values())
 
-    print(f"  Attention total: {attn_total:.2f} ms/tok")
-    print(f"  Model total:     {avg_model_total:.2f} ms/tok  ({tok_s:.1f} tok/s)")
+    # `tok_s` is steps/sec (== `1000 / avg_model_total`). One step generates
+    # `bsz` tokens (one per batch element), so aggregate throughput is
+    # `bsz * tok_s`. At bsz=1 the two coincide. Print both to make the
+    # distinction explicit when bsz>1.
+    print(f"  Attention total: {attn_total:.2f} ms/step")
+    if bsz == 1:
+        print(f"  Model total:     {avg_model_total:.2f} ms/step  ({tok_s:.1f} tok/s)")
+    else:
+        agg_tok_s = tok_s * bsz
+        print(
+            f"  Model total:     {avg_model_total:.2f} ms/step  "
+            f"({tok_s:.1f} step/s, {agg_tok_s:.1f} agg tok/s @ bsz={bsz})"
+        )
     print()
 
     has_cpu = cpu_timings and len(cpu_timings) > 0

@@ -124,8 +124,8 @@ def parse_args():
     # DCT Page Attention params
     parser.add_argument("--page_size", type=int, default=16)
     parser.add_argument("--top_k", type=int, default=128)
-    parser.add_argument("--sink_size", type=int, default=4)
-    parser.add_argument("--recent_size", type=int, default=128)
+    parser.add_argument("--num_sink_pages", type=int, default=1)
+    parser.add_argument("--num_recent_pages", type=int, default=5)
     parser.add_argument("--compress_ratio", type=float, default=0.125)
     parser.add_argument("--scoring_method", type=str, default="max",
                         choices=["mean", "max"])
@@ -301,8 +301,8 @@ def apply_monkey_patch(args):
             replace_llama_attn(
                 page_size=args.page_size,
                 top_k=args.top_k,
-                sink_size=args.sink_size,
-                recent_size=args.recent_size,
+                num_sink_pages=args.num_sink_pages,
+                num_recent_pages=args.num_recent_pages,
                 compress_ratio=args.compress_ratio,
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,
@@ -320,8 +320,8 @@ def apply_monkey_patch(args):
             replace_qwen3_attn(
                 page_size=args.page_size,
                 top_k=args.top_k,
-                sink_size=args.sink_size,
-                recent_size=args.recent_size,
+                num_sink_pages=args.num_sink_pages,
+                num_recent_pages=args.num_recent_pages,
                 compress_ratio=args.compress_ratio,
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,
@@ -339,8 +339,8 @@ def apply_monkey_patch(args):
             replace_qwen2_attn(
                 page_size=args.page_size,
                 top_k=args.top_k,
-                sink_size=args.sink_size,
-                recent_size=args.recent_size,
+                num_sink_pages=args.num_sink_pages,
+                num_recent_pages=args.num_recent_pages,
                 compress_ratio=args.compress_ratio,
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,

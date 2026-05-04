@@ -1,0 +1,190 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1777874560161,
+  "projectRoot": "/home/yoongonkim/DCT-Page",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "requirements.txt"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": "pip",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": null,
+    "lintCommand": null,
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "__pycache__": {
+      "path": "__pycache__",
+      "purpose": null,
+      "fileCount": 27,
+      "lastAccessed": 1777874560156,
+      "keyFiles": [
+        "analyze_niah_page_ranks.cpython-312.pyc",
+        "analyze_selection_oracle_overlap.cpython-312.pyc",
+        "config.cpython-311.pyc",
+        "config.cpython-312.pyc",
+        "dct_page_attention.cpython-310.pyc"
+      ]
+    },
+    "baselines": {
+      "path": "baselines",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1777874560156,
+      "keyFiles": []
+    },
+    "benchmark": {
+      "path": "benchmark",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1777874560157,
+      "keyFiles": []
+    },
+    "observations": {
+      "path": "observations",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1777874560157,
+      "keyFiles": [
+        "dct_page_energy.py"
+      ]
+    },
+    "oracle": {
+      "path": "oracle",
+      "purpose": null,
+      "fileCount": 8,
+      "lastAccessed": 1777874560159,
+      "keyFiles": [
+        "attention_mass_recall_ruler.py",
+        "attention_mass_recall_ruler_quest.py",
+        "dc_ac_ruler.py",
+        "diagnose_scoring_methods.py",
+        "hybridmulti_ruler.py"
+      ]
+    },
+    "results": {
+      "path": "results",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1777874560159,
+      "keyFiles": [
+        "phase2c_nvtx.nsys-rep",
+        "phase2c_nvtx.sqlite"
+      ]
+    },
+    "results_attention_mass_recall": {
+      "path": "results_attention_mass_recall",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1777874560159,
+      "keyFiles": []
+    },
+    "results_quest_mass_recall": {
+      "path": "results_quest_mass_recall",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1777874560159,
+      "keyFiles": []
+    },
+    "results_ruler": {
+      "path": "results_ruler",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1777874560159,
+      "keyFiles": []
+    },
+    "speed": {
+      "path": "speed",
+      "purpose": null,
+      "fileCount": 9,
+      "lastAccessed": 1777874560160,
+      "keyFiles": [
+        "flashinfer_backend.py",
+        "profile_decode.py",
+        "profile_decode_flash_infer.py",
+        "profile_decode_upstream_flash_infer.py",
+        "quest_backend.py"
+      ]
+    },
+    "benchmark/data": {
+      "path": "benchmark/data",
+      "purpose": "Data files",
+      "fileCount": 0,
+      "lastAccessed": 1777874560160,
+      "keyFiles": []
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "speed/profile_decode_upstream_flash_infer.py",
+      "accessCount": 49,
+      "lastAccessed": 1777888512602,
+      "type": "file"
+    },
+    {
+      "path": "speed/upstream_flashinfer_backend.py",
+      "accessCount": 17,
+      "lastAccessed": 1777884425406,
+      "type": "file"
+    },
+    {
+      "path": "triton_kernels.py",
+      "accessCount": 9,
+      "lastAccessed": 1777884436646,
+      "type": "file"
+    },
+    {
+      "path": "speed/profile_decode_flash_infer.py",
+      "accessCount": 7,
+      "lastAccessed": 1777884437852,
+      "type": "file"
+    },
+    {
+      "path": "speed/flashinfer_backend.py",
+      "accessCount": 5,
+      "lastAccessed": 1777884425648,
+      "type": "file"
+    },
+    {
+      "path": "dct_page_attention.py",
+      "accessCount": 3,
+      "lastAccessed": 1777884437422,
+      "type": "file"
+    },
+    {
+      "path": "speed/profile_decode.py",
+      "accessCount": 3,
+      "lastAccessed": 1777887236722,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

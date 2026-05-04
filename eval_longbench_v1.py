@@ -400,22 +400,23 @@ def compute_effective_len(input_len, args):
 
     kv_len = input_len + 1  # first decode step adds one token to cache
 
-    min_len_for_paging = args.sink_size + args.page_size * (args.top_k + 1) + args.recent_size
+    min_len_for_paging = (args.num_sink_pages + args.top_k + 1 + args.num_recent_pages) * args.page_size
     if kv_len < min_len_for_paging:
         return kv_len
 
-    pageable_len = kv_len - args.sink_size - args.recent_size
+    sink_tokens = args.num_sink_pages * args.page_size
+    recent_tokens_min = (args.num_recent_pages - 1) * args.page_size
+    pageable_len = kv_len - sink_tokens - recent_tokens_min
     num_pages = pageable_len // args.page_size
-    leftover = pageable_len % args.page_size
-    actual_recent = args.recent_size + leftover
+    actual_recent = kv_len - sink_tokens - num_pages * args.page_size
     top_k = min(args.top_k, num_pages)
 
     if args.unselected_mode == "drop":
-        return args.sink_size + top_k * args.page_size + actual_recent
+        return sink_tokens + top_k * args.page_size + actual_recent
     elif args.unselected_mode == "compressed":
         comp_size = max(1, int(args.page_size * args.compress_ratio))
         num_unselected = num_pages - top_k
-        return args.sink_size + top_k * args.page_size + num_unselected * comp_size + actual_recent
+        return sink_tokens + top_k * args.page_size + num_unselected * comp_size + actual_recent
     else:
         return kv_len
 
@@ -452,8 +453,8 @@ def parse_args():
     # DCT Page Attention params (only used when mode=page_attention)
     parser.add_argument("--page_size", type=int, default=32)
     parser.add_argument("--top_k", type=int, default=64)
-    parser.add_argument("--sink_size", type=int, default=4)
-    parser.add_argument("--recent_size", type=int, default=128)
+    parser.add_argument("--num_sink_pages", type=int, default=1)
+    parser.add_argument("--num_recent_pages", type=int, default=5)
     parser.add_argument("--compress_ratio", type=float, default=0.03125)
     parser.add_argument("--scoring_method", type=str, default="max",
                         choices=["mean", "max"])
@@ -746,8 +747,8 @@ def main():
             replace_llama_attn(
                 page_size=args.page_size,
                 top_k=args.top_k,
-                sink_size=args.sink_size,
-                recent_size=args.recent_size,
+                num_sink_pages=args.num_sink_pages,
+                num_recent_pages=args.num_recent_pages,
                 compress_ratio=args.compress_ratio,
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,
@@ -764,8 +765,8 @@ def main():
             replace_qwen3_attn(
                 page_size=args.page_size,
                 top_k=args.top_k,
-                sink_size=args.sink_size,
-                recent_size=args.recent_size,
+                num_sink_pages=args.num_sink_pages,
+                num_recent_pages=args.num_recent_pages,
                 compress_ratio=args.compress_ratio,
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,
@@ -782,8 +783,8 @@ def main():
             replace_qwen2_attn(
                 page_size=args.page_size,
                 top_k=args.top_k,
-                sink_size=args.sink_size,
-                recent_size=args.recent_size,
+                num_sink_pages=args.num_sink_pages,
+                num_recent_pages=args.num_recent_pages,
                 compress_ratio=args.compress_ratio,
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,

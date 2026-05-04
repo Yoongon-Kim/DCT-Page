@@ -3,10 +3,10 @@ from dataclasses import dataclass
 
 @dataclass
 class DCTPageConfig:
-    page_size: int = 32            # Tokens per page
+    page_size: int = 32            # Tokens per page (sink/recent are page-counted)
     top_k: int = 64                # Pages selected for full attention
-    sink_size: int = 4             # Initial tokens always kept (attention sink)
-    recent_size: int = 128         # Recent tokens always kept (absorbs last partial page)
+    num_sink_pages: int = 1        # First N physical pages always attended (sink)
+    num_recent_pages: int = 5      # Last M physical pages always attended (recent), INCLUDES the currently-open partial page
     compress_ratio: float = 0.03125   # Per-page compression (32 -> 1 token)
     min_decode_kv_len_for_paging: int = 8192  # Fallback to baseline decode attention below this KV length
     scoring_method: str = "max"    # "mean" | "max" | "sum"

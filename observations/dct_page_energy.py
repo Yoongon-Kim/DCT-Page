@@ -341,8 +341,8 @@ def print_headline_table(run_name: str, summary: dict, page_size: int) -> None:
 def build_config(args: argparse.Namespace) -> DCTPageConfig:
     return DCTPageConfig(
         page_size=args.page_size,
-        sink_size=args.sink_size,
-        recent_size=args.recent_size,
+        num_sink_pages=args.num_sink_pages,
+        num_recent_pages=args.num_recent_pages,
     )
 
 
@@ -413,8 +413,8 @@ def run_measurement(args: argparse.Namespace) -> None:
         "task": args.task,
         "num_samples": args.num_samples,
         "page_size": args.page_size,
-        "sink_size": args.sink_size,
-        "recent_size": args.recent_size,
+        "num_sink_pages": args.num_sink_pages,
+        "num_recent_pages": args.num_recent_pages,
         "data_path": str(data_path),
         "run_name": run_name,
     }
@@ -436,8 +436,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--task", default="niah_single_1")
     p.add_argument("--num_samples", type=int, default=25)
     p.add_argument("--page_size", type=int, default=16)
-    p.add_argument("--sink_size", type=int, default=4)
-    p.add_argument("--recent_size", type=int, default=128)
+    p.add_argument("--num_sink_pages", type=int, default=1)
+    p.add_argument("--num_recent_pages", type=int, default=9)
     p.add_argument("--data_root", type=Path, default=_REPO_ROOT / "benchmark" / "data" / "ruler_data")
     p.add_argument("--output_dir", type=Path, default=_REPO_ROOT / "observations" / "results" / "dct_page_energy")
     p.add_argument("--run_name", default=None)

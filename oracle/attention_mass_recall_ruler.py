@@ -991,8 +991,8 @@ class MassRecallRecorder:
         num_decode_steps: int,
         page_size: int,
         top_k: int,
-        sink_size: int,
-        recent_size: int,
+        num_sink_pages: int,
+        num_recent_pages: int,
         comp_size: int,
         scoring_method: str,
         group_agg_method: str,
@@ -1003,8 +1003,8 @@ class MassRecallRecorder:
         self.num_decode_steps = num_decode_steps
         self.page_size = page_size
         self.top_k = top_k
-        self.sink_size = sink_size
-        self.recent_size = recent_size
+        self.num_sink_pages = num_sink_pages
+        self.num_recent_pages = num_recent_pages
         self.comp_size = comp_size
         self.scoring_method = scoring_method
         self.group_agg_method = group_agg_method
@@ -1032,13 +1032,13 @@ class MassRecallRecorder:
         assert H_q == H_kv * num_kv_groups
 
         # Segment [sink | paged | recent] exactly like DCT's segment_kv:
-        # fixed-length sink, fixed-length recent absorbing the alignment
-        # remainder, and the middle carved into whole pages of page_size.
-        sink_len = self.sink_size
-        if kv_len < sink_len + self.page_size + self.recent_size:
+        # whole-page sink, whole-page recent (last page may be partial absorbing
+        # the alignment remainder), and the middle carved into whole pages.
+        sink_len = self.num_sink_pages * self.page_size
+        recent_min = (self.num_recent_pages - 1) * self.page_size
+        if kv_len < sink_len + self.page_size + recent_min:
             return  # nothing meaningful to page
-        after_sink = kv_len - sink_len
-        num_pages = (after_sink - self.recent_size) // self.page_size
+        num_pages = (kv_len - sink_len - recent_min) // self.page_size
         if num_pages < 1:
             return
         actual_top_k = min(self.top_k, num_pages)
@@ -1160,8 +1160,8 @@ def generate_with_mass_traces(
     num_decode_steps: int,
     page_size: int,
     top_k: int,
-    sink_size: int,
-    recent_size: int,
+    num_sink_pages: int,
+    num_recent_pages: int,
     comp_size: int,
     scoring_method: str,
     group_agg_method: str,
@@ -1181,8 +1181,8 @@ def generate_with_mass_traces(
         num_decode_steps=num_decode_steps,
         page_size=page_size,
         top_k=top_k,
-        sink_size=sink_size,
-        recent_size=recent_size,
+        num_sink_pages=num_sink_pages,
+        num_recent_pages=num_recent_pages,
         comp_size=comp_size,
         scoring_method=scoring_method,
         group_agg_method=group_agg_method,
@@ -1227,8 +1227,8 @@ class PagedMassRatioSweepRecorder:
         num_decode_steps: int,
         page_size: int,
         top_k: int,
-        sink_size: int,
-        recent_size: int,
+        num_sink_pages: int,
+        num_recent_pages: int,
         comp_sizes: list[int],
         scoring_method: str,
         group_agg_method: str,
@@ -1236,8 +1236,8 @@ class PagedMassRatioSweepRecorder:
         self.num_decode_steps = num_decode_steps
         self.page_size = page_size
         self.top_k = top_k
-        self.sink_size = sink_size
-        self.recent_size = recent_size
+        self.num_sink_pages = num_sink_pages
+        self.num_recent_pages = num_recent_pages
         self.comp_sizes = list(comp_sizes)
         self.scoring_method = scoring_method
         self.group_agg_method = group_agg_method
@@ -1261,11 +1261,11 @@ class PagedMassRatioSweepRecorder:
         assert bsz == 1 and q_len == 1
         assert H_q == H_kv * num_kv_groups
 
-        sink_len = self.sink_size
-        if kv_len < sink_len + self.page_size + self.recent_size:
+        sink_len = self.num_sink_pages * self.page_size
+        recent_min = (self.num_recent_pages - 1) * self.page_size
+        if kv_len < sink_len + self.page_size + recent_min:
             return
-        after_sink = kv_len - sink_len
-        num_pages = (after_sink - self.recent_size) // self.page_size
+        num_pages = (kv_len - sink_len - recent_min) // self.page_size
         if num_pages < 1:
             return
         actual_top_k = min(self.top_k, num_pages)
@@ -1333,8 +1333,8 @@ def generate_with_paged_mass_ratio_sweep(
     num_decode_steps: int,
     page_size: int,
     top_k: int,
-    sink_size: int,
-    recent_size: int,
+    num_sink_pages: int,
+    num_recent_pages: int,
     comp_sizes: list[int],
     scoring_method: str,
     group_agg_method: str,
@@ -1351,8 +1351,8 @@ def generate_with_paged_mass_ratio_sweep(
         num_decode_steps=num_decode_steps,
         page_size=page_size,
         top_k=top_k,
-        sink_size=sink_size,
-        recent_size=recent_size,
+        num_sink_pages=num_sink_pages,
+        num_recent_pages=num_recent_pages,
         comp_sizes=comp_sizes,
         scoring_method=scoring_method,
         group_agg_method=group_agg_method,
@@ -1400,8 +1400,8 @@ def parse_args() -> argparse.Namespace:
     # Page layout + proxy scoring config (no DCT output path involved).
     p.add_argument("--page_size", type=int, default=16)
     p.add_argument("--top_k", type=int, default=128)
-    p.add_argument("--sink_size", type=int, default=4)
-    p.add_argument("--recent_size", type=int, default=128)
+    p.add_argument("--num_sink_pages", type=int, default=1)
+    p.add_argument("--num_recent_pages", type=int, default=9)
     p.add_argument("--compress_ratio", type=float, default=0.125,
                    help="Haar proxy compression ratio; comp_size = "
                         "max(1, int(page_size * compress_ratio)).")
@@ -1665,8 +1665,8 @@ def _run_comp_size_sweep(args: argparse.Namespace) -> None:
                     num_decode_steps=args.num_decode_steps,
                     page_size=args.page_size,
                     top_k=args.top_k,
-                    sink_size=args.sink_size,
-                    recent_size=args.recent_size,
+                    num_sink_pages=args.num_sink_pages,
+                    num_recent_pages=args.num_recent_pages,
                     comp_sizes=comp_sizes,
                     scoring_method=args.scoring_method,
                     group_agg_method=args.group_agg_method,
@@ -1971,8 +1971,8 @@ def main() -> None:
                     num_decode_steps=args.num_decode_steps,
                     page_size=args.page_size,
                     top_k=args.top_k,
-                    sink_size=args.sink_size,
-                    recent_size=args.recent_size,
+                    num_sink_pages=args.num_sink_pages,
+                    num_recent_pages=args.num_recent_pages,
                     comp_size=comp_size,
                     scoring_method=args.scoring_method,
                     group_agg_method=args.group_agg_method,
@@ -2120,8 +2120,8 @@ def main() -> None:
                 "num_decode_steps": args.num_decode_steps,
                 "page_size": args.page_size,
                 "top_k": args.top_k,
-                "sink_size": args.sink_size,
-                "recent_size": args.recent_size,
+                "num_sink_pages": args.num_sink_pages,
+                "num_recent_pages": args.num_recent_pages,
                 "compress_ratio": args.compress_ratio,
                 "comp_size": comp_size,
                 "scoring_method": args.scoring_method,

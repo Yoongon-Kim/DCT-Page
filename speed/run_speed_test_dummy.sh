@@ -10,8 +10,8 @@ OUTPUT_DIR="${OUTPUT_DIR:-results/speed_test_dummy}"
 
 # Fixed DCT parameters
 PAGE_SIZE=128
-SINK_SIZE=4
-RECENT_SIZE=128
+NUM_SINK_PAGES=1
+NUM_RECENT_PAGES=2
 
 COMMON_ARGS="--model $MODEL \
     --context_lengths $CONTEXT_LENGTHS \
@@ -42,8 +42,8 @@ for COMPRESS_RATIO in 0.032; do
                                 --mode dct \
                                 $COMMON_ARGS \
                                 --page_size        $PAGE_SIZE \
-                                --sink_size        $SINK_SIZE \
-                                --recent_size      $RECENT_SIZE \
+                                --num_sink_pages   $NUM_SINK_PAGES \
+                                --num_recent_pages $NUM_RECENT_PAGES \
                                 --compress_ratio   $COMPRESS_RATIO \
                                 --top_k            $TOP_K \
                                 --scoring_method   $SCORING \
