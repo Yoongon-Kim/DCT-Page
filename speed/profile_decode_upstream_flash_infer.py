@@ -473,6 +473,61 @@ def _reset_mode_state():
     _pd._current_layer = 0
 
 
+def _probe_event_record_in_graph(device) -> bool:
+    """Returns True iff cudaEventRecord inside torch.cuda.graph capture
+    is supported on this torch+CUDA+driver combo. Probe is FI-state-free
+    (two events + a no-op graph on an explicit non-default stream).
+
+    Dual-purpose: gate for Option A (events) AND a documented capability
+    stub. See feedback_event_in_graph_unsupported.md."""
+    try:
+        probe_g = torch.cuda.CUDAGraph()
+        probe_s = torch.cuda.Event(enable_timing=True)
+        probe_e = torch.cuda.Event(enable_timing=True)
+        s_probe = torch.cuda.Stream(device=device)
+        s_probe.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(s_probe), torch.cuda.graph(probe_g):
+            probe_s.record()
+            probe_e.record()
+        torch.cuda.current_stream(device).wait_stream(s_probe)
+        probe_g.replay()
+        torch.cuda.synchronize(device)
+        # Back-to-back records can legitimately yield 0.0 ms; gate on < 0.
+        ok = probe_s.elapsed_time(probe_e) >= 0
+        # C3: explicit cleanup of probe locals so the empty captured graph
+        # and its events drop their refs immediately rather than at GC.
+        del probe_g, probe_s, probe_e, s_probe
+        return ok
+    except Exception:
+        return False
+
+
+class _CudagraphBreakdownToggle:
+    """Enable `_pd._enabled` (with `_pd._sync_mode` forced off) for the
+    duration of a CUDA-graph priming + capture block, so the chained-event
+    chain in `profiled_dct_upstream_flashinfer_forward` records into the
+    captured graph.
+
+    Do NOT call `_pd._flush_events()` inside the cudagraph block — the
+    read-after-final-replay pattern requires `_pending_events` to retain
+    its capture-time entries until the explicit walk. `_flush_events()`
+    clears the list and would break the readout.
+    """
+
+    def __enter__(self):
+        self._old_enabled = _pd._enabled
+        self._old_sync_mode = _pd._sync_mode
+        _pd._enabled = True
+        _pd._sync_mode = False
+        _pd._pending_events.clear()  # discard stale events from previous mode
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        _pd._enabled = self._old_enabled
+        _pd._sync_mode = self._old_sync_mode
+        return False
+
+
 def _fi_cache_for_mode(mode):
     """Return the active FI cache for the given mode, or None.
 
@@ -559,6 +614,58 @@ def parse_args():
                         "time so graph capture is safe by construction.")
     p.add_argument("--cudagraph_replays", type=int, default=0)
     p.add_argument("--torch_profiler_trace", default=None)
+    p.add_argument("--cudagraph_breakdown", action="store_true",
+                   help="Capture per-attention-substep CUDA events inside "
+                        "the captured graph and report them after replay. "
+                        "Implies `--cudagraph`. Forces `--sync` off inside "
+                        "capture (sync is not graph-capturable). Sibling "
+                        "driver `profile_decode_flash_infer.py` lacks the "
+                        "same flag — fork-FI variant is a follow-up PR.")
+    p.add_argument("--cudagraph_breakdown_method",
+                   choices=["profiler", "events"], default="profiler",
+                   help="Breakdown mechanism. `profiler` (default): wrap "
+                        "timed g.replay() loop in torch.profiler, bucket "
+                        "kernel-level CUPTI activity into attention substeps "
+                        "by kernel name. `events`: in-graph CUDA events "
+                        "(Option A — dormant on this build per "
+                        "feedback_event_in_graph_unsupported.md; auto-rearms "
+                        "if a future torch/CUDA bump re-enables event-record "
+                        "during graph capture).")
+    p.add_argument("--cudagraph_breakdown_disambig",
+                   choices=["merge", "ordering"], default="merge",
+                   help="cublasLt gemm bucket strategy (profiler method only). "
+                        "`merge` (default): collapse ALL cublasLt gemms (qkv + "
+                        "o_proj + MLP gate/up/down + lm_head) into one "
+                        "`gemm_total` bucket — fully kernel-name grounded but "
+                        "not attention-scoped. `ordering`: split into `1_qkv_proj` and "
+                        "`8_o_proj` via per-launch ordering within each layer "
+                        "window (boundary marker = `_score_pages_*_kernel`). "
+                        "8 rows matching eager column shape. Heuristic — "
+                        "see Step 4 comment block for the off-by-one rule. "
+                        "Auto-falls back to `merge` if cublasLt-count canary "
+                        "fails.")
+    p.add_argument("--cudagraph_breakdown_dump_kernels",
+                   action="store_true", default=False,
+                   help="Diagnostic: after replay, print all CUPTI kernel names "
+                        "+ counts from prof.events() for one replay window. "
+                        "Use when the residual line warns the bucket dict is "
+                        "stale (kernel renames across torch/triton/flashinfer "
+                        "versions).")
+    p.add_argument("--cudagraph_breakdown_seal_microbench",
+                   action="store_true", default=False,
+                   help="After graph capture, run a same-process eager forced-seal "
+                        "microbench of _update_comp_cache to produce a truth row "
+                        "for the 4_compress reconciliation block. See Plan v3 "
+                        "(cudagraph-substep-breakdown.md). No-op when flag is absent "
+                        "(byte-identical to pre-edit default output).")
+    p.add_argument("--cudagraph_breakdown_seal_microbench_iters",
+                   type=int, default=100,
+                   help="Number of timed forced-seal _update_comp_cache calls "
+                        "(default 100). Higher = lower variance.")
+    p.add_argument("--cudagraph_breakdown_seal_microbench_warmup",
+                   type=int, default=5,
+                   help="Discarded warmup forced-seal calls before timing begins "
+                        "(default 5). Absorbs slow-path realloc + Triton JIT.")
 
     return p.parse_args()
 
@@ -626,6 +733,396 @@ def _patch_dct_upstream_flashinfer(model, args, original_forward):
     attn_cls = transformers.models.llama.modeling_llama.LlamaAttention
     attn_cls.forward = profiled_dct_upstream_flashinfer_forward
     _rebind_instance_forward(model, attn_cls, profiled_dct_upstream_flashinfer_forward)
+
+
+# ---------------------------------------------------------------------------
+# Eager forced-seal microbench for 4_compress reconciliation (Plan v3).
+#
+# Why needed: the captured graph always replays non-sealing steps (alignment
+# ensures last_page_len <= page_size - 4), so bucket 4_compress in the graph
+# row is structurally ~0.  Without a direct measurement the reconciliation
+# table would show "graph ≈0, eager-avg ≈ t_seal/ps" and imply the graph
+# eliminated compression cost — misleading.  This helper measures the actual
+# per-seal GPU time directly by forcing n_new=1 each iteration.
+#
+# Runs AFTER graph capture+replay, BEFORE the printer call.
+# Eager mode means it uses the standard caching allocator — no graph
+# stream-private pool hazard.
+# ---------------------------------------------------------------------------
+def _run_seal_microbench(model, fi_cache, attn_modules, args, num_layers):
+    # _dct_page_cfg is a module-level global, NOT an attn_module attribute.
+    from dct_page_attention import _dct_page_cfg as cfg
+    if cfg is None:
+        print("[ERROR] seal microbench: DCT patch not active (_dct_page_cfg is None)")
+        return None
+    if not attn_modules:
+        print("[ERROR] seal microbench: no DCT attention modules found; mode is likely baseline")
+        return None
+
+    # Use layer-0 attn_module for determinism across torch versions / refactors.
+    attn_module = attn_modules[0]
+
+    # Derive arguments the forward uses at decode time (drop mode only here;
+    # argparse restricts choices=["drop"] so compressed path is unreachable).
+    comp_size = max(1, int(cfg.page_size * cfg.compress_ratio))
+    page_size = cfg.page_size
+
+    # Build paged_k / paged_v views from the live FI cache buffer.
+    # fi_cache.buf_views[0] is 7-D: (B, H, P, 2, ps, 1, d); see
+    # speed/upstream_flashinfer_backend.py:93. Axis 3: 0=K, 1=V. Axis 5 is a
+    # singleton retained for the FI 7-D layout — index with 0 to drop it so
+    # _update_comp_cache (which expects 5-D [B, H, num_pages, ps, d]) is happy.
+    buf = fi_cache.buf_views[0]
+    sink = cfg.num_sink_pages
+    recent = cfg.num_recent_pages
+    last_idx = fi_cache.last_page_idx_py  # index of the currently-open page
+    # num_pages = pages EXCLUDING sink and recent (the "paged" region scored by DCT).
+    num_pages = last_idx - sink - recent + 1
+    if num_pages <= 0:
+        print(f"[INFO] seal microbench: num_pages={num_pages} <= 0; context too short "
+              f"for seal microbench (need at least sink+recent+1 pages). Skipping.")
+        return None
+
+    paged_k = buf[:, :, sink:sink + num_pages, 0, :, 0, :]  # [B, H, num_pages, ps, d]
+    paged_v = buf[:, :, sink:sink + num_pages, 1, :, 0, :]  # [B, H, num_pages, ps, d]
+
+    # Stash original cache state so we can restore it after the microbench.
+    original_n_cached = getattr(attn_module, '_comp_n_pages_cached', 0)
+
+    iters = args.cudagraph_breakdown_seal_microbench_iters
+    warmup = args.cudagraph_breakdown_seal_microbench_warmup
+
+    # Warmup: absorbs slow-path realloc (first fire) + Triton JIT compilation.
+    # Discard timing.
+    for _ in range(warmup):
+        attn_module._comp_n_pages_cached = num_pages - 1  # force n_new=1
+        _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
+    torch.cuda.synchronize()
+
+    # Timed loop: single event pair around all `iters` calls, divide at end.
+    # Slow-path auto-writes _comp_n_pages_cached = num_pages at L722 of
+    # dct_page_attention.py; the manual reset to num_pages-1 inside the loop
+    # is what forces n_new=1 each iteration.
+    start_ev = torch.cuda.Event(enable_timing=True)
+    end_ev = torch.cuda.Event(enable_timing=True)
+    start_ev.record()
+    for _ in range(iters):
+        attn_module._comp_n_pages_cached = num_pages - 1
+        _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
+    end_ev.record()
+    torch.cuda.synchronize()
+
+    t_seal_per_layer_ms = start_ev.elapsed_time(end_ev) / iters
+
+    # Defensive teardown: restore both _comp_n_pages_cached AND _last_comp_kv.
+    # The slow-path writes _last_comp_kv = result (dct_page_attention.py:740/753);
+    # the live-forward fast-path (L563) returns it without recomputing.  Without
+    # clearing _last_comp_kv, the next real decode step receives microbench-mutated
+    # cache identity.
+    attn_module._comp_n_pages_cached = original_n_cached
+    attn_module._last_comp_kv = None
+
+    amortized_per_layer_ms = t_seal_per_layer_ms / page_size
+    amortized_total_ms = amortized_per_layer_ms * num_layers
+
+    return {
+        "t_seal_per_layer_ms": t_seal_per_layer_ms,
+        "iters": iters,
+        "page_size": page_size,
+        "num_layers": num_layers,
+        "amortized_per_step_per_layer_ms": amortized_per_layer_ms,
+        "amortized_per_step_total_ms": amortized_total_ms,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CUDA-graph per-substep breakdown printer (adjacent to the --cudagraph block)
+# ---------------------------------------------------------------------------
+def _print_graph_breakdown(
+    per_replay_ms,
+    substep_per_token,
+    num_layers,
+    bsz,
+    all_kernel_sum_ms_per_step=None,
+    eager_per_token=None,
+    seal_microbench=None,
+):
+    print(f"\n{'=' * 70}")
+    print(f"PROFILE: DCT_UPSTREAM_FLASHINFER (CUDA GRAPH)")
+    print(f"{'=' * 70}")
+    # C2 legend: distinguishes the two reconciliation lines that follow.
+    # `non_attn_residual` ≈ MLP + layernorm + lm_head (real, non-attention work
+    #     captured by per_replay but not by the attention-bucket sum).
+    # `residual` (All-kernel reconciliation) ≈ unbucketed CUPTI activity time
+    #     vs per_replay; this is a *bucketing integrity check* — large values
+    #     mean the kernel-name → bucket dict missed kernels (likely renamed),
+    #     not real un-instrumented work.
+    if bsz == 1:
+        print(f"  Attention total (graph): "
+              f"{sum(substep_per_token.values()):.3f} ms/step")
+        print(f"  Per-replay (graph):      {per_replay_ms:.3f} ms/step")
+    else:
+        agg = bsz / per_replay_ms * 1000.0
+        print(f"  Attention total (graph): "
+              f"{sum(substep_per_token.values()):.3f} ms/step")
+        print(f"  Per-replay (graph):      {per_replay_ms:.3f} ms/step  "
+              f"({agg:.1f} agg tok/s @ bsz={bsz})")
+    print()
+    attn_total = sum(substep_per_token.values())
+    print(f"  {'Step':<25} {'Per-token (ms)':>15} {'% of attn':>12}")
+    print(f"  {'-' * 25} {'-' * 15} {'-' * 12}")
+    for name in sorted(substep_per_token.keys()):
+        per_token = substep_per_token[name]
+        pct = per_token / attn_total * 100 if attn_total > 0 else 0.0
+        print(f"  {name:<25} {per_token:>15.3f} {pct:>11.1f}%")
+    print(f"  {'-' * 25} {'-' * 15} {'-' * 12}")
+    print(f"  {'TOTAL':<25} {attn_total:>15.3f} {'100.0':>11}%")
+    residual = max(0.0, per_replay_ms - attn_total)
+    pct = (residual / per_replay_ms * 100) if per_replay_ms > 0 else 0.0
+    # mod 8 — rename: this is the attention-only reconciliation (the residual
+    # here is real non-attention work like MLP/layernorm/lm_head).
+    print(
+        f"  Graph-mode reconciliation (attn-only): "
+        f"substep_sum={attn_total:.3f} ms/step, "
+        f"per_replay={per_replay_ms:.3f} ms/step, "
+        f"non_attn_residual={residual:.3f} ms ({pct:.1f}%)"
+    )
+    # NEW: All-kernel reconciliation = bucketing integrity check.
+    if all_kernel_sum_ms_per_step is not None:
+        residual_full = max(0.0, per_replay_ms - all_kernel_sum_ms_per_step)
+        pct_full = (residual_full / per_replay_ms * 100) if per_replay_ms > 0 else 0.0
+        print(
+            f"  All-kernel reconciliation: "
+            f"all_kernel_sum={all_kernel_sum_ms_per_step:.3f} ms/step, "
+            f"per_replay={per_replay_ms:.3f} ms/step, "
+            f"residual={residual_full:.3f} ms ({pct_full:.1f}%)  "
+            f"# integrity check; should match within ~5%"
+        )
+        # mod 5 — residual-based escalation.
+        if per_replay_ms > 0 and (residual_full / per_replay_ms) > 0.25:
+            print(
+                "  [INFO] kernel-name dict likely stale; rerun with "
+                "--cudagraph_breakdown_dump_kernels to discover renames."
+            )
+    # NEW: per-substep eager_ms / graph_ms ratio table — disambig sanity check.
+    #
+    # Unit reconciliation: `eager_per_token[name]` is per-LAYER-per-step
+    # (each of the N decoder layers records its own substep events into
+    # `_pd._step_timings`, and the eager-stash averages those without summing
+    # across layers). `substep_per_token[name]` is per-STEP TOTAL (sum over
+    # all layers, divided by num_replays). To compare on equal footing, we
+    # scale the eager value up to per-step by multiplying by `num_layers`.
+    if eager_per_token:
+        print()
+        print(f"  {'Step':<25} {'eager (ms)':>12} {'graph (ms)':>12} "
+              f"{'ratio':>8}")
+        print(f"  {'-' * 25} {'-' * 12} {'-' * 12} {'-' * 8}")
+        # Critical substeps for disambig sanity (1 launch / layer / step).
+        # `7_upstream_fi_run` is INTENTIONALLY EXCLUDED: it groups multiple FI
+        # kernels (BatchDecode + MergeStates) plus per-call setup. CUDA graphs
+        # eliminate the per-FI-call CPU dispatch overhead between those
+        # sub-kernels, so the graph/eager ratio is structurally ~0.3-0.4 (the
+        # speedup is real, not a bucketing defect).
+        critical = {"5_score_pages_kernel", "6_topk_and_pack"}
+        if substep_per_token.get("1_qkv_proj") is not None:
+            # Ordering-mode disambig produces these two; merge-mode uses
+            # `gemm_total` instead and they're absent.
+            critical |= {"1_qkv_proj", "8_o_proj"}
+        out_of_band = False
+        for name in sorted(set(substep_per_token.keys()) | set(eager_per_token.keys())):
+            e_ms_per_layer = eager_per_token.get(name)
+            g_ms = substep_per_token.get(name)
+            if e_ms_per_layer is None or g_ms is None:
+                # Skip substeps with no counterpart (e.g. merged `gemm_total`
+                # has no eager peer; eager `1_qkv_proj`/`8_o_proj` have no
+                # graph peer in merge mode). Mentioned in plan Step 5.
+                continue
+            # Scale eager up to per-step (sum across layers) to match graph.
+            e_ms_per_step = e_ms_per_layer * num_layers
+            ratio = g_ms / e_ms_per_step if e_ms_per_step > 0 else float('inf')
+            print(f"  {name:<25} {e_ms_per_step:>12.3f} {g_ms:>12.3f} "
+                  f"{ratio:>8.2f}")
+            if name in critical and (ratio < 0.5 or ratio > 2.0):
+                out_of_band = True
+        if out_of_band:
+            print(
+                "  [INFO] disambig may be wrong, rerun with "
+                "--cudagraph_breakdown_dump_kernels"
+            )
+
+    # 4_compress reconciliation block (Plan v3).
+    # Only printed when --cudagraph_breakdown_seal_microbench is active.
+    # With flag off, seal_microbench=None and this block is skipped entirely
+    # (byte-identity with pre-edit default output preserved).
+    if seal_microbench is not None:
+        graph_4c = substep_per_token.get("4_compress", 0.0)
+        eager_4c_per_step = (
+            eager_per_token.get("4_compress", 0.0) * num_layers
+            if eager_per_token else 0.0
+        )
+        forced_truth = seal_microbench["amortized_per_step_total_ms"]
+        mb_iters = seal_microbench["iters"]
+        mb_ps = seal_microbench["page_size"]
+        print()
+        print("  Compression reconciliation (4_compress):")
+        print(f"    graph (captured, fast-path):                  "
+              f"{graph_4c:.3f} ms/step"
+              f"    # ~0 by design (non-sealing steps captured)")
+        print(f"    eager average over all steps x layers:        "
+              f"{eager_4c_per_step:.3f} ms/step"
+              f"    # = t_seal/ps x layers (in expectation)")
+        print(f"    forced-seal microbench / page_size x layers:  "
+              f"{forced_truth:.3f} ms/step"
+              f"    # truth (direct measurement, n={mb_iters})")
+        print(f"    note: page_size={mb_ps}, microbench_iters={mb_iters}, "
+              f"num_layers={num_layers}")
+        # Plausibility advisory: runtime-derived window from eager average.
+        # Fallback [0.05, 5.0] ms/step only when eager average is unavailable.
+        if eager_4c_per_step > 0:
+            lo, hi = eager_4c_per_step / 2.0, eager_4c_per_step * 2.0
+        else:
+            lo, hi = 0.05, 5.0
+        if not (lo <= forced_truth <= hi):
+            print(
+                f"  [INFO] forced-seal/ps ({forced_truth:.3f} ms/step) outside "
+                f"+-2x eager avg [{lo:.3f}, {hi:.3f}]; consider verifying with nsys."
+            )
+
+    # DCT-only attention substeps. {3, 4, 5, 6, 7} is the work that REPLACES
+    # SDPA full attention (page segmenting, page compression, scoring, top-k
+    # selection, paged FI run). Substeps {1, 2, 8} are model-shared (qkv, RoPE
+    # + cache append, o_proj) and would run in any attention method, so they
+    # are excluded from this comparison. Sum this against the equivalent SDPA
+    # attention latency (run with `attention_backend=sdpa` baseline) to see
+    # the per-step cost of DCT vs full-KV attention.
+    DCT_ATTN_SUBSTEPS = (
+        "3_segment", "4_compress", "5_score_pages_kernel",
+        "6_topk_and_pack", "7_upstream_fi_run",
+    )
+    graph_dct_sum = sum(
+        substep_per_token.get(name, 0.0) for name in DCT_ATTN_SUBSTEPS
+    )
+    eager_dct_sum_per_step = None
+    if eager_per_token:
+        eager_dct_sum_per_step = sum(
+            eager_per_token.get(name, 0.0) * num_layers
+            for name in DCT_ATTN_SUBSTEPS
+        )
+    print()
+    print("  DCT-only attention substeps (3+4+5+6+7) — REPLACES SDPA full "
+          "attention:")
+    if eager_dct_sum_per_step is not None and eager_dct_sum_per_step > 0:
+        speedup = eager_dct_sum_per_step / graph_dct_sum if graph_dct_sum > 0 else float("inf")
+        print(f"    eager DCT total: {eager_dct_sum_per_step:>7.3f} ms/step  "
+              f"(per-layer × {num_layers} layers)")
+        print(f"    graph DCT total: {graph_dct_sum:>7.3f} ms/step  "
+              f"(graph speedup: {speedup:.2f}x)")
+    else:
+        print(f"    graph DCT total: {graph_dct_sum:>7.3f} ms/step")
+    print("    Compare against SDPA full-attention latency (same model + "
+          "context, attention_backend=sdpa) to evaluate DCT replacement cost.")
+
+
+# ---------------------------------------------------------------------------
+# CUDA-graph torch.profiler bucketing (Option B path).
+#
+# Maps CUPTI kernel names emitted by the captured DCT-upstream-FlashInfer
+# forward into the 8 attention substep buckets defined by
+# `profiled_dct_upstream_flashinfer_forward`'s event chain:
+#
+#   1_qkv_proj                  : cublasLt gemm (FIRST per layer; see disambig)
+#   2_rope_and_cache_append     : RoPE element-wise kernels + index_copy
+#   3_segment                   : stride-only view (no kernel — empty bucket)
+#   4_compress                  : Triton _update_comp_cache kernel(s)
+#   5_score_pages_kernel        : Triton `_score_pages_<scoring>_<group_agg>_kernel`
+#                                 (e.g. `_score_pages_max_max_kernel`)
+#   6_topk_and_pack             : Triton `_topk_sort_and_pack_kernel`
+#                                 (single fused kernel — topk + pack)
+#   7_upstream_fi_run           : flashinfer batch_prefill / batch_decode
+#                                 kernel + index_copy_ for K/V write
+#   8_o_proj                    : cublasLt gemm (LAST per layer; see disambig)
+#
+# Kernel-name signatures observed (this box, torch 2.10 + flashinfer 0.2 +
+# triton 3.6, captured via prof.events() on a 32K Llama-3.1-8B step):
+#
+#   - cublasLt gemm:   "ampere_h16816gemm_..." or "ampere_bf16_s16816gemm_..."
+#                      or "void at::native::elementwise_kernel<...>" (epilogue)
+#   - RoPE:            "void at::native::vectorized_elementwise_kernel<..."
+#                      — DELIBERATELY UNMAPPED. This generic elementwise kernel
+#                      fires for SiLU, residuals, RMSNorm internals, RoPE
+#                      complex-multiplies, AND MLP activations. Mapping it to
+#                      `2_rope_and_cache_append` would inflate that bucket
+#                      with MLP work and corrupt the {5,6,7} ratio checks.
+#                      RoPE elementwise multiplies currently land in
+#                      `non_attn_residual` (i.e. they show up in
+#                      all_kernel_sum but not in any attn-bucket). Positional
+#                      disambiguation (assign elementwise-kernel events to
+#                      their layer-window position) is a future enhancement —
+#                      see Follow-up: positional-window bucketing.
+#   - index_copy:      "void at::native::index_kernel<...>" or
+#                      "void at::native::indexing_backward_kernel<...>"
+#   - _update_comp_cache:    "_update_comp_cache_kernel" (Triton, exact name)
+#   - _score_pages_*:        "_score_pages_<scoring>_<group_agg>_kernel"
+#                            (Triton; specialized per `scoring_method` x
+#                            `group_agg_method`, e.g. `_score_pages_max_max_kernel`,
+#                            `_score_pages_max_mean_kernel`, plus `*_c4_g4` /
+#                            `*_c1_g4` constexpr specializations). We match by
+#                            the `_score_pages_` prefix to cover all variants.
+#   - _topk_sort_and_pack:   "_topk_sort_and_pack_kernel" (Triton, single
+#                            fused kernel — topk + pack are not separate
+#                            kernels in the current codebase).
+#   - flashinfer:            "flashinfer::BatchDecodeWithPagedKVCacheKernel"
+#                            (also an internal "_apply_pos_encoding_inplace"
+#                            but our cache path bypasses it — unused).
+#                            Plus "PersistentVariableLengthMergeStatesKernel":
+#                            on the upstream-FI virtual-batch-per-(b, h) layout
+#                            FI runs a split-kv decode whose partial outputs
+#                            are merged by a separate merge-states kernel —
+#                            observed empirically (32 layers × N replays).
+#                            Both kernels MUST be bucketed into 7_upstream_fi_run
+#                            or the ratio falls under the [0.5, 2.0] band.
+#
+# IMPORTANT: kernel names are subject to change across torch/triton/flashinfer
+# versions. The bucketing function (Step 4) hard-asserts two canaries:
+#   - `5_score_pages_kernel` count == num_layers * num_replays (boundary anchor)
+#   - cublasLt count per layer window matches the expected layout
+#     (3 for window 0, 4 for windows 1..N-1) — only enforced when
+#     --cudagraph_breakdown_disambig=ordering is set.
+# Either canary failing forces fallback to merged `gemm_total` and prints an
+# INFO line. The diagnostic flag --cudagraph_breakdown_dump_kernels prints
+# all kernel names + counts after one replay window so the user can update
+# this dict when names drift.
+
+_SUBSTEP_NAME_PATTERNS = {
+    # Triton kernels (substring match against the demangled kernel name)
+    "_update_comp_cache_kernel":   "4_compress",
+    # Score-pages: substring covers all `_score_pages_<scoring>_<group_agg>_kernel`
+    # specializations (e.g. `_score_pages_max_max_kernel`, plus `*_c4_g4` /
+    # `*_c1_g4` constexpr variants).
+    "_score_pages_":               "5_score_pages_kernel",
+    # Topk + pack are fused into a single kernel in the current codebase.
+    "_topk_sort_and_pack_kernel":  "6_topk_and_pack",
+    # FlashInfer — both the decode kernel AND the merge-states kernel
+    # (split-kv path on the virtual-batch-per-(b, h) layout) must land here.
+    "BatchDecodeWithPagedKVCacheKernel": "7_upstream_fi_run",
+    "PersistentVariableLengthMergeStatesKernel": "7_upstream_fi_run",
+    # Cache append (index_copy_). RoPE's `vectorized_elementwise_kernel` is
+    # DELIBERATELY UNMAPPED — see the comment block above.
+    "index_kernel":                "2_rope_and_cache_append",
+}
+# cublasLt gemms: by default merged into a single `gemm_total` bucket. This
+# bucket includes ALL cublasLt matmuls in the captured forward — attention
+# (qkv + o_proj), MLP (gate + up + down), AND lm_head — because they share the
+# same kernel name and cannot be distinguished by name alone. The bucket is
+# therefore NOT attention-scoped; expect it to dwarf the attention substeps
+# because MLP is ~3 gemms per layer (vs attention's 2). The eager profile's
+# `1_qkv_proj` + `8_o_proj` rows give the attention-only gemm cost for cross-
+# checking.
+#
+# If --cudagraph_breakdown_disambig=ordering is set, the bucket is split into
+# 1_qkv_proj / 8_o_proj via per-launch ordering — see Step 4 layer-window
+# comment. In ordering mode, MLP and lm_head gemms are explicitly skipped.
+_CUBLASLT_PATTERNS = ("gemm", "cutlass", "ampere_")  # case-insensitive
 
 
 # ---------------------------------------------------------------------------
@@ -778,6 +1275,17 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
     for step in range(args.num_decode_steps):
         _do_one_decode_step(args.warmup_steps + step, profiled=True)
     _pd._enabled = False
+    # B1: stash per-substep eager averages BEFORE the cudagraph block so the
+    # graph-mode bucketer can compute eager_ms / graph_ms ratios as a disambig
+    # sanity check. Reads from `_pd._step_timings` populated by the eager
+    # forward's `_pd._flush_events()` call (deque of per-step ms, one entry
+    # per substep per step). MUST live here in `_run_one_mode` (not in
+    # `main()`); placing it near `print_profile` would be too late — bucketer
+    # below reads it during this same `_run_one_mode` invocation.
+    _pd._last_eager_per_token = {
+        name: sum(t) / len(t)
+        for name, t in _pd._step_timings.items() if t
+    }
     torch.cuda.synchronize(device)
 
     avg_total = sum(total_times) / len(total_times)
@@ -871,6 +1379,22 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
                 f"(last_page_len={fi_cache.last_page_len_py}/{ps})"
             )
 
+        # The probe is the original Option A capability probe (event-record-
+        # in-graph). It stays in tree because Option A is correct on hardware/torch
+        # versions where event-record-in-graph works (NOT this box per
+        # feedback_event_in_graph_unsupported.md, but plausibly future versions).
+        # When --cudagraph_breakdown_method == "events" we call the probe and gate
+        # the feature on it; when == "profiler" (default) we skip the probe and
+        # use torch.profiler instead (Step 2).
+        if args.cudagraph_breakdown and args.cudagraph_breakdown_method == "events":
+            if not _probe_event_record_in_graph(device):
+                print(
+                    "[INFO] CUDA graph breakdown unsupported on this build "
+                    "(cudaEventRecord-in-graph silently dropped); disabling "
+                    "--cudagraph_breakdown"
+                )
+                args.cudagraph_breakdown = False
+
         torch.cuda.synchronize(device)
         num_replays = args.cudagraph_replays or args.num_decode_steps
         current_pos = (
@@ -880,44 +1404,327 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
         static_input = next_token.clone()
         static_pos = torch.tensor([current_pos], device=device, dtype=torch.long)
 
-        s = torch.cuda.Stream(device=device)
-        s.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(s):
-            for _ in range(3):
-                with torch.no_grad():
-                    model(static_input, past_key_values=past_key_values,
-                          use_cache=True, cache_position=static_pos)
-        torch.cuda.current_stream(device).wait_stream(s)
-        torch.cuda.synchronize(device)
-
+        if args.cudagraph_breakdown:
+            _breakdown_toggle = _CudagraphBreakdownToggle()
+            _breakdown_toggle.__enter__()
         try:
-            g = torch.cuda.CUDAGraph()
-            print(f"  Capturing CUDA graph...")
-            with torch.cuda.graph(g):
-                with torch.no_grad():
-                    model(static_input, past_key_values=past_key_values,
-                          use_cache=True, cache_position=static_pos)
-            for _ in range(5):
-                g.replay()
+            s = torch.cuda.Stream(device=device)
+            s.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    with torch.no_grad():
+                        model(static_input, past_key_values=past_key_values,
+                              use_cache=True, cache_position=static_pos)
+            torch.cuda.current_stream(device).wait_stream(s)
             torch.cuda.synchronize(device)
-            print(f"  Replaying graph ({num_replays} steps) for throughput...")
-            t0 = time.perf_counter()
-            for _ in range(num_replays):
-                g.replay()
-            torch.cuda.synchronize(device)
-            per_replay_ms = (time.perf_counter() - t0) * 1000 / num_replays
-            graph_tok_s = 1000.0 / per_replay_ms
-            graph_stats = (per_replay_ms, graph_tok_s)
-            if args.batch_size == 1:
-                print(f"  CUDA graph: {per_replay_ms:.3f} ms/step  ({graph_tok_s:.1f} tok/s)")
-            else:
-                print(
-                    f"  CUDA graph: {per_replay_ms:.3f} ms/step  "
-                    f"({graph_tok_s:.1f} step/s, {graph_tok_s * args.batch_size:.1f} agg tok/s @ bsz={args.batch_size})"
+
+            try:
+                if args.cudagraph_breakdown:
+                    # discard priming-loop events; only capture-time events should be read
+                    _pd._pending_events.clear()
+                g = torch.cuda.CUDAGraph()
+                print(f"  Capturing CUDA graph...")
+                with torch.cuda.graph(g):
+                    with torch.no_grad():
+                        model(static_input, past_key_values=past_key_values,
+                              use_cache=True, cache_position=static_pos)
+                for _ in range(5):
+                    g.replay()
+                torch.cuda.synchronize(device)
+                print(f"  Replaying graph ({num_replays} steps) for throughput...")
+                # The torch.profiler import is conditional and unreachable when
+                # --cudagraph_breakdown is OFF (preserves the byte-identical
+                # no-flag invariant — Principle 1).
+                use_profiler = (
+                    args.cudagraph_breakdown
+                    and args.cudagraph_breakdown_method == "profiler"
                 )
-        except Exception as e:
-            print(f"  CUDA graph benchmark failed: {type(e).__name__}: {e}")
-            graph_stats = None
+                if use_profiler:
+                    from torch.profiler import profile, ProfilerActivity
+                    prof_ctx = profile(activities=[ProfilerActivity.CUDA])
+                else:
+                    from contextlib import nullcontext
+                    prof_ctx = nullcontext()
+                with prof_ctx as prof:
+                    t0 = time.perf_counter()
+                    for _ in range(num_replays):
+                        g.replay()
+                    # cuda.synchronize stays inside the profiler scope so
+                    # headline measurement is taken under identical conditions
+                    # whether profiling or not.
+                    torch.cuda.synchronize(device)
+                    per_replay_ms = (time.perf_counter() - t0) * 1000 / num_replays
+                graph_tok_s = 1000.0 / per_replay_ms
+                graph_stats = (per_replay_ms, graph_tok_s)
+                if args.batch_size == 1:
+                    print(f"  CUDA graph: {per_replay_ms:.3f} ms/step  ({graph_tok_s:.1f} tok/s)")
+                else:
+                    print(
+                        f"  CUDA graph: {per_replay_ms:.3f} ms/step  "
+                        f"({graph_tok_s:.1f} step/s, {graph_tok_s * args.batch_size:.1f} agg tok/s @ bsz={args.batch_size})"
+                    )
+                if args.cudagraph_breakdown:
+                    # Layer windowing — required reading before touching the disambig logic.
+                    #
+                    # The eager forward at speed/profile_decode_upstream_flash_infer.py:204-228
+                    # emits the following GPU event stream PER LAYER (linear, no branches at
+                    # steady state for unfused-qkv Llama-3.1-8B):
+                    #
+                    #   ... [PREV LAYER] [o_proj_{li-1}]                                   <-- LAST cublasLt of previous layer's window
+                    #   [layernorm_li] [q_proj_li] [k_proj_li] [v_proj_li]                 <-- FIRST 3 cublasLt of current layer's window
+                    #   [q_norm?] [k_norm?] [transpose×2] [apply_rotary_pos_emb (multi-kernel)]
+                    #   [past_key_values.update / index_copy] [2× .fill_]
+                    #   [_update_comp_cache_kernel] [_score_pages_*_kernel(li)]            <-- BOUNDARY MARKER
+                    #   ... [topk] [pack] [flashinfer_kernel] [o_proj_li]                  <-- LAST cublasLt of current layer's window
+                    #   [NEXT LAYER] ...
+                    #
+                    # Define layer window `li` as the half-open event-index range
+                    #   [score_kernel[li-1] + 1, score_kernel[li] + 1)
+                    # i.e. starts AFTER the previous score kernel and includes the current one.
+                    #
+                    # Within window `li`:
+                    #   - The FIRST 3 cublasLt events  = q_proj_li, k_proj_li, v_proj_li
+                    #                                                            -> bucket 1_qkv_proj
+                    #   - The LAST cublasLt event      = o_proj_{li-1}           -> bucket 8_o_proj
+                    #
+                    # Yes — within window `li` the o_proj belongs to the PREVIOUS layer. This is
+                    # intentional: the score kernel is a clean boundary marker but it falls in
+                    # the MIDDLE of layer `li`'s execution, not at its edge. The bookkeeping
+                    # handles this off-by-one explicitly.
+                    #
+                    # Edge cases:
+                    #   - FIRST window (li=0): there is no score_kernel[-1], so window 0 starts
+                    #     from event 0 and contains no o_proj (only the model's initial qkv
+                    #     before the first score kernel). Expected cublasLt count in window 0:
+                    #     3 (qkv only).
+                    #   - LAST window (li = num_layers - 1): final-layer o_proj has no anchor
+                    #     after it (no next score kernel). We accept misclassification of the
+                    #     final-layer o_proj as a 1/N error; acceptable for an opt-in advanced
+                    #     disambig path. C4 prints an INFO line about this in ordering mode.
+                    #
+                    # This windowing is ONLY used when --cudagraph_breakdown_disambig=ordering.
+                    # Default `merge` mode skips all of this and assigns every cublasLt to a
+                    # single `gemm_total` bucket.
+                    num_layers_local = model.config.num_hidden_layers
+                    substep_total = {}
+                    all_kernel_sum_ms = 0.0
+                    bucketing_ok = True
+
+                    if args.cudagraph_breakdown_method == "profiler":
+                        # `prof` was created above (use_profiler == True here).
+                        events_list = list(prof.events()) if prof is not None else []
+                        if len(events_list) == 0:
+                            print(
+                                "[INFO] torch.profiler returned no CUDA events; "
+                                "skipping breakdown (headline still printed)."
+                            )
+                            bucketing_ok = False
+                        else:
+                            # Primary filter: device_time_total > 0 — most robust
+                            # across torch versions. (device_type-based filter
+                            # would be a fallback but is not stable on this
+                            # torch build.)
+                            cuda_events = [
+                                ev for ev in events_list
+                                if (getattr(ev, "device_time_total", None)
+                                    or getattr(ev, "cuda_time_total", 0)) > 0
+                            ]
+                            # Sort by timeline start. Events without time_range
+                            # sort to END (float("inf")) so they don't scramble
+                            # the layer-boundary scan.
+                            cuda_events.sort(
+                                key=lambda e: (
+                                    e.time_range.start
+                                    if hasattr(e, "time_range") else float("inf")
+                                )
+                            )
+
+                            # Optional diagnostic dump of all kernel names.
+                            if args.cudagraph_breakdown_dump_kernels:
+                                from collections import Counter
+                                ctr = Counter(ev.key for ev in cuda_events)
+                                print("[DIAG] CUPTI kernel name counts (full trace):")
+                                for k, v in sorted(ctr.items(), key=lambda kv: -kv[1]):
+                                    print(f"  {v:6d}  {k}")
+
+                            # Find score-kernel anchors (one per layer per replay).
+                            # Match by `_score_pages_` prefix to cover all
+                            # `_score_pages_<scoring>_<group_agg>_kernel`
+                            # specializations.
+                            score_idx = [
+                                i for i, ev in enumerate(cuda_events)
+                                if "_score_pages_" in ev.key
+                            ]
+                            expected_score_hits = num_layers_local * num_replays
+                            # C1: gate score-kernel-count INFO on ordering mode
+                            # only — in merge mode the canary doesn't gate
+                            # disambig, so the message would mislead.
+                            if (
+                                len(score_idx) != expected_score_hits
+                                and args.cudagraph_breakdown_disambig == "ordering"
+                            ):
+                                print(
+                                    f"[INFO] score-kernel hit count mismatch: "
+                                    f"got {len(score_idx)}, expected "
+                                    f"{expected_score_hits}. Forcing merged gemm bucket."
+                                )
+                            use_ordering = (
+                                args.cudagraph_breakdown_disambig == "ordering"
+                                and len(score_idx) == expected_score_hits
+                            )
+
+                            # Build per-layer cublasLt index lists when ordering active.
+                            gemm_qkv_idx = set()
+                            gemm_oproj_idx = set()
+                            if use_ordering:
+                                cublaslt_count_anomaly = False
+                                for replay_i in range(num_replays):
+                                    replay_start = replay_i * num_layers_local
+                                    replay_anchors = score_idx[
+                                        replay_start: replay_start + num_layers_local
+                                    ]
+                                    for li, anchor in enumerate(replay_anchors):
+                                        # Window li = [prev_anchor + 1, anchor + 1).
+                                        if li > 0:
+                                            prev_anchor = replay_anchors[li - 1]
+                                        else:
+                                            # Window 0 of this replay: back up far
+                                            # enough to capture the initial qkv
+                                            # gemms before the first score kernel.
+                                            prev_anchor = replay_anchors[0] - 100
+                                        win_start = max(0, prev_anchor + 1)
+                                        win_end = anchor + 1
+                                        gemms = [
+                                            j for j in range(win_start, win_end)
+                                            if any(
+                                                p in cuda_events[j].key.lower()
+                                                for p in _CUBLASLT_PATTERNS
+                                            )
+                                        ]
+                                        # cublasLt-count canary: window 0 of replay 0
+                                        # has 3 (qkv only); other windows have 4
+                                        # (qkv + previous-layer o_proj).
+                                        expected = 3 if (replay_i == 0 and li == 0) else 4
+                                        if len(gemms) != expected:
+                                            cublaslt_count_anomaly = True
+                                            print(
+                                                f"[INFO] cublasLt-per-layer-window "
+                                                f"count mismatch (replay={replay_i}, "
+                                                f"layer={li}): got {len(gemms)}, "
+                                                f"expected {expected}; merging gemms."
+                                            )
+                                            break
+                                        # qkv = first 3, o_proj_{li-1} = last (li>=1).
+                                        gemm_qkv_idx.update(gemms[:3])
+                                        if li > 0:
+                                            gemm_oproj_idx.add(gemms[-1])
+                                    if cublaslt_count_anomaly:
+                                        break
+                                if cublaslt_count_anomaly:
+                                    use_ordering = False
+                                    gemm_qkv_idx.clear()
+                                    gemm_oproj_idx.clear()
+
+                            for j, ev in enumerate(cuda_events):
+                                bucket = None
+                                key_lower = ev.key.lower()
+                                is_gemm = any(
+                                    p in key_lower for p in _CUBLASLT_PATTERNS
+                                )
+                                if is_gemm:
+                                    if not use_ordering:
+                                        bucket = "gemm_total"  # merged path
+                                    elif j in gemm_qkv_idx:
+                                        bucket = "1_qkv_proj"
+                                    elif j in gemm_oproj_idx:
+                                        bucket = "8_o_proj"
+                                    # else: gemm in non-attention region
+                                    # (MLP / lm_head) — skip
+                                else:
+                                    for pat, b in _SUBSTEP_NAME_PATTERNS.items():
+                                        if pat in ev.key:
+                                            bucket = b
+                                            break
+                                # torch ≥ 2.10 renamed cuda_time_total → device_time_total
+                                ev_us = (getattr(ev, "device_time_total", None)
+                                         or ev.cuda_time_total)
+                                ev_ms = ev_us / 1000.0  # us → ms
+                                all_kernel_sum_ms += ev_ms
+                                if bucket:
+                                    substep_total[bucket] = (
+                                        substep_total.get(bucket, 0.0) + ev_ms
+                                    )
+
+                            # Per-step normalization: profiler ran over `num_replays`
+                            # replays; divide each bucket by num_replays.
+                            substep_per_token = {
+                                name: total / num_replays
+                                for name, total in substep_total.items()
+                            }
+                    else:  # method == "events" — Option A path (dormant on this box)
+                        substep_count = {}
+                        for name, ev_s, ev_e in _pd._pending_events:
+                            substep_total[name] = (
+                                substep_total.get(name, 0.0)
+                                + ev_s.elapsed_time(ev_e)
+                            )
+                            substep_count[name] = substep_count.get(name, 0) + 1
+                        substep_per_token = {
+                            name: substep_total[name] / substep_count[name]
+                            for name in substep_total
+                        }
+                        # all_kernel_sum unavailable via Option A.
+                        all_kernel_sum_ms = None
+
+                    if bucketing_ok and substep_per_token:
+                        # Run seal microbench BEFORE the printer (uses live
+                        # attn_module state; must run while KV cache is intact).
+                        # layer_idx==0 pin: model.modules() registration order is
+                        # not spec-guaranteed; pinning makes the choice deterministic.
+                        seal_mb = None
+                        if args.cudagraph_breakdown_seal_microbench:
+                            attn_modules = [
+                                m for m in model.modules()
+                                if hasattr(m, '_comp_n_pages_cached')
+                                and getattr(m, 'layer_idx', -1) == 0
+                            ]
+                            if not attn_modules:
+                                print(
+                                    "[ERROR] seal microbench: no DCT attention "
+                                    "modules found; mode is likely baseline"
+                                )
+                            else:
+                                seal_mb = _run_seal_microbench(
+                                    model, fi_cache, attn_modules, args,
+                                    num_layers_local,
+                                )
+                        _print_graph_breakdown(
+                            per_replay_ms, substep_per_token,
+                            num_layers_local, args.batch_size,
+                            all_kernel_sum_ms_per_step=(
+                                all_kernel_sum_ms / num_replays
+                                if all_kernel_sum_ms is not None else None
+                            ),
+                            eager_per_token=getattr(
+                                _pd, "_last_eager_per_token", None
+                            ),
+                            seal_microbench=seal_mb,
+                        )
+                        # C4: ordering-mode-only INFO about excluded final o_proj.
+                        if (
+                            args.cudagraph_breakdown_method == "profiler"
+                            and args.cudagraph_breakdown_disambig == "ordering"
+                        ):
+                            print(
+                                "  [INFO] 8_o_proj excludes the final-layer "
+                                "o_proj (1/N-error, acknowledged in plan)."
+                            )
+            except Exception as e:
+                print(f"  CUDA graph benchmark failed: {type(e).__name__}: {e}")
+                graph_stats = None
+        finally:
+            if args.cudagraph_breakdown:
+                _breakdown_toggle.__exit__(None, None, None)
 
     return (
         avg_total, tok_s,

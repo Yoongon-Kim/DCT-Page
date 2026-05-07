@@ -14,11 +14,11 @@ INF_LLM_CONFIG = {
 
     # Memory/block parameters (swept by run_ruler_infllm.sh).
     "block_size": 16,
-    "n_init": 4,
+    "n_init": 128,
     "n_local": 4096,
-    "topk": 64,
-    "repr_topk": 2,
-    "max_cached_block": 128,
+    "topk": 128,
+    "repr_topk": 4,
+    "max_cached_block": 256,
     "exc_block_size": 512,
 
     # Triton flash attention (requires nightly triton; leave False by default).

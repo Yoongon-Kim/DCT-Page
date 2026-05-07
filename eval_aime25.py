@@ -1,12 +1,13 @@
 """
 AIME 2025 evaluation for DCT Page Attention and baseline attention mechanisms.
 
-Evaluates Qwen3-8B (the only supported reasoning model in this harness) on the
-AIME 2025 math competition (30 integer-answer problems) across the same eight
-attention modes exposed by eval_ruler.py. Modes that do not support Qwen3
+Evaluates Qwen3-8B (the default reasoning model in this harness) on the
+AIME 2025 math competition (30 integer-answer problems) across the attention
+modes exposed by eval_ruler.py. Modes that do not support Qwen3
 (seer_prefill, quest_attention, duo_attention, shadowkv) are still listed in
 --mode for parity, but the script raises ValueError before model load if one
-is selected.
+is selected. inf_llm is Llama-only (transformers==4.37.2 env pinning) and
+requires --base_model pointing to a Llama-family checkpoint.
 
 Default dataset is yentinglin/aime_2025. Prompting is chain-of-thought; final
 answer is extracted from the innermost \\boxed{...} expression and compared
@@ -41,29 +42,39 @@ if _BASELINES_DIR not in sys.path:
 
 import torch
 from tqdm import tqdm
-from datasets import load_dataset
 
 from eval_ruler import model_name_tag, apply_monkey_patch, load_model_and_tokenizer
 
 
 # ---------------------------------------------------------------------------
-# Qwen3 compatibility
+# Mode / model-family compatibility
 # ---------------------------------------------------------------------------
+# Modes that run on Qwen3-8B (current default reasoning model).
 QWEN3_SUPPORTED_MODES = {
     "baseline", "page_attention", "seer_attention", "multipole_attention",
 }
-QWEN3_UNSUPPORTED_MODES = {
+# Modes that are Llama-only in this harness (e.g. InfLLM's transformers==4.37
+# shim and Llama-only RoPE replacement). When --mode is in this set, --base_model
+# must be a Llama-family ID.
+LLAMA_ONLY_MODES = {"inf_llm"}
+# Modes intentionally listed in --mode for argparse parity but unsupported here.
+UNSUPPORTED_MODES = {
     "seer_prefill", "quest_attention", "duo_attention", "shadowkv",
 }
 
 
-def _assert_qwen3_compatible(mode: str) -> None:
-    if mode in QWEN3_UNSUPPORTED_MODES:
-        raise ValueError(
-            f"--mode {mode!r} does not support Qwen3. "
-            f"Supported modes for Qwen3-8B: {sorted(QWEN3_SUPPORTED_MODES)}."
-        )
-    if mode not in QWEN3_SUPPORTED_MODES:
+def _assert_mode_model_compatible(mode: str, base_model: str) -> None:
+    # Intentionally duplicates the family check in baselines/infllm/__init__.py:33-46
+    # (`assert_llama_only`) — we want early failure *before* model load and config
+    # rope stripping. The (mode × family) cross-axis lives only here.
+    if mode in UNSUPPORTED_MODES:
+        raise ValueError(f"--mode {mode!r} is not supported by eval_aime25.")
+    name = base_model.lower()
+    if mode in LLAMA_ONLY_MODES and "llama" not in name:
+        raise ValueError(f"--mode {mode!r} is Llama-only; got {base_model!r}.")
+    if mode in QWEN3_SUPPORTED_MODES and "qwen3" not in name:
+        raise ValueError(f"--mode {mode!r} requires Qwen3; got {base_model!r}.")
+    if mode not in (UNSUPPORTED_MODES | LLAMA_ONLY_MODES | QWEN3_SUPPORTED_MODES):
         raise ValueError(f"Unknown --mode {mode!r}.")
 
 
@@ -87,7 +98,7 @@ def format_aime25_sample(item):
 # ---------------------------------------------------------------------------
 # Tokenize
 # ---------------------------------------------------------------------------
-def tokenize_prompt(prompt_text, tokenizer, max_input_len):
+def tokenize_prompt(prompt_text, tokenizer, max_input_len, args=None):
     messages = [{"role": "user", "content": prompt_text}]
     chat_kwargs = dict(
         tokenize=True,
@@ -95,7 +106,8 @@ def tokenize_prompt(prompt_text, tokenizer, max_input_len):
         return_tensors="pt",
     )
     # Qwen3 chat template: keep thinking ON for reasoning evals.
-    if hasattr(tokenizer, "chat_template") and "enable_thinking" in (tokenizer.chat_template or ""):
+    base_model = (args.base_model if args is not None else "")
+    if "qwen3" in base_model.lower() and "enable_thinking" in (tokenizer.chat_template or ""):
         chat_kwargs["enable_thinking"] = True
     input_ids = tokenizer.apply_chat_template(messages, **chat_kwargs)
     if not isinstance(input_ids, torch.Tensor):
@@ -177,18 +189,18 @@ def extract_answer(response: str):
 def parse_args():
     parser = argparse.ArgumentParser(description="AIME 2025 Evaluation (Qwen3-8B)")
 
-    # Mode (all 8 visible for parity; Qwen3 guard runs after parsing)
+    # Mode (all visible for parity; model-family guard runs after parsing)
     parser.add_argument("--mode", type=str, required=True,
                         choices=["baseline", "page_attention", "seer_attention",
                                  "seer_prefill",
                                  "multipole_attention", "quest_attention",
                                  "duo_attention",
-                                 "shadowkv"])
+                                 "shadowkv",
+                                 "inf_llm"])
 
-    # Model — Qwen3-8B only
+    # Model — Qwen3-8B default; Llama-family accepted for inf_llm mode
     parser.add_argument("--base_model", type=str,
-                        default="Qwen/Qwen3-8B",
-                        choices=["Qwen/Qwen3-8B"])
+                        default="Qwen/Qwen3-8B")
 
     # Dataset
     parser.add_argument("--aime25_dataset", type=str, default="yentinglin/aime_2025")
@@ -239,11 +251,23 @@ def parse_args():
     parser.add_argument("--rank", type=int, default=160)
     parser.add_argument("--chunk_size", type=int, default=8)
 
+    # InfLLM baseline params (only used when --mode inf_llm). Llama 3.x only.
+    parser.add_argument("--inf_llm_n_init", type=int, default=128,
+                        help="InfLLM: sink token count.")
+    parser.add_argument("--inf_llm_repr_topk", type=int, default=4,
+                        help="InfLLM: representative tokens per block.")
+    parser.add_argument("--inf_llm_max_cached_block", type=int, default=128,
+                        help="InfLLM: GPU block cache size. MUST be >= "
+                             "INF_LLM_CONFIG['topk'] (default 64); upstream "
+                             "MemoryCache.alloc hard-asserts this.")
+    parser.add_argument("--inf_llm_chunk_size", type=int, default=8192,
+                        help="InfLLM: prefill chunk size for GreedySearch.")
+
     parser.add_argument("--skip_existing", action="store_true")
 
     args = parser.parse_args()
 
-    _assert_qwen3_compatible(args.mode)
+    _assert_mode_model_compatible(args.mode, args.base_model)
 
     if args.num_repeats != 1:
         raise NotImplementedError("--num_repeats > 1 (pass@k) is not implemented yet.")
@@ -261,12 +285,22 @@ def parse_args():
             args.run_name = f"{tag}_seer_attention_{suffix}"
         elif args.mode == "multipole_attention":
             args.run_name = f"{tag}_multipole_attention_{suffix}"
+        elif args.mode == "inf_llm":
+            args.run_name = (f"{tag}_inf_llm_nini{args.inf_llm_n_init}"
+                             f"_repr{args.inf_llm_repr_topk}_{suffix}")
 
     if args.skip_existing:
         summary_path = os.path.join(args.output_dir, f"{args.run_name}_summary.json")
         if os.path.exists(summary_path):
             print(f"SKIP (already exists): {summary_path}")
             sys.exit(0)
+
+    # Diagnostic short-circuit: --num_samples 0 prints the auto-generated
+    # run_name to stdout and exits 0 without loading the model. Mirrors the
+    # --skip_existing short-circuit above.
+    if args.num_samples == 0:
+        print(args.run_name)
+        sys.exit(0)
 
     return args
 
@@ -304,7 +338,7 @@ def evaluate(model, tokenizer, dataset, args):
 
         prompt_text, gold = format_aime25_sample(item)
 
-        input_ids = tokenize_prompt(prompt_text, tokenizer, args.max_input_len).to(model.device)
+        input_ids = tokenize_prompt(prompt_text, tokenizer, args.max_input_len, args=args).to(model.device)
         input_len = input_ids.shape[1]
 
         with torch.no_grad():
@@ -315,6 +349,15 @@ def evaluate(model, tokenizer, dataset, args):
                     max_length=input_len + args.max_new_tokens,
                     do_sample=False,
                 )
+            elif args.mode == "inf_llm":
+                # InfLLM uses a stateful ContextManager KV cache that HF generate()
+                # cannot round-trip. Use the GreedySearch adapter built in
+                # load_model_and_tokenizer. AIME extracts numeric \boxed{...}, so
+                # we omit extra_end_token_ids (mirrors eval_longbench_v2.py:280-283).
+                output_ids = args._inf_llm_generator.generate(
+                    input_ids,
+                    max_new_tokens=args.max_new_tokens,
+                )
             else:
                 output_ids = model.generate(
                     input_ids,
@@ -324,6 +367,9 @@ def evaluate(model, tokenizer, dataset, args):
                 )
 
         generated_ids = output_ids[0, input_len:]
+        if args.mode == "inf_llm":
+            # ContextManager persists past_kv across samples; reset it.
+            args._inf_llm_generator.clear()
         del input_ids, output_ids
         torch.cuda.empty_cache()
 
@@ -343,11 +389,18 @@ def evaluate(model, tokenizer, dataset, args):
         out_f.write(json.dumps(result) + "\n")
         out_f.flush()
 
+        if total == 0:
+            sample_path = os.path.join(args.output_dir, f"{args.run_name}_sample0.txt")
+            with open(sample_path, "w", encoding="utf-8") as sf:
+                sf.write(response[:200])
+
         if is_correct:
             correct += 1
         total += 1
 
     out_f.close()
+
+    print(f"[mem] peak_alloc_gb={torch.cuda.max_memory_allocated() / 1e9:.2f}", flush=True)
 
     results = []
     with open(output_path, "r") as f:
@@ -411,6 +464,9 @@ def build_summary(results, args):
     elif args.mode == "multipole_attention":
         from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
         summary["multipole_attn_config"] = MULTIPOLE_ATTN_CONFIG
+    elif args.mode == "inf_llm":
+        from infllm.config import INF_LLM_CONFIG
+        summary["inf_llm_config"] = INF_LLM_CONFIG
 
     return summary
 
@@ -458,6 +514,7 @@ def main():
     apply_monkey_patch(args)
     model, tokenizer = load_model_and_tokenizer(args)
 
+    from datasets import load_dataset
     print(f"\nLoading AIME25: {args.aime25_dataset} (split={args.aime25_split})")
     dataset = load_dataset(args.aime25_dataset, split=args.aime25_split)
     print(f"Loaded {len(dataset)} samples")

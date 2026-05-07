@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1777874560161,
+  "lastScanned": 1778165860019,
   "projectRoot": "/home/yoongonkim/DCT-Page",
   "techStack": {
     "languages": [
@@ -44,8 +44,8 @@
     "__pycache__": {
       "path": "__pycache__",
       "purpose": null,
-      "fileCount": 27,
-      "lastAccessed": 1777874560156,
+      "fileCount": 29,
+      "lastAccessed": 1778165860015,
       "keyFiles": [
         "analyze_niah_page_ranks.cpython-312.pyc",
         "analyze_selection_oracle_overlap.cpython-312.pyc",
@@ -58,21 +58,21 @@
       "path": "baselines",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1777874560156,
+      "lastAccessed": 1778165860017,
       "keyFiles": []
     },
     "benchmark": {
       "path": "benchmark",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1777874560157,
+      "lastAccessed": 1778165860017,
       "keyFiles": []
     },
     "observations": {
       "path": "observations",
       "purpose": null,
       "fileCount": 1,
-      "lastAccessed": 1777874560157,
+      "lastAccessed": 1778165860017,
       "keyFiles": [
         "dct_page_energy.py"
       ]
@@ -81,7 +81,7 @@
       "path": "oracle",
       "purpose": null,
       "fileCount": 8,
-      "lastAccessed": 1777874560159,
+      "lastAccessed": 1778165860017,
       "keyFiles": [
         "attention_mass_recall_ruler.py",
         "attention_mass_recall_ruler_quest.py",
@@ -94,7 +94,7 @@
       "path": "results",
       "purpose": null,
       "fileCount": 2,
-      "lastAccessed": 1777874560159,
+      "lastAccessed": 1778165860018,
       "keyFiles": [
         "phase2c_nvtx.nsys-rep",
         "phase2c_nvtx.sqlite"
@@ -104,28 +104,28 @@
       "path": "results_attention_mass_recall",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1777874560159,
+      "lastAccessed": 1778165860018,
       "keyFiles": []
     },
     "results_quest_mass_recall": {
       "path": "results_quest_mass_recall",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1777874560159,
+      "lastAccessed": 1778165860018,
       "keyFiles": []
     },
     "results_ruler": {
       "path": "results_ruler",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1777874560159,
+      "lastAccessed": 1778165860018,
       "keyFiles": []
     },
     "speed": {
       "path": "speed",
       "purpose": null,
       "fileCount": 9,
-      "lastAccessed": 1777874560160,
+      "lastAccessed": 1778165860018,
       "keyFiles": [
         "flashinfer_backend.py",
         "profile_decode.py",
@@ -138,15 +138,15 @@
       "path": "benchmark/data",
       "purpose": "Data files",
       "fileCount": 0,
-      "lastAccessed": 1777874560160,
+      "lastAccessed": 1778165860018,
       "keyFiles": []
     }
   },
   "hotPaths": [
     {
       "path": "speed/profile_decode_upstream_flash_infer.py",
-      "accessCount": 49,
-      "lastAccessed": 1777888512602,
+      "accessCount": 57,
+      "lastAccessed": 1778142651918,
       "type": "file"
     },
     {
@@ -168,6 +168,12 @@
       "type": "file"
     },
     {
+      "path": "run_ruler_infllm.sh",
+      "accessCount": 6,
+      "lastAccessed": 1778167867920,
+      "type": "file"
+    },
+    {
       "path": "speed/flashinfer_backend.py",
       "accessCount": 5,
       "lastAccessed": 1777884425648,
@@ -183,6 +189,18 @@
       "path": "speed/profile_decode.py",
       "accessCount": 3,
       "lastAccessed": 1777887236722,
+      "type": "file"
+    },
+    {
+      "path": "eval_ruler.py",
+      "accessCount": 1,
+      "lastAccessed": 1778166313202,
+      "type": "file"
+    },
+    {
+      "path": "baselines/infllm/config.py",
+      "accessCount": 1,
+      "lastAccessed": 1778166706914,
       "type": "file"
     }
   ],

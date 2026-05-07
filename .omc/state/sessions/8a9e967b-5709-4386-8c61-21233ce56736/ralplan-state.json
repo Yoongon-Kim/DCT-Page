@@ -1,0 +1,11 @@
+{
+  "active": false,
+  "started_at": "2026-05-06T07:21:18.615Z",
+  "session_id": "8a9e967b-5709-4386-8c61-21233ce56736",
+  "project_path": "/home/yoongonkim/DCT-Page",
+  "awaiting_confirmation_set_at": "2026-05-06T07:21:18.615Z",
+  "last_checked_at": "2026-05-06T07:21:18.615Z",
+  "current_phase": "complete",
+  "completed_at": "2026-05-06T07:22:38.901Z",
+  "deactivated_reason": "skill_completed"
+}

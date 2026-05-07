@@ -1,18 +1,22 @@
 #!/bin/bash
-# RULER Evaluation — InfLLM
-# Sweeps InfLLM's main sparsity knobs (topk / block_size / n_local) by
-# rewriting baselines/inf_llm/config.py. Only topk/block_size/n_local are
-# config-only in eval_ruler.py; n_init / repr_topk / max_cached_block /
-# chunk_size are passed as CLI args.
+# RULER Evaluation — InfLLM (accuracy sweep)
+# Varies the 5 accuracy-relevant knobs: topk, block_size, n_local, n_init,
+# repr_topk. topk/block_size/n_local are config-only in eval_ruler.py
+# (rewritten into baselines/infllm/config.py via write_config); n_init /
+# repr_topk / max_cached_block / chunk_size flow through as CLI args.
+# Other knobs (attn_type, fattn, base, distance_scale, score_decay,
+# async_global_stream, faiss, perhead, exc_block_size) stay at upstream
+# defaults. max_cached_block is derived as 2*topk to satisfy the >= topk
+# invariant of MemoryCache.alloc.
 #
 # InfLLM requires a dedicated conda env with transformers==4.37.2 (its
 # patch.py targets pre-4.45 attention internals). Set INFLLM_ENV_NAME
-# (default: inf_llm_env) and CONDA_SETUP to override.
+# (default: infllm) and CONDA_SETUP to override.
 set -e
 
 # ---- Conda activation ----
-INFLLM_ENV_NAME="${INFLLM_ENV_NAME:-inf_llm_env}"
-CONDA_SETUP="${CONDA_SETUP:-$HOME/miniconda3/etc/profile.d/conda.sh}"
+INFLLM_ENV_NAME="${INFLLM_ENV_NAME:-infllm}"
+CONDA_SETUP="${CONDA_SETUP:-/home/tools/anaconda3/etc/profile.d/conda.sh}"
 if [[ -f "$CONDA_SETUP" ]]; then
     # shellcheck disable=SC1090
     source "$CONDA_SETUP"
@@ -51,11 +55,9 @@ OUTPUT_DIR="${OUTPUT_DIR:-results_ruler/inf_llm/${MODEL_TAG}}"
 # Sequence lengths to evaluate
 SEQ_LENGTHS="${SEQ_LENGTHS:-32768}"
 
-# Fixed InfLLM parameters (CLI-exposed; passed through per-run).
-# REPR_TOPK is swept below (representative tokens per block, quality knob).
-# MAX_CACHED_BLOCK is derived from TOPK inside the sweep (must be >= topk;
-# upstream uses 2*topk). Raising it only costs GPU memory, not quality.
-N_INIT=4
+# Accuracy-relevant axes (TOPK, BLOCK_SIZE, N_LOCAL, N_INIT, REPR_TOPK) are
+# swept in the nested loops below. MAX_CACHED_BLOCK is derived from TOPK
+# (must be >= topk; upstream uses 2*topk). Raising it only costs GPU memory.
 CHUNK_SIZE=8192
 
 # Fixed config-only parameters that are not being swept.
@@ -112,36 +114,42 @@ INF_LLM_CONFIG = {
 PYEOF
 }
 
-# ---- Sweep block_size x n_local x topk x repr_topk ----
-# block_size * topk = attended-block token budget; n_local is the sliding window.
-# repr_topk = # of representative tokens per block (block-summary fidelity).
-for BLOCK_SIZE in 16; do
-    for N_LOCAL in 4096; do
-        for TOPK in 128 64; do
-            for REPR_TOPK in 1 2; do
-                MAX_CACHED_BLOCK=$(( TOPK * 2 ))
-                RUN_NAME="${MODEL_TAG}_inf_llm_bs${BLOCK_SIZE}_nlocal${N_LOCAL}_topk${TOPK}_nini${N_INIT}_repr${REPR_TOPK}"
+# ---- Accuracy sweep: topk x block_size x n_local x n_init x repr_topk ----
+# topk      = blocks attended per decode step (main sparsity dial).
+# block_size= tokens per block (retrieval granularity).
+# n_local   = sliding-window of always-attended recent tokens.
+# n_init    = sink token count (attention-anchor).
+# repr_topk = representative tokens per block (block-summary fidelity).
+# Tight initial grid: 2*1*1*2*2 = 8 cells. Add values to any axis to widen.
+for TOPK in 64 128; do
+    for BLOCK_SIZE in 16; do
+        for N_LOCAL in 4096; do
+            for N_INIT in 4 128; do
+                for REPR_TOPK in 2 4; do
+                    MAX_CACHED_BLOCK=$(( TOPK * 2 ))
+                    RUN_NAME="${MODEL_TAG}_inf_llm_topk${TOPK}_bs${BLOCK_SIZE}_nlocal${N_LOCAL}_nini${N_INIT}_repr${REPR_TOPK}"
 
-                echo ""
-                echo "===================================================================="
-                echo "INFLLM: block_size=${BLOCK_SIZE}, n_local=${N_LOCAL}, topk=${TOPK}, repr_topk=${REPR_TOPK}"
-                echo "===================================================================="
+                    echo ""
+                    echo "===================================================================="
+                    echo "INFLLM: topk=${TOPK}, block_size=${BLOCK_SIZE}, n_local=${N_LOCAL}, n_init=${N_INIT}, repr_topk=${REPR_TOPK}"
+                    echo "===================================================================="
 
-                write_config "$BLOCK_SIZE" "$N_LOCAL" "$TOPK" "$REPR_TOPK"
+                    write_config "$BLOCK_SIZE" "$N_LOCAL" "$TOPK" "$REPR_TOPK"
 
-                python eval_ruler.py \
-                    --mode inf_llm \
-                    --base_model "$BASE_MODEL" \
-                    --skip_existing \
-                    $PREPARE_FLAG \
-                    --seq_lengths $SEQ_LENGTHS \
-                    --num_samples "$NUM_SAMPLES" \
-                    --inf_llm_n_init "$N_INIT" \
-                    --inf_llm_repr_topk "$REPR_TOPK" \
-                    --inf_llm_max_cached_block "$MAX_CACHED_BLOCK" \
-                    --inf_llm_chunk_size "$CHUNK_SIZE" \
-                    --output_dir "$OUTPUT_DIR" \
-                    --run_name "$RUN_NAME"
+                    python eval_ruler.py \
+                        --mode inf_llm \
+                        --base_model "$BASE_MODEL" \
+                        --skip_existing \
+                        $PREPARE_FLAG \
+                        --seq_lengths $SEQ_LENGTHS \
+                        --num_samples "$NUM_SAMPLES" \
+                        --inf_llm_n_init "$N_INIT" \
+                        --inf_llm_repr_topk "$REPR_TOPK" \
+                        --inf_llm_max_cached_block "$MAX_CACHED_BLOCK" \
+                        --inf_llm_chunk_size "$CHUNK_SIZE" \
+                        --output_dir "$OUTPUT_DIR" \
+                        --run_name "$RUN_NAME"
+                done
             done
         done
     done
