@@ -1,7 +1,7 @@
 {
   "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"ls /home/yoongonkim/DCT-Page/benchmark/eval_ruler/synthetic/ 2>/dev/null && echo \\\"---\\\" && cat /home/yoongonkim/DCT-Page/benchmark/eval_ruler/synthetic.yaml 2>/dev/null\",\"description\":\"Li...",
-  "error": "Exit code 2",
-  "timestamp": "2026-05-10T09:55:51.418Z",
-  "retry_count": 1
+  "tool_input_preview": "{\"command\":\"CUDA_VISIBLE_DEVICES=1 conda run -n quest python eval_ruler.py --mode quest_attention \\\\\\n  --base_model Qwen/Qwen3-8B \\\\\\n  --seq_lengths 32768 \\\\\\n  --num_samples 1 \\\\\\n  --tasks niah_si...",
+  "error": "Exit code 1\n  File \"/home/yoongonkim/DCT-Page/baselines/quest_attn/utils/controller.py\", line 20, in __init__\n    self.kv_cache = KvCache(\n  File \"/home/yoongonkim/DCT-Page/baselines/quest_attn/utils/kv_cache.py\", line 82, in __init__\n    self._pool = KvPool(\n  File \"/home/yoongonkim/DCT-Page/baselines/quest_attn/utils/kv_cache.py\", line 20, in __init__\n    self._buf = torch.empty(\ntorch.OutOfMemoryError: CUDA out of memory. Tried to allocate 20.25 GiB. GPU 0 has a total capacity of 47.40 GiB of...",
+  "timestamp": "2026-05-10T16:23:53.980Z",
+  "retry_count": 3
 }

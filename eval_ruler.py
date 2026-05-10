@@ -164,6 +164,14 @@ def parse_args():
     parser.add_argument("--comp_kv_quant_granularity", type=str, default="per_page",
                         choices=["per_page", "per_comp_token"],
                         help="Scale granularity for comp_kv_quant")
+    
+    # Quest baseline (--mode quest_attention) — separate from DCT's --page_size/--top_k.
+    # token_budget = quest_page_size * quest_top_k.
+    parser.add_argument("--quest_page_size", type=int, default=32,
+                        help="Quest baseline: tokens per KV page (Quest paper default: 16)")
+    parser.add_argument("--quest_top_k", type=int, default=64,
+                        help="Quest baseline: page budget (=token_budget/page_size). "
+                             "Default 128 → token_budget=2048 with quest_page_size=16")
 
     # ShadowKV baseline params (only used when --mode shadowkv)
     parser.add_argument("--shadowkv_cache_mode", type=str, default="shadowkv_cpu",
@@ -247,7 +255,7 @@ def parse_args():
         elif args.mode == "multipole_attention":
             args.run_name = f"{tag}_multipole_attention"
         elif args.mode == "quest_attention":
-            args.run_name = f"{tag}_quest_ps{args.page_size}_pb{args.top_k}"
+            args.run_name = f"{tag}_quest_ps{args.quest_page_size}_pb{args.quest_top_k}"
         elif args.mode == "duo_attention":
             args.run_name = f"{tag}_duo_attention"
         elif args.mode == "shadowkv":
@@ -598,13 +606,10 @@ def load_model_and_tokenizer(args):
         print(f"Model loaded (base={hf_config.base_model}). "
               f"Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
     elif args.mode == "quest_attention":
-        from quest_attn.config import QUEST_ATTN_CONFIG
-
         base_model = args.base_model
-        page_size = args.page_size
-        token_budget = args.page_size * args.top_k  # top_k used as page_budget
-        # Size the preallocated KV pool to the actual eval workload (with headroom
-        # for generation), not the 128k default in QUEST_ATTN_CONFIG.
+        page_size = args.quest_page_size
+        token_budget = args.quest_page_size * args.quest_top_k  # quest_top_k = page_budget
+        # Size the preallocated KV pool to the actual eval workload (with headroom for generation).
         max_seq_len = max(args.seq_lengths) + 4096
 
         model_name_lower = base_model.lower()
@@ -617,7 +622,7 @@ def load_model_and_tokenizer(args):
                 f"Quest supports LLaMA-family (Llama-2, Llama-3.x, Mistral) and Qwen3 models, "
                 f"got: {base_model}"
             )
-        print(f"Loading Quest model: {base_model} (page_size={page_size}, page_budget={args.top_k}, token_budget={token_budget})")
+        print(f"Loading Quest model: {base_model} (page_size={page_size}, page_budget={args.quest_top_k}, token_budget={token_budget})")
         model = QuestModel.from_pretrained(
             base_model,
             device_map="cuda:0",
@@ -987,9 +992,9 @@ def _save_summary(args, all_seq_results):
     elif args.mode == "quest_attention":
         summary["quest_attn_config"] = {
             "base_model": args.base_model,
-            "page_size": args.page_size,
-            "page_budget": args.top_k,
-            "token_budget": args.page_size * args.top_k,
+            "page_size": args.quest_page_size,
+            "page_budget": args.quest_top_k,
+            "token_budget": args.quest_page_size * args.quest_top_k,
         }
 
     summary_path = Path(args.output_dir) / args.run_name / "summary.json"

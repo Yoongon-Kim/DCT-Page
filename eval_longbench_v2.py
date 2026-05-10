@@ -74,6 +74,14 @@ def parse_args():
     parser.add_argument("--run_name", type=str, default=None,
                         help="Name for this run (auto-generated if not given)")
 
+    # Quest baseline (--mode quest_attention) — separate from DCT's --page_size/--top_k.
+    # token_budget = quest_page_size * quest_top_k.
+    parser.add_argument("--quest_page_size", type=int, default=16,
+                        help="Quest baseline: tokens per KV page (Quest paper default: 16)")
+    parser.add_argument("--quest_top_k", type=int, default=128,
+                        help="Quest baseline: page budget (=token_budget/page_size). "
+                             "Default 128 → token_budget=2048 with quest_page_size=16")
+
     # RoPE Gap params (only used when mode=rope_gap)
     parser.add_argument("--num_gaps", type=int, default=8,
                         help="Number of position gaps to insert")
@@ -161,7 +169,7 @@ def parse_args():
         elif args.mode == "multipole_attention":
             args.run_name = f"{tag}_multipole_attention"
         elif args.mode == "quest_attention":
-            args.run_name = f"{tag}_quest_attention"
+            args.run_name = f"{tag}_quest_ps{args.quest_page_size}_pb{args.quest_top_k}"
         elif args.mode == "duo_attention":
             args.run_name = f"{tag}_duo_attention"
         elif args.mode == "inf_llm":
@@ -494,7 +502,12 @@ def build_summary(results, args):
         summary["multipole_attn_config"] = MULTIPOLE_ATTN_CONFIG
     elif args.mode == "quest_attention":
         from quest_attn.config import QUEST_ATTN_CONFIG
-        summary["quest_attn_config"] = QUEST_ATTN_CONFIG
+        summary["quest_attn_config"] = {
+            **QUEST_ATTN_CONFIG,
+            "page_size": args.quest_page_size,
+            "page_budget": args.quest_top_k,
+            "token_budget": args.quest_page_size * args.quest_top_k,
+        }
     elif args.mode == "duo_attention":
         from duo_attn.config import DUO_ATTN_CONFIG
         summary["duo_attn_config"] = DUO_ATTN_CONFIG
@@ -751,6 +764,8 @@ def main():
         from quest_attn.config import QUEST_ATTN_CONFIG
 
         base_model = QUEST_ATTN_CONFIG["base_model"]
+        page_size = args.quest_page_size
+        token_budget = args.quest_page_size * args.quest_top_k  # quest_top_k = page_budget
         model_name_lower = base_model.lower()
         if "qwen3" in model_name_lower:
             from quest_attn import Qwen3ForCausalLM as QuestModel
@@ -761,16 +776,16 @@ def main():
                 f"Quest supports LLaMA-family (Llama-2, Llama-3.x, Mistral) and Qwen3 models, "
                 f"got: {base_model}"
             )
-        print(f"Loading Quest model: {base_model}")
+        print(f"Loading Quest model: {base_model} (page_size={page_size}, page_budget={args.quest_top_k}, token_budget={token_budget})")
         model = QuestModel.from_pretrained(
             base_model,
             device_map="cuda:0",
             torch_dtype=torch.float16,
         )
         model.quest_init(
-            page_size=QUEST_ATTN_CONFIG["page_size"],
+            page_size=page_size,
             max_seq_len=QUEST_ATTN_CONFIG["max_seq_len"],
-            token_budget=QUEST_ATTN_CONFIG["token_budget"],
+            token_budget=token_budget,
             dtype=torch.float16,
             device=torch.device("cuda:0"),
         )

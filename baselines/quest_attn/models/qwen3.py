@@ -157,6 +157,11 @@ class Qwen3PreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _no_split_modules = ["Qwen3DecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
+    # Quest manages its own KV via iController; force HF to keep legacy
+    # tuple-style past_key_values so the upstream prefill/decode signal works.
+    _supports_cache_class = False
+    _supports_static_cache = False
+    _supports_quantized_cache = False
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -291,13 +296,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
         torch.cuda.nvtx.range_pop()
 
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, seq_length_with_past), dtype=torch.bool, device=inputs_embeds.device
-            )
-        attention_mask = self._prepare_decoder_attention_mask(
-            attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
-        )
+        # QuestAttention ignores attention_mask — causal masking is handled by the
+        # FlashInfer paged kernels internally. Skip _prepare_decoder_attention_mask
+        # to avoid materializing a [bsz, 1, q_len, kv_len] mask (OOM at 32k+ context).
+        attention_mask = None
 
         hidden_states = inputs_embeds
 
@@ -501,6 +503,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
         torch.cuda.nvtx.range_push("lm_head")
         hidden_states = outputs[0]
+        # Inference-only optimization: only compute logits for the last token.
+        # For 32k+ prefills, full-sequence fp32 logits is ~16 GB and causes OOM.
+        if not self.training and hidden_states.size(1) > 1:
+            hidden_states = hidden_states[:, -1:, :]
         logits = self.lm_head(hidden_states)
         logits = logits.float()
 
@@ -530,13 +536,16 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
 
     def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None,
-        is_first_iteration=False, **kwargs
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
-        # Quest manages its KV state via iController; transformers >= 5 passes a
-        # truthy empty Cache on the first call so past_key_values is unreliable.
-        # Use is_first_iteration instead.
-        is_decode = not is_first_iteration
+        # Use Quest's own KV state (iController.kv_cache.seqlen) as the prefill/decode
+        # signal — independent of HF's past_key_values plumbing, which is unreliable
+        # across transformers versions (different Cache classes, mid-loop conversions).
+        # quest_clear() resets seqlen to 0 between samples.
+        is_decode = (
+            self.model.iController is not None
+            and self.model.iController.kv_cache.seqlen > 0
+        )
         if is_decode:
             input_ids = input_ids[:, -1:]
 
@@ -547,7 +556,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             if is_decode:
                 position_ids = position_ids[:, -1].unsqueeze(-1)
 
-        if inputs_embeds is not None and is_first_iteration:
+        if inputs_embeds is not None and not is_decode:
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
             model_inputs = {"input_ids": input_ids}

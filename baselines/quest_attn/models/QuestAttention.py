@@ -22,7 +22,15 @@ class _HeadRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return rms_norm_forward(x, self.weight, self.eps)
+        # rms_norm.cu hardcodes rows=input.size(1), columns=input.size(2), so it
+        # expects shape [batch, rows, embed_dim]. For QK-norm input
+        # [seq_len, num_heads, head_dim], reshape to [1, seq_len*num_heads, head_dim]
+        # so every (token, head) pair gets normalized over head_dim. Without this
+        # reshape only num_heads rows get processed and the rest are uninitialized.
+        orig_shape = x.shape
+        x_flat = x.reshape(1, -1, orig_shape[-1])
+        out = rms_norm_forward(x_flat, self.weight, self.eps)
+        return out.reshape(orig_shape)
 
 class QuestAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -64,6 +72,17 @@ class QuestAttention(nn.Module):
         self.rope_theta = getattr(self.config, 'rope_theta', 1e4)
         # rope_theta is default to 1e4, as set in RoPE kernel API.
         rope_scaling = getattr(self.config, 'rope_scaling', None)
+
+        # Quest's fused FlashInfer RoPE uses interleaved-pair convention; HF (Llama,
+        # Qwen3, Mistral) uses half-split. They only happen to match for Llama-2-style
+        # configs that were tested upstream. For everything else, fall back to HF rotary.
+        # Concretely: force HF rotary for Qwen3 and any non-trivial rope_scaling.
+        _model_type = getattr(self.config, 'model_type', 'llama')
+        if _model_type == 'qwen3':
+            self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
+            self.rope_scale = None  # signals "use self.rotary_emb in forward"
+            return
+
         if rope_scaling is None:
             self.rotary_emb = None  # RoPE applied by FlashInfer kernel
             self.rope_scale = 1.0
@@ -130,6 +149,15 @@ class QuestAttention(nn.Module):
         query_states = query_states.view(q_len, self.num_heads, self.head_dim)
         key_states = key_states.view(q_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(q_len, self.num_key_value_heads, self.head_dim)
+
+        # Quest's CUDA kernels (estimate, append_kv, RoPE) assume num_kv_heads == num_qo_heads.
+        # For GQA models (Llama-3.1, Qwen3) the metadata-vs-pool head-count check fails because
+        # estimate.cu reads num_heads from q (qo=32) while page.cu reads from k (kv=8).
+        # Replicate K/V to qo-heads before RoPE/append — same approach upstream's simulated
+        # path uses. Costs num_kv_groups× extra KV memory; algorithmically equivalent.
+        if self.num_key_value_groups > 1:
+            key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
+            value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
 
         # Optional QK-norm (Qwen3 applies norm BEFORE RoPE)
         if self.q_norm is not None:
