@@ -1996,20 +1996,21 @@ def dct_page_attention_forward_upstream_flashinfer(
     key_states = key_states.transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-    # Step 2: RoPE + bookkeeping. The FI paged buf is the source of truth at
-    # decode time; `past_key_values.update()` is a counter-only shim (in
-    # _fi_mode the flat KV was freed at FI build).
-    cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-    if past_key_values is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        past_key_values.update(
-            key_states, value_states, self.layer_idx, cache_kwargs
-        )
-
     # Lazy-init the upstream-FI cache on the first decode step (layer 0 only).
-    # Prefill already ran `pre_allocate_cache` at line 1216-1220 — DO NOT call
-    # it again here; the second call would null-deref on `_fi_mode=True` layers.
+    # MUST happen BEFORE `past_key_values.update()` — otherwise layer 0's
+    # update bumps `_seen` to `prefill_len + 1` and writes its first decode K
+    # to the flat KV buffer, while layers 1..N-1 have not yet had update
+    # called (we are still inside layer 0's forward). The cache build then
+    # packs `layer.keys[:, :, :prefill_len + 1, :]` for ALL layers, but the
+    # +1 slot is uninitialized garbage for every layer except layer 0. The
+    # subsequent explicit per-layer K/V write also lands at slot 1 instead
+    # of slot 0 of the open page (because `last_page_len_py` is 1 at build
+    # and gets bumped to 2 in the layer-0 counter-advance below). Building
+    # before update — with `prefill_len = layer 0._seen` (pre-update) —
+    # mirrors the profiler driver and keeps the open-page slot accounting
+    # consistent with the explicit decode-time write.
+    # Prefill already ran `pre_allocate_cache` — DO NOT call it again here;
+    # the second call would null-deref on `_fi_mode=True` layers.
     if self.layer_idx == 0 and _upstream_fi_cache_ref[0] is None:
         # Lazy import: upstream_flashinfer_backend lives under speed/, not the
         # repo root. Keeps flashinfer import out of the cold path.
@@ -2040,6 +2041,17 @@ def dct_page_attention_forward_upstream_flashinfer(
             top_k=cfg.top_k,
             num_recent_pages_fixed=cfg.num_recent_pages,
             bsz=hidden_states.shape[0],
+        )
+
+    # Step 2: RoPE + bookkeeping. The FI paged buf is the source of truth at
+    # decode time; `past_key_values.update()` is a counter-only shim (in
+    # _fi_mode the flat KV was freed at FI build).
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    if past_key_values is not None:
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        past_key_values.update(
+            key_states, value_states, self.layer_idx, cache_kwargs
         )
 
     cache = _upstream_fi_cache_ref[0]
