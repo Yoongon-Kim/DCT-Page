@@ -1,19 +1,18 @@
 {
   "active": false,
   "current_phase": "complete",
-  "completed_at": "2026-05-07T08:37:00Z",
-  "team_name": "aime25-infllm",
-  "agent_count": "2",
-  "agent_types": "executor,verifier",
-  "task": "Add InfLLM support to eval_aime25.py per approved plan",
+  "completed_at": "2026-05-10T07:35:00Z",
+  "team_name": "eval-upstream-fi",
+  "agent_count": "3",
+  "agent_types": "executor",
   "fix_loop_count": "1",
   "max_fix_loops": "3",
   "linked_ralph": "false",
-  "stage_history": "team-plan,team-exec,team-verify,team-fix,team-verify,team-complete",
+  "stage_history": "team-plan,team-exec,team-verify,team-fix,team-verify,complete",
   "_meta": {
     "mode": "team",
     "sessionId": null,
-    "updatedAt": "2026-05-07T08:37:34.437Z",
+    "updatedAt": "2026-05-10T07:34:12.505Z",
     "updatedBy": "state_write_tool"
   }
 }

@@ -6,7 +6,7 @@ class DCTPageConfig:
     page_size: int = 32            # Tokens per page (sink/recent are page-counted)
     top_k: int = 64                # Pages selected for full attention
     num_sink_pages: int = 1        # First N physical pages always attended (sink)
-    num_recent_pages: int = 5      # Last M physical pages always attended (recent), INCLUDES the currently-open partial page
+    num_recent_pages: int = 5      # Number of full recent pages always attended; EXCLUDES the currently-open partial page (open is implicit, +1). Total recent slots = num_recent_pages + 1.
     compress_ratio: float = 0.03125   # Per-page compression (32 -> 1 token)
     min_decode_kv_len_for_paging: int = 8192  # Fallback to baseline decode attention below this KV length
     scoring_method: str = "max"    # "mean" | "max" | "sum"

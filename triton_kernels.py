@@ -754,10 +754,15 @@ def topk_sort_torch(
     return indices
 
 
-# Threshold: single-stage wins up to BLOCK_P=1024, two-stage wins above.
-# Measured on H100: at num_pages=1020, fused=14us vs twostage-8=24us;
-# at num_pages=2040, fused=28us vs twostage-8=23us.
-_TOPK_TWOSTAGE_MIN_PAGES = 1025
+# Threshold: two-stage wins on A6000 from ~1000 pages onwards.
+# H100 (orig calibration): at num_pages=1020, fused=14us vs twostage-8=24us;
+#   at num_pages=2040, fused=28us vs twostage-8=23us.
+# A6000 (cudagraph, 6_topk_and_pack bucket / num_layers):
+#   num_pages~1017 (32K ctx): single-stage ~40us/call
+#   num_pages~2041 (65K ctx): two-stage    ~10us/call  (4x faster on 2x work)
+# A6000's smaller SM count + small-warp single-CTA bitonic starves SMs at
+# bsz=1 num_kv_heads=8 (only 8 CTAs) — two-stage's stage-1 launches 8x more.
+_TOPK_TWOSTAGE_MIN_PAGES = 1000
 
 
 def topk_sort(

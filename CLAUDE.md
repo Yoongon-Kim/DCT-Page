@@ -47,7 +47,7 @@ Key kernels in `triton_kernels.py` (every kernel has a PyTorch fallback):
 | `page_size` | `32` | Tokens per page |
 | `top_k` | `64` | Pages selected for full attention |
 | `num_sink_pages` | `1` | First N physical pages always attended (sink) |
-| `num_recent_pages` | `5` | Last M physical pages always attended (recent), INCLUDES the currently-open partial page |
+| `num_recent_pages` | `5` | Number of full recent pages always attended; EXCLUDES the currently-open partial page (open page is implicit, always also attended). Total recent slots = `num_recent_pages + 1`. |
 | `compress_ratio` | `0.03125` | Per-page compression (e.g. 32 → 1 token) |
 | `min_decode_kv_len_for_paging` | `8192` | Fallback to baseline decode attention below this KV length |
 | `scoring_method` | `"max"` | `"mean" \| "max" \| "sum"` |
@@ -241,6 +241,8 @@ python oracle/oracle_ruler.py --mode page_attention --context_len 16384 \
 - **Buffer caching**: projection matrices and kernel caches live on `attn_module` attributes (lazy init via `_get_or_build_*`, shape/device checked each call).
 - **Triton kernels**: `@triton.jit` with constexpr block sizes; wrappers handle grid launch and switch to pure-PyTorch when `use_triton=False`.
 - **Run naming convention**: encodes params, e.g. `drop_ps32_top64_comp1`, `qwen_ps32_topk64_cr0.125_drop_tokenropemixed_popw`, `llama_shadowkv_shadowkv_cpu_sb2192_r160_cs8`.
+- **`--top_k` semantics**: in `eval_*.py` (page_attention mode) `--top_k` means TOTAL pages
+  (sink + middle + recent); in `oracle/*` scripts `--dct_top_k` still means MIDDLE pages.
 - **No unit tests**: validation is through benchmark runs (RULER / LongBench / AIME / GPQA) and the oracle diagnostics.
 
 ## Data paths

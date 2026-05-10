@@ -1,35 +1,41 @@
-## Handoff: team-plan → team-exec (dct-seal-microbench team)
+## Handoff: team-plan → team-exec (eval-upstream-fi team)
 
-- **Decided**: RALPLAN-DR consensus iteration 3 APPROVE. Single-file edit per `/home/yoongonkim/DCT-Page/.omc/plans/cudagraph-substep-breakdown.md` (Plan v3 — Same-Process Eager Forced-Seal Microbench). 4 surgical sites in `speed/profile_decode_upstream_flash_infer.py`: argparse (~10 LOC), `_run_seal_microbench` helper (~50-60 LOC), `_print_graph_breakdown` 3-row reconciliation block (~25 LOC), cudagraph-branch wiring (~15 LOC). Total ~80-100 LOC.
-- **Rejected** during planning:
-  - v1 two-process / `--cudagraph_breakdown_align_target=compress` design — `wrapper.plan()` is not graph-capturable; capture would crash on page-boundary or use stream-private allocator pool for `_comp_k_cache` realloc.
-  - cudaEventRecord-in-graph (Option B) — silently dropped on torch 2.10/A6000 per `feedback_event_in_graph_unsupported.md`.
-  - JSON sidecar + bash wrapper — v1 scope creep; same-process microbench needs no IPC.
+- **Decided**: Decompose plan `/home/yoongonkim/DCT-Page/.omc/plans/eval-upstream-flashinfer-backend.md` into 8 tasks. 3 workers:
+  - **worker-1** (foundation): #1 dct_page_attention.py (new forward + dispatch + 4 helpers + per-instance attr + maintainer comment), #8 CLAUDE.md doc fix.
+  - **worker-2** (parallelizable): #2 Quest-minmax mirror in profile_decode_upstream_flash_infer.py, #4 eval_longbench_v1.py, #5 eval_longbench_v2.py.
+  - **worker-3** (sequential pipeline): #3 eval_ruler.py, #6 eval_aime25.py, #7 eval_gpqa.py (#6/#7 reuse eval_ruler helpers, hence sequential).
+- **Dependency graph**: #1 blocks #3, #4, #5, #6, #7. #3 additionally blocks #6, #7. #2 and #8 are independent.
+- **Rejected**:
+  - One-task-per-worker (overhead with no parallel speedup; #1 is critical path).
+  - Merging #1 + #3 into one worker (would block #4 and #5 unnecessarily).
+  - New shell sweep scripts (user explicitly removed from scope; §7 of plan).
 - **Risks**:
-  - Forced-seal does NOT exercise the realloc branch (`_next_page_capacity` doubles only on first warmup) — measures steady-state seal cost, NOT amortized realloc cost. Acceptable; production realloc is sub-µs over 1000+ steps. Document in code comment.
-  - Microbench transiently mutates `_comp_n_pages_cached`. Defensive teardown MUST clear BOTH `_comp_n_pages_cached = original_n_cached` AND `_last_comp_kv = None` (the latter prevents poisoning the next live forward via fast-path at `dct_page_attention.py:563`).
-  - Per-LAYER × num_layers extrapolation hides layer-skew if seal-cost varies across layers. Llama-3.1 decoder layers share shape and projection-matrix cache; acceptable for v1. Flag follow-up #1 in plan.
-  - Plausibility window MUST be runtime-derived from `eager_per_token['4_compress'] × num_layers ± 2×`. Hardcoded fallback `[0.05, 5.0]` ms/step only when eager average is unavailable.
-- **5 Load-bearing details** (Architect+Critic verified; do NOT deviate):
-  1. `from dct_page_attention import _dct_page_cfg as cfg; assert cfg is not None, "DCT patch not active"` — `_dct_page_cfg` is a module-level global, NOT an `attn_module` attribute.
-  2. `attn_modules = [m for m in model.modules() if hasattr(m, '_comp_n_pages_cached') and getattr(m, 'layer_idx', -1) == 0]` — pinned to layer 0 for determinism.
-  3. Defensive teardown clears BOTH `_comp_n_pages_cached` and `_last_comp_kv`.
-  4. Plausibility window derived at runtime.
-  5. Mode guard simplified to "DCT patch active" only — `unselected_mode == "compressed"` is unreachable in this driver (argparse `choices=["drop"]` at L572).
-- **Files**:
-  - **MODIFY**: `/home/yoongonkim/DCT-Page/speed/profile_decode_upstream_flash_infer.py` (single file; ~80-100 LOC additive).
-  - **READ-ONLY donor refs**: `/home/yoongonkim/DCT-Page/dct_page_attention.py:128, 522-754, 740, 753, 563` (`_update_comp_cache` body + fast-path read site).
-  - **OUT OF SCOPE — DO NOT TOUCH**: `dct_page_attention.py`, sibling drivers, baselines/, oracle/. NO bash wrappers, NO JSON sidecars.
-- **GPU pinning convention**: `CUDA_VISIBLE_DEVICES=2` for all eval/profile invocations (project convention; check `nvidia-smi` first; 4× A6000 box).
-- **Conda env**: Default DCT_Page (transformers 5.2.0, torch 2.10.0, triton 3.6.0).
-- **Acceptance gates** (5 total):
-  1. Default invocation byte-identical to pre-edit (`diff` empty).
-  2. `--cudagraph_breakdown_seal_microbench` produces non-zero `forced-seal microbench / page_size × layers` line.
-  3. Number is plausible: within ±2× of eager-avg × num_layers (runtime-derived window).
-  4. 32K Llama-3.1-8B smoke: no OOM, `Per-replay (graph)` within ±5% of pre-edit baseline.
-  5. No-DCT path: helper exits with `[ERROR]` line and returns None.
-- **Pipeline**: planner=DONE → executor (worker-1) → verifier (worker-2). Spawn debugger only on real defects.
+  - **#1 is large** (new forward ~250 LOC + 4 helpers + dispatch + per-instance attr + maintainer comment). If it lands buggy, #3-#7 verify will all fail. Worker-1 must verify imports + 3-way dispatch immediately after edit.
+  - **Compressed-mode preflight is duplicated** across #3, #4, #5; drift risk. Consider extracting to a shared helper in dct_page_attention.py if the planner had specced it (didn't); workers replicate verbatim instead.
+  - **`_init_upstream_fi_build_kwargs` post-load pattern is new** — must pick up Llama AND Qwen3 attention modules (different classes; use `hasattr(q_proj, k_proj)` not isinstance check).
+  - **Lazy-init layer-0 race** (architect-flagged; out-of-scope refinement) — assumes vanilla HF generate fires layer 0 first. True for transformers 5.x sequential decode; not asserted.
+  - **Profile driver Quest closure (#2) introduces a lazy import from dct_page_attention** — verify it doesn't break the cold path when score_use_quest_minmax=False.
+- **Load-bearing details (DO NOT deviate)**:
+  1. NEW forward MUST NOT call `pre_allocate_cache` — prefill already did at line 1216-1220; second call would null-deref on `_fi_mode=True` layers (line 68). Read `prefill_len = past_key_values.layers[0]._seen` directly.
+  2. `_upstream_fi_max_decode_steps` is a PER-INSTANCE attribute (`module._upstream_fi_build_kwargs["max_decode_steps"]`), NOT a module global.
+  3. `reset_upstream_fi_cache_state(model)` clears `_dct_runtime_cache_ref` and `_verify_diffs` EXPLICITLY (do NOT add either to `_DCT_RUNTIME_STATE_ATTRS` — that defeats the guard at lines 1119-1121).
+  4. `_generate_with_upstream_fi` does defensive double-clear at entry, sets max_decode_steps, then `try: model.generate(...) finally: reset + empty_cache()`.
+  5. Compressed mode is a HARD ERROR at argparse (not silent SDPA fallback). Hard 64K preflight (NOT soft warning). Greedy-only assert.
+  6. SDPA path bit-identical when `--attention_backend` defaults (no behavior change).
+  7. Quest-minmax simultaneous closure: BOTH new eval forward AND profile driver line 280-297 get the branch. Lazy import in profile driver to keep cold path clean.
+- **Files modified**:
+  - `dct_page_attention.py` (#1)
+  - `speed/profile_decode_upstream_flash_infer.py` (#2 only — Quest mirror)
+  - `eval_ruler.py` (#3)
+  - `eval_longbench_v1.py` (#4)
+  - `eval_longbench_v2.py` (#5)
+  - `eval_aime25.py` (#6)
+  - `eval_gpqa.py` (#7)
+  - `CLAUDE.md` (#8 — doc fix)
+- **Files DO NOT TOUCH**: `speed/upstream_flashinfer_backend.py`, `speed/flashinfer_backend.py`, `triton_kernels.py`, `config.py`, `baselines/**`, all `run_*.sh`.
+- **GPU pinning**: `CUDA_VISIBLE_DEVICES=2` for any eval/profile invocations during verify (project convention; 4× A6000 box).
+- **Conda env**: Default DCT_Page (transformers 5.2.0, torch 2.10.0, triton 3.6.0, flashinfer present).
 - **Remaining**:
-  - **team-exec**: implement plan steps 1-4 in `speed/profile_decode_upstream_flash_infer.py`. Single executor (worker-1).
-  - **team-verify**: 5 acceptance gates (worker-2). Sequential GPU usage on device 2.
+  - **team-exec**: workers run #1 + #2 + #8 in parallel; #3, #4, #5 unlock when #1 done; #6, #7 unlock when #1+#3 done.
+  - **team-verify**: import check + AST parse on all 7 edited files; help-text grep for new flags; 3-way dispatch test; lazy-import smoke test on upstream FI helpers.
   - **team-fix**: only on real defect.

@@ -72,13 +72,13 @@ from profile_decode import (
 # profile_decode.PreAllocatedLayer.update unconditionally writes to
 # self.keys, which crashes with NoneType once flat KV is freed.
 
-# Share the full-KV FlashInfer baseline from the fork profiler — neither
-# baseline nor dct_sdpa need per-head selection, so no reason to duplicate.
-import profile_decode_flash_infer as _pdfi
-from profile_decode_flash_infer import (
-    build_fi_baseline_cache,
-    profiled_baseline_flashinfer_forward,
-)
+# Full-KV FI baseline lives locally in this module (see
+# `build_baseline_upstream_fi_cache` and
+# `profiled_baseline_upstream_flashinfer_forward` below) so that the upstream
+# profiler has zero dependency on the fork profiler / fork backend's per-head
+# `indices` patch. Only stock `BatchDecodeWithPagedKVCacheWrapper` is used.
+from dataclasses import dataclass
+from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 
 from speed_test_dummy import (
     load_model_and_tokenizer,
@@ -258,7 +258,7 @@ def profiled_dct_upstream_flashinfer_forward(
     comp_size = max(1, int(cfg.page_size * cfg.compress_ratio))
     num_pages = (
         cache.last_page_idx_py - cache.num_sink_pages
-        - cache.num_recent_pages_fixed + 1
+        - cache.num_recent_pages_fixed
     )
     buf_l = cache.buf_views[self.layer_idx]   # (B, H, P, 2, ps, 1, d)
     middle = buf_l[:, :, cache.num_sink_pages:cache.num_sink_pages + num_pages]
@@ -289,12 +289,21 @@ def profiled_dct_upstream_flashinfer_forward(
             bsz, _num_kv_heads, num_pages,
             dtype=torch.float32, device=paged_k.device,
         )
-    page_scores = score_pages_triton(
-        query_states, comp_k,
-        cfg.scoring_method, cfg.group_agg_method,
-        self.num_key_value_groups,
-        out=self._page_scores_buf[:, :, :num_pages],
-    )
+    if cfg.score_use_quest_minmax:
+        from dct_page_attention import _update_quest_metadata, _score_pages_quest
+        quest_min_k, quest_max_k = _update_quest_metadata(self, paged_k, num_pages)
+        page_scores = _score_pages_quest(
+            query_states, quest_min_k, quest_max_k,
+            cfg.group_agg_method, self.num_key_value_groups,
+            out=self._page_scores_buf[:, :, :num_pages],
+        )
+    else:
+        page_scores = score_pages_triton(
+            query_states, comp_k,
+            cfg.scoring_method, cfg.group_agg_method,
+            self.num_key_value_groups,
+            out=self._page_scores_buf[:, :, :num_pages],
+        )
 
     if _pd._enabled:
         _rec(5)
@@ -425,7 +434,7 @@ def _build_upstream_fi_cache(model, past_key_values, prefill_len, args):
     max_decode_steps = args.warmup_steps + args.num_decode_steps + 16
     if args.cudagraph:
         max_decode_steps += 64
-    page_budget = num_sink_pages + args.top_k + num_recent_pages_fixed
+    page_budget = num_sink_pages + args.top_k + num_recent_pages_fixed + 1
     bsz = args.batch_size
     vbsz = bsz * num_kv_heads
     print(
@@ -462,9 +471,341 @@ def _build_upstream_fi_cache(model, past_key_values, prefill_len, args):
     return cache
 
 
+# ---------------------------------------------------------------------------
+# Full-KV upstream-FlashInfer baseline (self-contained: no fork dep)
+# ---------------------------------------------------------------------------
+# Mirrors the layout of the fork profiler's full-KV baseline but lives entirely
+# inside this module so the upstream profiler is decoupled. Only stock
+# `BatchDecodeWithPagedKVCacheWrapper` APIs (plan/run + 2-D indices) are used —
+# no per-head `indices` / `page_budget` kwargs from the fork.
+#
+# Layout per layer:
+#   buf[l]: (capacity_pages, 2, page_size, num_kv_heads, head_dim)
+#   capacity_pages = bsz * pages_per_batch.
+#   Batch b owns physical pages [b*pages_per_batch, (b+1)*pages_per_batch).
+#
+# plan() is re-called inside the forward each time a new physical page opens
+# (every page_size decode steps), since `indptr_buf` stride changes with
+# `num_active_pages`. Between page boundaries only `last_page_len_buf` mutates.
+# `use_cuda_graph=True` pins indptr / indices / last_page_len buffers so replan
+# is an in-place scheduler refresh.
+# ---------------------------------------------------------------------------
+@dataclass
+class FullKVUpstreamFIBaselineCache:
+    buf: list  # list[Tensor], one (capacity_pages, 2, ps, nkv, d) per layer
+    wrapper: BatchDecodeWithPagedKVCacheWrapper
+
+    bsz: int
+    page_size: int
+    num_kv_heads: int
+    head_dim: int
+    num_qo_heads: int
+    num_layers: int
+    capacity_pages: int
+    pages_per_batch: int
+
+    dtype: torch.dtype
+    device: torch.device
+
+    indices_buf: torch.Tensor          # (bsz * pages_per_batch,) int32
+    indptr_buf: torch.Tensor           # (bsz+1,) int32
+    last_page_len_buf: torch.Tensor    # (bsz,) int32
+
+    cur_seqlen: int = 0
+    last_page_idx_py: int = 0   # per-batch LOGICAL page index (lockstep)
+    last_page_len_py: int = 0
+    num_active_pages: int = 0   # per-batch active page count (lockstep)
+
+
+def _pack_preallocated_to_paged_per_layer(
+    preallocated_layers,
+    prefill_len: int,
+    page_size: int,
+    capacity_pages: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    bsz: int,
+    pages_per_batch: int,
+):
+    """Pack PreAllocatedLayer → paged buf one layer at a time, freeing each
+    layer's flat keys/values immediately after pack. Pure-torch (no FI ops).
+
+    Mirrors `flashinfer_backend._build_paged_buf_per_layer` — copied locally to
+    sever the upstream profiler's dependency on the fork backend. `_fi_mode`
+    flips on each layer so subsequent `PreAllocatedLayer.update` calls in
+    counter-only mode skip writes to the freed flat KV.
+    """
+    prefill_pages = (prefill_len + page_size - 1) // page_size
+    pad = prefill_pages * page_size - prefill_len
+    bufs = []
+    for layer in preallocated_layers:
+        layer_buf = torch.zeros(
+            capacity_pages, 2, page_size, num_kv_heads, head_dim,
+            dtype=dtype, device=device,
+        )
+        for b in range(bsz):
+            k = layer.keys[b, :, :prefill_len, :]
+            v = layer.values[b, :, :prefill_len, :]
+            if pad:
+                k = torch.nn.functional.pad(k, (0, 0, 0, pad))
+                v = torch.nn.functional.pad(v, (0, 0, 0, pad))
+            k = k.view(num_kv_heads, prefill_pages, page_size, head_dim).permute(1, 2, 0, 3).to(dtype)
+            v = v.view(num_kv_heads, prefill_pages, page_size, head_dim).permute(1, 2, 0, 3).to(dtype)
+            base = b * pages_per_batch
+            layer_buf[base:base + prefill_pages, 0].copy_(k)
+            layer_buf[base:base + prefill_pages, 1].copy_(v)
+        bufs.append(layer_buf)
+        layer._fi_mode = True
+        layer.keys = None
+        layer.values = None
+    return bufs
+
+
+def build_baseline_upstream_fi_cache(
+    preallocated_layers,
+    prefill_len: int,
+    page_size: int,
+    num_kv_heads: int,
+    head_dim: int,
+    num_qo_heads: int,
+    num_layers: int,
+    max_decode_steps: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    bsz: int = 1,
+    workspace_bytes: int = 128 * 1024 * 1024,
+) -> FullKVUpstreamFIBaselineCache:
+    """Pack prefill into an FI paged buffer and plan a full-KV decode wrapper
+    against stock FlashInfer. Per-layer pack frees flat KV one layer at a time
+    so peak transient stays ~one layer's worth above steady-state paged size.
+    """
+    prefill_pages = (prefill_len + page_size - 1) // page_size
+    decode_pages = (max_decode_steps + page_size - 1) // page_size
+    pages_per_batch = prefill_pages + decode_pages + 4
+    capacity_pages = bsz * pages_per_batch
+
+    buf = _pack_preallocated_to_paged_per_layer(
+        preallocated_layers, prefill_len, page_size, capacity_pages,
+        num_kv_heads, head_dim, dtype, device,
+        bsz=bsz, pages_per_batch=pages_per_batch,
+    )
+    torch.cuda.empty_cache()
+
+    base_arange = torch.arange(pages_per_batch, dtype=torch.int32, device=device)
+    batch_offsets = (
+        torch.arange(bsz, dtype=torch.int32, device=device) * pages_per_batch
+    )
+    indices_buf = (
+        base_arange[None, :] + batch_offsets[:, None]
+    ).contiguous().view(-1)
+
+    indptr_buf = (
+        torch.arange(bsz + 1, dtype=torch.int32, device=device) * prefill_pages
+    ).contiguous()
+
+    last_open_page = (prefill_len - 1) // page_size
+    last_open_len = prefill_len - last_open_page * page_size
+    last_page_len_buf = torch.full(
+        (bsz,), last_open_len, dtype=torch.int32, device=device,
+    )
+
+    float_workspace_buffer = torch.empty(
+        workspace_bytes, dtype=torch.uint8, device=device,
+    )
+    wrapper = BatchDecodeWithPagedKVCacheWrapper(
+        float_workspace_buffer,
+        kv_layout="NHD",
+        use_cuda_graph=True,
+        paged_kv_indptr_buffer=indptr_buf,
+        paged_kv_indices_buffer=indices_buf,
+        paged_kv_last_page_len_buffer=last_page_len_buf,
+    )
+    active_slab = (
+        base_arange[:prefill_pages][None, :] + batch_offsets[:, None]
+    ).contiguous().view(-1)
+    wrapper.plan(
+        indptr_buf, active_slab, last_page_len_buf,
+        num_qo_heads, num_kv_heads, head_dim, page_size,
+        q_data_type=dtype, kv_data_type=dtype,
+    )
+
+    return FullKVUpstreamFIBaselineCache(
+        buf=buf, wrapper=wrapper,
+        bsz=bsz,
+        page_size=page_size,
+        num_kv_heads=num_kv_heads, head_dim=head_dim,
+        num_qo_heads=num_qo_heads, num_layers=num_layers,
+        capacity_pages=capacity_pages,
+        pages_per_batch=pages_per_batch,
+        dtype=dtype, device=device,
+        indices_buf=indices_buf, indptr_buf=indptr_buf,
+        last_page_len_buf=last_page_len_buf,
+        cur_seqlen=prefill_len,
+        last_page_idx_py=last_open_page,
+        last_page_len_py=last_open_len,
+        num_active_pages=prefill_pages,
+    )
+
+
+_fi_baseline_cache_ref = [None]
+
+
+def profiled_baseline_upstream_flashinfer_forward(
+    self,
+    hidden_states,
+    position_embeddings,
+    attention_mask=None,
+    past_key_values=None,
+    cache_position=None,
+    **kwargs,
+):
+    """Full-KV (no page selection) decode via stock upstream FlashInfer paged
+    decode. Mirrors `profiled_baseline_flashinfer_forward` from the fork
+    profiler but uses only stock `BatchDecodeWithPagedKVCacheWrapper` APIs.
+
+    4 chained events (same labels as the fork-profiler baseline so the
+    summary table aligns):
+        1_qkv_proj
+        2_rope_and_cache_append
+        8_flashinfer_run
+        9_o_proj
+    """
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+    bsz, q_len = input_shape
+
+    if q_len > 1:
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if past_key_values is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+
+        attention_interface = _pd._get_attention_interface(self)
+        attn_output, attn_weights = attention_interface(
+            self, query_states, key_states, value_states, attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=getattr(self, "sliding_window", None), **kwargs,
+        )
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+    # ---- DECODE PATH (q_len == 1) ----
+    cache = _fi_baseline_cache_ref[0]
+    if cache is None:
+        raise RuntimeError(
+            "Full-KV upstream-FI baseline cache is not set. Build via "
+            "build_baseline_upstream_fi_cache(...) post-prefill and assign to "
+            "_fi_baseline_cache_ref[0] before decode."
+        )
+
+    if _pd._enabled:
+        _dev = hidden_states.device
+        _stream = torch.cuda.current_stream(_dev)
+        ev = [torch.cuda.Event(enable_timing=True) for _ in range(5)]
+        ev[0].record(_stream)
+
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    if _pd._enabled:
+        ev[1].record(_stream)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    cache_bsz = cache.bsz
+    if self.layer_idx == 0:
+        if cache.last_page_len_py == cache.page_size:
+            cache.last_page_idx_py += 1
+            cache.last_page_len_py = 0
+            cache.num_active_pages += 1
+            if cache.num_active_pages > cache.pages_per_batch:
+                raise RuntimeError(
+                    f"FullKVUpstreamFIBaselineCache overflow: "
+                    f"num_active_pages={cache.num_active_pages} > "
+                    f"pages_per_batch={cache.pages_per_batch}. Increase "
+                    f"max_decode_steps at build time."
+                )
+            new_indptr = (
+                torch.arange(
+                    cache_bsz + 1, dtype=torch.int32, device=cache.device,
+                ) * cache.num_active_pages
+            )
+            cache.indptr_buf.copy_(new_indptr)
+            indices_view = cache.indices_buf.view(cache_bsz, cache.pages_per_batch)
+            active_slab = indices_view[:, :cache.num_active_pages].contiguous().view(-1)
+            cache.wrapper.plan(
+                cache.indptr_buf,
+                active_slab,
+                cache.last_page_len_buf,
+                cache.num_qo_heads, cache.num_kv_heads, cache.head_dim,
+                cache.page_size,
+                q_data_type=cache.dtype, kv_data_type=cache.dtype,
+            )
+        cache.last_page_len_py += 1
+        cache.cur_seqlen += 1
+        cache.last_page_len_buf.fill_(cache.last_page_len_py)
+
+    logical_page = cache.last_page_idx_py
+    slot = cache.last_page_len_py - 1
+    layer_buf = cache.buf[self.layer_idx]
+    if cache_bsz == 1:
+        k_flat = key_states[:, :, -1:, :].reshape(cache.num_kv_heads, cache.head_dim)
+        v_flat = value_states[:, :, -1:, :].reshape(cache.num_kv_heads, cache.head_dim)
+        layer_buf[logical_page, 0, slot].copy_(k_flat)
+        layer_buf[logical_page, 1, slot].copy_(v_flat)
+    else:
+        phys = (
+            torch.arange(cache_bsz, dtype=torch.long, device=cache.device)
+            * cache.pages_per_batch + logical_page
+        )
+        k_flat = key_states[:, :, -1:, :].reshape(cache_bsz, cache.num_kv_heads, cache.head_dim)
+        v_flat = value_states[:, :, -1:, :].reshape(cache_bsz, cache.num_kv_heads, cache.head_dim)
+        layer_buf[phys, 0, slot] = k_flat
+        layer_buf[phys, 1, slot] = v_flat
+
+    if _pd._enabled:
+        ev[2].record(_stream)
+
+    q_flat = query_states.reshape(cache_bsz, cache.num_qo_heads, cache.head_dim).contiguous()
+    attn_output = cache.wrapper.run(q_flat, cache.buf[self.layer_idx])
+    attn_output = attn_output.view(cache_bsz, cache.num_qo_heads, 1, cache.head_dim)
+
+    if _pd._enabled:
+        ev[3].record(_stream)
+
+    attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+
+    if _pd._enabled:
+        ev[4].record(_stream)
+        step_names = [
+            "1_qkv_proj",
+            "2_rope_and_cache_append",
+            "8_flashinfer_run",
+            "9_o_proj",
+        ]
+        for i, name in enumerate(step_names):
+            _pd._pending_events.append((name, ev[i], ev[i + 1]))
+
+    return attn_output, None
+
+
 def _reset_mode_state():
     _upstream_fi_cache_ref[0] = None
-    _pdfi._fi_baseline_cache_ref[0] = None
+    _fi_baseline_cache_ref[0] = None
     _pd._quest_cache_ref[0] = None
     _pd._step_timings.clear()
     _pd._cpu_timings.clear()
@@ -540,7 +881,7 @@ def _fi_cache_for_mode(mode):
     if mode == "dct_upstream_flashinfer":
         return _upstream_fi_cache_ref[0]
     if mode == "baseline":
-        return _pdfi._fi_baseline_cache_ref[0]
+        return _fi_baseline_cache_ref[0]
     return None
 
 
@@ -565,7 +906,7 @@ def parse_args():
     p.add_argument("--page_size", type=int, default=32)
     p.add_argument("--top_k", type=int, default=64)
     p.add_argument("--num_sink_pages", type=int, default=1)
-    p.add_argument("--num_recent_pages", type=int, default=5)
+    p.add_argument("--num_recent_pages", type=int, default=4)
     p.add_argument("--compress_ratio", type=float, default=0.125)
     p.add_argument("--scoring_method", default="max", choices=["mean", "max"])
     p.add_argument("--group_agg_method", default="max", choices=["mean", "max"])
@@ -653,9 +994,10 @@ def parse_args():
                         "versions).")
     p.add_argument("--cudagraph_breakdown_seal_microbench",
                    action="store_true", default=False,
-                   help="After graph capture, run a same-process eager forced-seal "
-                        "microbench of _update_comp_cache to produce a truth row "
-                        "for the 4_compress reconciliation block. See Plan v3 "
+                   help="[EAGER MODE] After graph capture, run a same-process "
+                        "eager forced-seal microbench of _update_comp_cache "
+                        "(no CUDA graph) to produce a truth row for the "
+                        "4_compress reconciliation block. See Plan v3 "
                         "(cudagraph-substep-breakdown.md). No-op when flag is absent "
                         "(byte-identical to pre-edit default output).")
     p.add_argument("--cudagraph_breakdown_seal_microbench_iters",
@@ -668,17 +1010,18 @@ def parse_args():
                         "(default 5). Absorbs slow-path realloc + Triton JIT.")
     p.add_argument("--cudagraph_capture_with_seal", action="store_true",
                    default=False,
-                   help="Capture a SLOW-PATH (sealing) decode step instead of "
-                        "the default fast-path step. Just before capture, "
-                        "force `_comp_n_pages_cached -= 1` on every DCT layer "
-                        "so n_new=1 fires and the captured graph contains the "
-                        "compress GEMM + page-copy kernels. Per-replay "
-                        "`4_compress` then reports the in-graph cost (per "
-                        "replay = AS IF every step sealed); the printer also "
-                        "shows the amortized value (graph_4c / page_size). "
-                        "Replays write to a fixed cache slot every time, so "
-                        "this is for TIMING measurement only — never use for "
-                        "correctness runs. Implies --cudagraph.")
+                   help="[IN-GRAPH MODE] Capture a SLOW-PATH (sealing) decode "
+                        "step instead of the default fast-path step. Just "
+                        "before capture, force `_comp_n_pages_cached -= 1` on "
+                        "every DCT layer so n_new=1 fires and the captured "
+                        "graph contains the compress GEMM + page-copy "
+                        "kernels. Per-replay `4_compress` then reports the "
+                        "in-graph cost (per replay = AS IF every step "
+                        "sealed); the printer also shows the amortized value "
+                        "(graph_4c / page_size). Replays write to a fixed "
+                        "cache slot every time, so this is for TIMING "
+                        "measurement only — never use for correctness runs. "
+                        "Implies --cudagraph.")
 
     return p.parse_args()
 
@@ -693,11 +1036,12 @@ def _rebind_instance_forward(model, attn_cls, forward_fn):
 
 
 def _patch_baseline(model, args, original_forward):
-    """Shared full-KV FI baseline (imported from profile_decode_flash_infer)."""
+    """Full-KV FI baseline using stock upstream FlashInfer (defined locally
+    in this module)."""
     restore_forward(args.model, original_forward, model)
     attn_cls = transformers.models.llama.modeling_llama.LlamaAttention
-    attn_cls.forward = profiled_baseline_flashinfer_forward
-    _rebind_instance_forward(model, attn_cls, profiled_baseline_flashinfer_forward)
+    attn_cls.forward = profiled_baseline_upstream_flashinfer_forward
+    _rebind_instance_forward(model, attn_cls, profiled_baseline_upstream_flashinfer_forward)
 
 
 def _patch_dct_sdpa(model, args, original_forward):
@@ -882,7 +1226,7 @@ def _print_graph_breakdown(
         print(f"  Attention total (graph): "
               f"{sum(substep_per_token.values()):.3f} ms/step")
         print(f"  Per-replay (graph):      {per_replay_ms:.3f} ms/step  "
-              f"({agg:.1f} agg tok/s @ bsz={bsz})")
+              f"({agg:.2f} agg tok/s @ bsz={bsz})")
     print()
     attn_total = sum(substep_per_token.values())
     print(f"  {'Step':<25} {'Per-token (ms)':>15} {'% of attn':>12}")
@@ -1168,8 +1512,13 @@ _SUBSTEP_NAME_PATTERNS = {
     # specializations (e.g. `_score_pages_max_max_kernel`, plus `*_c4_g4` /
     # `*_c1_g4` constexpr variants).
     "_score_pages_":               "5_score_pages_kernel",
-    # Topk + pack are fused into a single kernel in the current codebase.
+    # Topk + pack: single-stage kernel fires for num_pages < 1025; two-stage
+    # path (_topk_local_kernel + _topk_merge_and_pack_kernel) fires above that
+    # threshold (triton_kernels.py:_TOPK_TWOSTAGE_MIN_PAGES). Map all three so
+    # `6_topk_and_pack` populates regardless of context length.
     "_topk_sort_and_pack_kernel":  "6_topk_and_pack",
+    "_topk_local_kernel":          "6_topk_and_pack",
+    "_topk_merge_and_pack_kernel": "6_topk_and_pack",
     # FlashInfer — both the decode kernel AND the merge-states kernel
     # (split-kv path on the virtual-batch-per-(b, h) layout) must land here.
     "BatchDecodeWithPagedKVCacheKernel": "7_upstream_fi_run",
@@ -1180,10 +1529,11 @@ _SUBSTEP_NAME_PATTERNS = {
 }
 
 # Baseline (full-KV FI) only fires {1_qkv_proj, 2_rope_and_cache_append,
-# 8_flashinfer_run, 9_o_proj} per the eager-stash in profile_decode_flash_infer.
-# `profiled_baseline_flashinfer_forward`. The DCT-only Triton patterns can't
-# fire in baseline, so we only need to remap the FI bucket to match the
-# baseline eager-stash name (`8_flashinfer_run` vs DCT's `7_upstream_fi_run`).
+# 8_flashinfer_run, 9_o_proj} per the eager-stash in
+# `profiled_baseline_upstream_flashinfer_forward` above. The DCT-only Triton
+# patterns can't fire in baseline, so we only need to remap the FI bucket to
+# match the baseline eager-stash name (`8_flashinfer_run` vs DCT's
+# `7_upstream_fi_run`).
 _SUBSTEP_NAME_PATTERNS_BASELINE = {
     "BatchDecodeWithPagedKVCacheKernel": "8_flashinfer_run",
     "PersistentVariableLengthMergeStatesKernel": "8_flashinfer_run",
@@ -1314,7 +1664,7 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
             f"  Building full-KV FI baseline cache (layers={num_layers}, "
             f"bsz={args.batch_size}, page_size={args.page_size})..."
         )
-        _pdfi._fi_baseline_cache_ref[0] = build_fi_baseline_cache(
+        _fi_baseline_cache_ref[0] = build_baseline_upstream_fi_cache(
             preallocated_layers=past_key_values.layers,
             prefill_len=prefill_len,
             page_size=args.page_size,
@@ -1327,7 +1677,7 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
             device=device,
             bsz=args.batch_size,
         )
-        _bc = _pdfi._fi_baseline_cache_ref[0]
+        _bc = _fi_baseline_cache_ref[0]
         print(
             f"  FI baseline cache ready: capacity_pages={_bc.capacity_pages} "
             f"(pages_per_batch={_bc.pages_per_batch} × bsz={_bc.bsz}), "
@@ -1467,12 +1817,13 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
     # Optional CUDA graph benchmark.
     graph_stats = None
     if args.cudagraph:
-        # FI-mode page alignment: lifted from `profile_decode_flash_infer.py:1568-1590`.
-        # The fork's full-KV baseline forward calls `wrapper.plan()` whenever
-        # a new physical page opens (every page_size decode steps). plan() is
-        # NOT graph-capturable. Priming runs the forward 3 extra times before
-        # the captured iteration, so unless `last_page_len_py + 4 <= page_size`
-        # plan() will land somewhere in the priming/capture window.
+        # FI-mode page alignment.
+        # The full-KV baseline forward (`profiled_baseline_upstream_flashinfer_forward`)
+        # calls `wrapper.plan()` whenever a new physical page opens (every
+        # page_size decode steps). plan() is NOT graph-capturable. Priming
+        # runs the forward 3 extra times before the captured iteration, so
+        # unless `last_page_len_py + 4 <= page_size` plan() will land
+        # somewhere in the priming/capture window.
         #
         # Mitigation: run extra eager decode steps (no profiling) until
         # `last_page_len_py <= page_size - 4`, advancing the open-page counter
@@ -1605,11 +1956,11 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
                 graph_tok_s = 1000.0 / per_replay_ms
                 graph_stats = (per_replay_ms, graph_tok_s)
                 if args.batch_size == 1:
-                    print(f"  CUDA graph: {per_replay_ms:.3f} ms/step  ({graph_tok_s:.1f} tok/s)")
+                    print(f"  CUDA graph: {per_replay_ms:.3f} ms/step  ({graph_tok_s:.2f} tok/s)")
                 else:
                     print(
                         f"  CUDA graph: {per_replay_ms:.3f} ms/step  "
-                        f"({graph_tok_s:.1f} step/s, {graph_tok_s * args.batch_size:.1f} agg tok/s @ bsz={args.batch_size})"
+                        f"({graph_tok_s:.2f} step/s, {graph_tok_s * args.batch_size:.2f} agg tok/s @ bsz={args.batch_size})"
                     )
 
                 # Seal-capture restore: replays don't mutate Python state
@@ -1972,11 +2323,11 @@ def main():
             else:
                 vs_str = "—"
             if bsz == 1:
-                print(f"  {mode:<28} {avg:>10.2f} {tok:>10.1f} {vs_str:>14}")
+                print(f"  {mode:<28} {avg:>10.2f} {tok:>10.2f} {vs_str:>14}")
             else:
                 print(
-                    f"  {mode:<28} {avg:>10.2f} {tok:>10.1f} "
-                    f"{tok * bsz:>11.1f} {vs_str:>14}"
+                    f"  {mode:<28} {avg:>10.2f} {tok:>10.2f} "
+                    f"{tok * bsz:>11.2f} {vs_str:>14}"
                 )
 
         any_graph = any(r[3] is not None for r in results.values())
@@ -2005,11 +2356,11 @@ def main():
                 else:
                     vs_str = "—"
                 if bsz == 1:
-                    print(f"  {mode:<28} {gp:>10.2f} {gts:>10.1f} {vs_str:>14}")
+                    print(f"  {mode:<28} {gp:>10.2f} {gts:>10.2f} {vs_str:>14}")
                 else:
                     print(
-                        f"  {mode:<28} {gp:>10.2f} {gts:>10.1f} "
-                        f"{gts * bsz:>11.1f} {vs_str:>14}"
+                        f"  {mode:<28} {gp:>10.2f} {gts:>10.2f} "
+                        f"{gts * bsz:>11.2f} {vs_str:>14}"
                     )
 
     if verify_state:

@@ -1035,7 +1035,7 @@ class MassRecallRecorder:
         # whole-page sink, whole-page recent (last page may be partial absorbing
         # the alignment remainder), and the middle carved into whole pages.
         sink_len = self.num_sink_pages * self.page_size
-        recent_min = (self.num_recent_pages - 1) * self.page_size
+        recent_min = self.num_recent_pages * self.page_size
         if kv_len < sink_len + self.page_size + recent_min:
             return  # nothing meaningful to page
         num_pages = (kv_len - sink_len - recent_min) // self.page_size
@@ -1262,7 +1262,7 @@ class PagedMassRatioSweepRecorder:
         assert H_q == H_kv * num_kv_groups
 
         sink_len = self.num_sink_pages * self.page_size
-        recent_min = (self.num_recent_pages - 1) * self.page_size
+        recent_min = self.num_recent_pages * self.page_size
         if kv_len < sink_len + self.page_size + recent_min:
             return
         num_pages = (kv_len - sink_len - recent_min) // self.page_size

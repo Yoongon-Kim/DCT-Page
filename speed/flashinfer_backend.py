@@ -54,10 +54,11 @@ Key layout choice (pages aligned with token 0 within each batch):
                                                  (last entry = last_page_idx[b],
                                                  the currently-open page)
 
-`num_recent_pages_fixed` INCLUDES the open page (recent_offsets span
-[-R+1, 0]). This lets `last_page_len_buf` track the current length of the open
-page directly — FlashInfer's standard contract (last entry in indices is the
-last page; `paged_kv_last_page_len` is its valid length).
+`num_recent_pages_fixed` EXCLUDES the open page; the open page is implicit
+(+1) and recent_offsets span [-R, 0] (length R+1, last entry = 0 selects the
+currently-open page). `last_page_len_buf` tracks the current length of the
+open page directly — FlashInfer's standard contract (last entry in indices
+is the last page; `paged_kv_last_page_len` is its valid length).
 
 Sink contract: page 0 (per-batch logical) is sink iff `num_sink_pages >= 1`.
 With `num_sink_pages=1` the entire first physical page (page_size tokens) of
@@ -95,7 +96,9 @@ class FlashInferPagedKVCache:
     together, ragged is not supported.
 
     Fixed-width indices: `page_budget = num_sink_pages + top_k +
-    num_recent_pages_fixed` entries per (batch, kv_head) row. `plan()` is
+    num_recent_pages_fixed + 1` entries per (batch, kv_head) row (the +1 is
+    the open page, implicit on top of `num_recent_pages_fixed` full recent
+    pages). `plan()` is
     called once at build time with this budget; `run()` reads the latest
     indices/last_page_len out of the pre-allocated buffers.
 
@@ -126,7 +129,7 @@ class FlashInferPagedKVCache:
 
     num_sink_pages: int
     top_k: int
-    num_recent_pages_fixed: int  # includes the currently-open page
+    num_recent_pages_fixed: int  # full recent pages, EXCLUDES the open page (open is implicit, +1)
     page_budget: int
 
     # Pre-allocated wrapper-owned buffers.
@@ -135,7 +138,7 @@ class FlashInferPagedKVCache:
     indices_buf: torch.Tensor            # (bsz, num_kv_heads, page_budget) int32 — Triton-facing permuted view of storage
     indptr_buf: torch.Tensor             # (bsz + 1,) int32, arange * page_budget
     last_page_len_buf: torch.Tensor      # (bsz,) int32, uniform under lockstep
-    recent_offsets: torch.Tensor         # (num_recent_pages_fixed,) int32
+    recent_offsets: torch.Tensor         # (num_recent_pages_fixed + 1,) int32 (full recent + open page at offset 0)
     last_page_idx: torch.Tensor          # (bsz,) int32, batch-biased physical IDs
 
     # Reusable scratch for batched H2D refresh of last_page_idx every decode
@@ -253,10 +256,10 @@ def build_flashinfer_paged_cache(
     """Build a FlashInferPagedKVCache populated from `preallocated_layers`
     (list of PreAllocatedLayer, one per model layer).
 
-    `num_recent_pages_fixed` INCLUDES the currently-open page (contract of
+    `num_recent_pages_fixed` EXCLUDES the currently-open page (contract of
     this backend — see module docstring). It is the same `cfg.num_recent_pages`
-    from `DCTPageConfig`; the +1-for-open-page bookkeeping is encoded in the
-    page-unit contract directly.
+    from `DCTPageConfig`. The open page is implicit and always allocated as
+    +1, so total recent slots = `num_recent_pages_fixed + 1`.
 
     `bsz` controls the per-batch disjoint physical-page pool layout: each
     batch b owns pages [b * pages_per_batch, (b+1) * pages_per_batch). All
@@ -270,14 +273,15 @@ def build_flashinfer_paged_cache(
             f"num_sink_pages=1 page 0 is fully attended (page_size tokens "
             f"of unconditional attention)."
         )
-    if num_recent_pages_fixed < 1:
+    if num_recent_pages_fixed < 0:
         raise ValueError(
-            "num_recent_pages_fixed must be >= 1 (includes the currently-open page)."
+            "num_recent_pages_fixed must be >= 0 (excludes the currently-open page; "
+            "the open page is implicit, +1)."
         )
     if bsz < 1:
         raise ValueError(f"bsz ({bsz}) must be >= 1")
 
-    page_budget = num_sink_pages + top_k + num_recent_pages_fixed
+    page_budget = num_sink_pages + top_k + num_recent_pages_fixed + 1
 
     # Per-batch capacity in physical pages.
     prefill_pages = (prefill_len + page_size - 1) // page_size
@@ -342,11 +346,12 @@ def build_flashinfer_paged_cache(
     )
     last_page_idx = batch_offsets + last_open_page
 
-    # recent_offsets: spans [-R+1, 0], so recent region ends at last_page_idx
-    # itself (the currently-open page). Stage 5 kernel adds `last_page_idx[b]`
-    # (already batch-biased) then stores into indices_buf[b, h, num_sink+top_k:].
+    # recent_offsets: spans [-R, 0] (length R+1), so recent region covers R
+    # full recent pages plus the currently-open page (offset 0 = last_page_idx
+    # itself). Stage 5 kernel adds `last_page_idx[b]` (already batch-biased)
+    # then stores into indices_buf[b, h, num_sink+top_k:].
     recent_offsets = torch.arange(
-        -num_recent_pages_fixed + 1, 1, dtype=torch.int32, device=device,
+        -num_recent_pages_fixed, 1, dtype=torch.int32, device=device,
     )
 
     # Wrapper with pre-allocated buffers. use_cuda_graph=True forces static

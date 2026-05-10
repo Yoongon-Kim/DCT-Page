@@ -43,7 +43,13 @@ if _BASELINES_DIR not in sys.path:
 import torch
 from tqdm import tqdm
 
-from eval_ruler import model_name_tag, apply_monkey_patch, load_model_and_tokenizer
+from eval_ruler import (
+    model_name_tag,
+    apply_monkey_patch,
+    load_model_and_tokenizer,
+    _resolve_middle_top_k,
+    _validate_upstream_fi_args,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +228,9 @@ def parse_args():
 
     # DCT Page Attention params
     parser.add_argument("--page_size", type=int, default=32)
-    parser.add_argument("--top_k", type=int, default=64)
+    parser.add_argument("--top_k", type=int, default=64,
+                        help="Total selected page budget (sink + middle + recent). "
+                             "DCTPageConfig receives total - sink - recent as its internal top_k.")
     parser.add_argument("--num_sink_pages", type=int, default=1)
     parser.add_argument("--num_recent_pages", type=int, default=5)
     parser.add_argument("--compress_ratio", type=float, default=0.03125)
@@ -236,6 +244,18 @@ def parse_args():
                         choices=["mixed", "block_center"])
     parser.add_argument("--continuous_rope", action="store_true")
     parser.add_argument("--no_triton", action="store_true")
+    parser.add_argument("--attention_backend", type=str, default="sdpa",
+                        choices=["sdpa", "upstream_flashinfer"],
+                        help="Attention backend for page_attention mode. "
+                             "'sdpa' (default): assemble + torch.scaled_dot_product_attention "
+                             "(unchanged production path). "
+                             "'upstream_flashinfer': stock FlashInfer paged-decode kernel via "
+                             "virtual-batch-per-(batch, KV head) layout (drop mode only). "
+                             "Ignored for non-page_attention modes.")
+    parser.add_argument("--verify_upstream_fi", action="store_true",
+                        help="When --attention_backend upstream_flashinfer, run a per-layer SDPA "
+                             "shadow comparison and log the per-step max-abs-diff distribution. "
+                             "bf16 noise floor on this hardware is 0.05.")
     parser.add_argument("--comp_kv_quant", type=str, default="none",
                         choices=["none", "fp8_e4m3", "fp8_e5m2", "int8", "int4"])
     parser.add_argument("--comp_kv_quant_granularity", type=str, default="per_page",
@@ -278,7 +298,7 @@ def parse_args():
         if args.mode == "baseline":
             args.run_name = f"{tag}_baseline_{suffix}"
         elif args.mode == "page_attention":
-            args.run_name = (f"{tag}_page_attn_topk{args.top_k}_cr{args.compress_ratio}"
+            args.run_name = (f"{tag}_page_attn_topk{args.top_k}T_cr{args.compress_ratio}"
                              f"_ps{args.page_size}_{args.unselected_mode}_{args.comp_kv_quant}"
                              f"_{suffix}")
         elif args.mode == "seer_attention":
@@ -357,6 +377,37 @@ def evaluate(model, tokenizer, dataset, args):
                 output_ids = args._inf_llm_generator.generate(
                     input_ids,
                     max_new_tokens=args.max_new_tokens,
+                )
+            elif args.mode == "page_attention" and args.attention_backend == "upstream_flashinfer":
+                from dct_page_attention import _generate_with_upstream_fi
+                if args.verify_upstream_fi:
+                    for _m in model.modules():
+                        if hasattr(_m, "q_proj") and hasattr(_m, "k_proj"):
+                            _m._verify_upstream = True
+
+                def _harvest_verify_diffs(_model, _output_ids):
+                    if not args.verify_upstream_fi:
+                        return
+                    all_diffs = []
+                    for _m in _model.modules():
+                        diffs = getattr(_m, "_verify_diffs", None)
+                        if diffs:
+                            all_diffs.extend(diffs)
+                    if all_diffs:
+                        import numpy as _np
+                        arr = _np.array(all_diffs)
+                        print(f"  [verify] _verify_diffs n={len(all_diffs)} "
+                              f"max={arr.max():.4f} "
+                              f"p99={_np.percentile(arr, 99):.4f} "
+                              f"p50={_np.percentile(arr, 50):.4f}")
+
+                output_ids = _generate_with_upstream_fi(
+                    model,
+                    input_ids,
+                    max_new_tokens=args.max_new_tokens,
+                    on_post_generate=_harvest_verify_diffs,
+                    do_sample=False,
+                    use_cache=True,
                 )
             else:
                 output_ids = model.generate(
@@ -452,6 +503,7 @@ def build_summary(results, args):
 
     if args.mode == "page_attention":
         summary["top_k"] = args.top_k
+        summary["middle_top_k"] = _resolve_middle_top_k(args)
         summary["page_size"] = args.page_size
         summary["compress_ratio"] = args.compress_ratio
         summary["scoring_method"] = args.scoring_method
@@ -507,6 +559,10 @@ def main():
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
+
+    # Hard preflights for --attention_backend upstream_flashinfer (compressed-mode
+    # reject, greedy-only assert, projected paged-KV memory). No-op for sdpa.
+    _validate_upstream_fi_args(args)
 
     print("=" * 60)
     print(f"LOADING MODEL (mode={args.mode})")

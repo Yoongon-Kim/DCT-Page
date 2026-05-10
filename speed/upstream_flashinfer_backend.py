@@ -112,7 +112,7 @@ class UpstreamFlashInferPagedKVCache:
     num_sink_pages: int
     top_k: int
     num_recent_pages_fixed: int
-    page_budget: int                  # num_sink_pages + top_k + num_recent_pages_fixed
+    page_budget: int                  # num_sink_pages + top_k + num_recent_pages_fixed + 1 (the +1 is the implicit open page)
 
     # Pre-allocated wrapper-owned buffers.
     float_workspace_buffer: torch.Tensor
@@ -120,7 +120,7 @@ class UpstreamFlashInferPagedKVCache:
     indices_flat_buf: torch.Tensor    # (B*H * page_budget,) int32, PHYSICAL
     indptr_buf: torch.Tensor          # (B*H + 1,) int32
     last_page_len_buf: torch.Tensor   # (B*H,) int32
-    recent_offsets: torch.Tensor      # (num_recent_pages_fixed,) int32
+    recent_offsets: torch.Tensor      # (num_recent_pages_fixed + 1,) int32 (full recent + open page at offset 0)
     last_page_idx: torch.Tensor       # (B,) int32, broadcast head-local logical
 
     head_offset: torch.Tensor         # (B*H, 1) int32, value (b*H + h) * pages_per_head
@@ -223,8 +223,9 @@ def build_upstream_flashinfer_paged_cache(
     workspace_bytes: int = 128 * 1024 * 1024,
 ) -> UpstreamFlashInferPagedKVCache:
     """Build a virtual-batch-per-(b,h) cache populated from DCT's prefilled
-    `preallocated_layers`. `num_recent_pages_fixed` INCLUDES the open page
-    (same contract as `flashinfer_backend.build_flashinfer_paged_cache`).
+    `preallocated_layers`. `num_recent_pages_fixed` EXCLUDES the open page;
+    the open page is implicit (+1) — same contract as
+    `flashinfer_backend.build_flashinfer_paged_cache`.
 
     Vbatch ordering: `v = b*H + h` (h-contiguous within each batch). This is
     asserted at build via `head_offset == arange(B*H) * pages_per_head`.
@@ -239,12 +240,15 @@ def build_upstream_flashinfer_paged_cache(
     group_size = num_qo_heads // num_kv_heads
     if num_sink_pages < 1:
         raise ValueError("num_sink_pages must be >= 1.")
-    if num_recent_pages_fixed < 1:
-        raise ValueError("num_recent_pages_fixed must be >= 1 (includes open page).")
+    if num_recent_pages_fixed < 0:
+        raise ValueError(
+            "num_recent_pages_fixed must be >= 0 (excludes the currently-open page; "
+            "the open page is implicit, +1)."
+        )
     if bsz < 1:
         raise ValueError(f"bsz ({bsz}) must be >= 1")
 
-    page_budget = num_sink_pages + top_k + num_recent_pages_fixed
+    page_budget = num_sink_pages + top_k + num_recent_pages_fixed + 1
     vbsz = bsz * num_kv_heads
 
     prefill_pages = (prefill_len + page_size - 1) // page_size
@@ -339,7 +343,7 @@ def build_upstream_flashinfer_paged_cache(
     )
 
     recent_offsets = torch.arange(
-        -num_recent_pages_fixed + 1, 1, dtype=torch.int32, device=device,
+        -num_recent_pages_fixed, 1, dtype=torch.int32, device=device,
     )
 
     float_workspace_buffer = torch.empty(

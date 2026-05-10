@@ -457,7 +457,7 @@ def profiled_dct_flashinfer_forward(
     # `last_page_idx_py` is the per-batch LOGICAL page index (lockstep).
     num_pages = (
         cache.last_page_idx_py - cache.num_sink_pages
-        - cache.num_recent_pages_fixed + 1
+        - cache.num_recent_pages_fixed
     )
     comp_size = max(1, int(cfg.page_size * cfg.compress_ratio))
     paged_k, paged_v = paged_views_from_buf(
@@ -1013,13 +1013,13 @@ def _build_fi_cache(model, past_key_values, prefill_len, args):
     head_dim = cfg_model.hidden_size // num_qo_heads
     num_layers = cfg_model.num_hidden_layers
     num_sink_pages = args.num_sink_pages
-    # num_recent_pages INCLUDES the currently-open page (Stage 6 contract — FI's
-    # last entry in indices IS the open page).
+    # num_recent_pages EXCLUDES the currently-open page (open is implicit, +1).
+    # FI's last entry in indices IS the open page (recent_offsets cover [-R, 0]).
     num_recent_pages_fixed = args.num_recent_pages
     max_decode_steps = args.warmup_steps + args.num_decode_steps + 16
     if args.cudagraph:
         max_decode_steps += 64
-    page_budget = num_sink_pages + args.top_k + num_recent_pages_fixed
+    page_budget = num_sink_pages + args.top_k + num_recent_pages_fixed + 1
     bsz = args.batch_size
     print(
         f"  Building FlashInfer cache: bsz={bsz}, layers={num_layers}, "
@@ -1094,8 +1094,8 @@ def parse_args():
     p.add_argument("--num_sink_pages", type=int, default=1,
                    help="First N physical pages always attended (sink).")
     p.add_argument("--num_recent_pages", type=int, default=5,
-                   help="Last M physical pages always attended (recent), "
-                        "INCLUDES the currently-open partial page.")
+                   help="Number of full recent pages always attended; "
+                        "EXCLUDES the currently-open partial page (open is implicit, +1).")
     p.add_argument("--compress_ratio", type=float, default=0.125)
     p.add_argument("--scoring_method", default="max", choices=["mean", "max"])
     p.add_argument("--group_agg_method", default="max", choices=["mean", "max"])

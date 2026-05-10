@@ -1019,10 +1019,10 @@ def run_profiled_decode(model, tokenizer, args, mode):
         head_dim = cfg_model.hidden_size // num_qo_heads
         num_layers = cfg_model.num_hidden_layers
         num_sink_pages = args.num_sink_pages
-        # num_recent_pages INCLUDES the currently-open page; fixing the count
-        # keeps total_selected constant (required for CUDA-graph capture).
+        # num_recent_pages EXCLUDES the currently-open page (open is implicit, +1);
+        # fixing the count keeps total_selected constant (required for CUDA-graph capture).
         num_recent_pages_fixed = args.num_recent_pages
-        max_total_selected = num_sink_pages + args.top_k + num_recent_pages_fixed
+        max_total_selected = num_sink_pages + args.top_k + num_recent_pages_fixed + 1
         max_decode_steps = args.warmup_steps + args.num_decode_steps + 16
         print(f"  Building Quest paged cache (layers={num_layers}, "
               f"page_size={args.page_size}, num_sink_pages={num_sink_pages}, "

@@ -29,7 +29,7 @@ from datasets import load_dataset
 from fuzzywuzzy import fuzz
 from rouge import Rouge
 
-from eval_ruler import model_name_tag
+from eval_ruler import model_name_tag, _resolve_middle_top_k
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -400,16 +400,16 @@ def compute_effective_len(input_len, args):
 
     kv_len = input_len + 1  # first decode step adds one token to cache
 
-    min_len_for_paging = (args.num_sink_pages + args.top_k + 1 + args.num_recent_pages) * args.page_size
+    min_len_for_paging = (args.top_k + 1) * args.page_size
     if kv_len < min_len_for_paging:
         return kv_len
 
     sink_tokens = args.num_sink_pages * args.page_size
-    recent_tokens_min = (args.num_recent_pages - 1) * args.page_size
+    recent_tokens_min = args.num_recent_pages * args.page_size
     pageable_len = kv_len - sink_tokens - recent_tokens_min
     num_pages = pageable_len // args.page_size
     actual_recent = kv_len - sink_tokens - num_pages * args.page_size
-    top_k = min(args.top_k, num_pages)
+    top_k = min(args.top_k - args.num_sink_pages - args.num_recent_pages, num_pages)
 
     if args.unselected_mode == "drop":
         return sink_tokens + top_k * args.page_size + actual_recent
@@ -452,7 +452,9 @@ def parse_args():
 
     # DCT Page Attention params (only used when mode=page_attention)
     parser.add_argument("--page_size", type=int, default=32)
-    parser.add_argument("--top_k", type=int, default=64)
+    parser.add_argument("--top_k", type=int, default=64,
+                        help="Total selected page budget (sink + middle + recent). "
+                             "DCTPageConfig receives total - sink - recent as its internal top_k.")
     parser.add_argument("--num_sink_pages", type=int, default=1)
     parser.add_argument("--num_recent_pages", type=int, default=5)
     parser.add_argument("--compress_ratio", type=float, default=0.03125)
@@ -470,6 +472,30 @@ def parse_args():
                         help="Temporarily disabled — raises error if used")
     parser.add_argument("--no_triton", action="store_true",
                         help="Disable Triton kernels (use pure PyTorch for comparison)")
+    parser.add_argument(
+        "--attention_backend",
+        type=str,
+        default="sdpa",
+        choices=["sdpa", "upstream_flashinfer"],
+        help=(
+            "Attention backend for page_attention mode. "
+            "'sdpa' (default): assemble + torch.scaled_dot_product_attention "
+            "(unchanged production path). "
+            "'upstream_flashinfer': stock FlashInfer paged-decode kernel via "
+            "virtual-batch-per-(batch, KV head) layout (drop mode only). "
+            "Ignored for non-page_attention modes."
+        ),
+    )
+    parser.add_argument(
+        "--verify_upstream_fi",
+        action="store_true",
+        help=(
+            "When --attention_backend upstream_flashinfer, run a per-layer SDPA "
+            "shadow comparison and log the per-step max-abs-diff distribution. "
+            "bf16 noise floor on this hardware is 0.05 — see project memory "
+            "project_upstream_fi_multibatch.md."
+        ),
+    )
     parser.add_argument("--comp_kv_quant", type=str, default="none",
                         choices=["none", "fp8_e4m3", "fp8_e5m2", "int8", "int4"],
                         help="Fake-quantization of compressed K/V at write time "
@@ -509,7 +535,7 @@ def parse_args():
             args.run_name = (f"{tag}_inf_llm_nini{args.inf_llm_n_init}"
                              f"_repr{args.inf_llm_repr_topk}")
         else:
-            args.run_name = f"{tag}_page_attn_topk{args.top_k}_{args.comp_kv_quant}"
+            args.run_name = f"{tag}_page_attn_topk{args.top_k}T_{args.comp_kv_quant}"
 
     return args
 
@@ -567,6 +593,41 @@ def evaluate_task(model, tokenizer, task, dataset, args):
                 output_ids = args._inf_llm_generator.generate(
                     input_ids,
                     max_new_tokens=max_gen,
+                )
+            elif args.mode == "page_attention" and args.attention_backend == "upstream_flashinfer":
+                from dct_page_attention import _generate_with_upstream_fi
+                if args.verify_upstream_fi:
+                    for _m in model.modules():
+                        if hasattr(_m, "q_proj") and hasattr(_m, "k_proj"):
+                            _m._verify_upstream = True
+
+                def _harvest_verify_diffs(_model, _output_ids):
+                    if not args.verify_upstream_fi:
+                        return
+                    all_diffs = []
+                    for _m in _model.modules():
+                        diffs = getattr(_m, "_verify_diffs", None)
+                        if diffs:
+                            all_diffs.extend(diffs)
+                    if all_diffs:
+                        import numpy as _np
+                        arr = _np.array(all_diffs)
+                        print(f"  [verify] _verify_diffs n={len(all_diffs)} "
+                              f"max={arr.max():.4f} "
+                              f"p99={_np.percentile(arr, 99):.4f} "
+                              f"p50={_np.percentile(arr, 50):.4f}")
+
+                output_ids = _generate_with_upstream_fi(
+                    model,
+                    input_ids,
+                    max_new_tokens=max_gen,
+                    on_post_generate=_harvest_verify_diffs,
+                    num_beams=1,
+                    do_sample=False,
+                    temperature=1.0,
+                    min_length=input_len + 1,
+                    eos_token_id=[tokenizer.eos_token_id],
+                    use_cache=True,
                 )
             else:
                 output_ids = model.generate(
@@ -696,6 +757,7 @@ def write_run_summary(run_dir, run_name, mode, model_name, all_task_results, arg
     }
     if mode == "page_attention":
         summary_json["top_k"] = args.top_k
+        summary_json["middle_top_k"] = _resolve_middle_top_k(args)
         summary_json["page_size"] = args.page_size
         summary_json["scoring_method"] = args.scoring_method
         summary_json["group_agg_method"] = args.group_agg_method
@@ -729,10 +791,105 @@ def write_run_summary(run_dir, run_name, mode, model_name, all_task_results, arg
 
 
 # ---------------------------------------------------------------------------
+# Upstream-FlashInfer preflight validation
+# ---------------------------------------------------------------------------
+# NOTE: keep this function name/logic IDENTICAL across eval_ruler.py,
+# eval_longbench_v1.py, and eval_longbench_v2.py so future maintainers can grep.
+def _validate_upstream_fi_args(args):
+    """Hard preflights for --attention_backend upstream_flashinfer.
+
+    Three checks (all hard errors, no silent downgrade):
+      1. compressed-mode reject: upstream FI does not implement compressed mode.
+      2. 64K memory preflight: refuses to start when projected paged-KV exceeds
+         0.9 * total GPU memory (uses approximate model dims for known families).
+      3. greedy-only assert: beam search / sampling break the lazy-init contract.
+    """
+    backend = getattr(args, "attention_backend", "sdpa")
+    if backend != "upstream_flashinfer":
+        return
+    if getattr(args, "mode", None) != "page_attention":
+        return
+
+    # 1. Compressed-mode hard error.
+    if getattr(args, "unselected_mode", "drop") != "drop":
+        raise SystemExit(
+            f"--attention_backend upstream_flashinfer requires "
+            f"--unselected_mode drop (got {args.unselected_mode!r}). "
+            f"Use --attention_backend sdpa for compressed mode. "
+            f"To sweep both modes, run two passes."
+        )
+
+    # 2. Greedy-only hard assert. Eval scripts default to greedy; this is defensive.
+    do_sample = getattr(args, "do_sample", False)
+    num_beams = getattr(args, "num_beams", 1)
+    num_return_sequences = getattr(args, "num_return_sequences", 1)
+    if do_sample or num_beams > 1 or num_return_sequences > 1:
+        raise SystemExit(
+            f"--attention_backend upstream_flashinfer requires greedy decoding "
+            f"(do_sample=False, num_beams=1, num_return_sequences=1). "
+            f"Got do_sample={do_sample}, num_beams={num_beams}, "
+            f"num_return_sequences={num_return_sequences}. "
+            f"The lazy-init cache contract assumes one forward per decode step."
+        )
+
+    # 3. 64K paged-KV memory preflight. Use approximate dims for known families.
+    # LongBench v1: prompts can run up to args.max_input_len tokens.
+    max_seq_len = int(getattr(args, "max_input_len", 0) or 0)
+    if max_seq_len <= 0:
+        return
+    max_new_tokens_override = int(getattr(args, "max_new_tokens_override", 0) or 0)
+    if max_new_tokens_override > 0:
+        max_decode_steps = max(max_new_tokens_override, 256)
+    else:
+        max_decode_steps = max(max(TASK_MAX_NEW_TOKENS.values()), 256)
+    page_size = int(getattr(args, "page_size", 32))
+    num_sink_pages = int(getattr(args, "num_sink_pages", 1))
+    num_recent_pages = int(getattr(args, "num_recent_pages", 5))
+
+    name = (getattr(args, "base_model", "") or "").lower()
+    if "llama" in name:
+        num_kv_heads, num_layers, head_dim = 8, 32, 128
+    elif "qwen3" in name:
+        num_kv_heads, num_layers, head_dim = 8, 36, 128
+    else:
+        print(f"  [preflight] WARNING: unknown model family for {name!r}; "
+              f"skipping upstream-FI memory preflight.")
+        return
+
+    import math
+    pages_per_head = (
+        math.ceil((max_seq_len + max_decode_steps) / page_size)
+        + num_sink_pages
+        + (num_recent_pages + 1)
+    )
+    bsz = 1  # eval scripts process one sample at a time
+    proj_bytes = (
+        bsz * num_kv_heads * pages_per_head * 2 * page_size * head_dim * 2 * num_layers
+    )
+    try:
+        total_bytes = torch.cuda.get_device_properties(0).total_memory
+    except Exception as e:
+        print(f"  [preflight] WARNING: could not query GPU memory ({e}); "
+              f"skipping upstream-FI memory preflight.")
+        return
+    threshold = 0.9 * total_bytes
+    if proj_bytes > threshold:
+        raise SystemExit(
+            f"--attention_backend upstream_flashinfer projected paged-KV memory "
+            f"({proj_bytes / 1e9:.2f} GiB) exceeds 0.9 * total GPU memory "
+            f"({threshold / 1e9:.2f} GiB of {total_bytes / 1e9:.2f} GiB). "
+            f"Reduce --max_input_len (={max_seq_len}) or run on a larger GPU."
+        )
+    print(f"  [preflight] upstream-FI projected paged-KV: "
+          f"{proj_bytes / 1e9:.2f} GiB (threshold {threshold / 1e9:.2f} GiB) — OK")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
     args = parse_args()
+    _validate_upstream_fi_args(args)
 
     seed = 42
     torch.manual_seed(seed)
@@ -746,7 +903,7 @@ def main():
             from dct_page_attention import replace_llama_attn
             replace_llama_attn(
                 page_size=args.page_size,
-                top_k=args.top_k,
+                top_k=_resolve_middle_top_k(args),
                 num_sink_pages=args.num_sink_pages,
                 num_recent_pages=args.num_recent_pages,
                 compress_ratio=args.compress_ratio,
@@ -759,12 +916,13 @@ def main():
                 weight_compressed_by_population=True,
                 comp_kv_quant=args.comp_kv_quant,
                 comp_kv_quant_granularity=args.comp_kv_quant_granularity,
+                attention_backend=args.attention_backend,
             )
         elif "qwen3" in model_name_lower:
             from dct_page_attention import replace_qwen3_attn
             replace_qwen3_attn(
                 page_size=args.page_size,
-                top_k=args.top_k,
+                top_k=_resolve_middle_top_k(args),
                 num_sink_pages=args.num_sink_pages,
                 num_recent_pages=args.num_recent_pages,
                 compress_ratio=args.compress_ratio,
@@ -777,12 +935,13 @@ def main():
                 weight_compressed_by_population=True,
                 comp_kv_quant=args.comp_kv_quant,
                 comp_kv_quant_granularity=args.comp_kv_quant_granularity,
+                attention_backend=args.attention_backend,
             )
         else:
             from dct_page_attention import replace_qwen2_attn
             replace_qwen2_attn(
                 page_size=args.page_size,
-                top_k=args.top_k,
+                top_k=_resolve_middle_top_k(args),
                 num_sink_pages=args.num_sink_pages,
                 num_recent_pages=args.num_recent_pages,
                 compress_ratio=args.compress_ratio,
@@ -795,6 +954,7 @@ def main():
                 weight_compressed_by_population=True,
                 comp_kv_quant=args.comp_kv_quant,
                 comp_kv_quant_granularity=args.comp_kv_quant_granularity,
+                attention_backend=args.attention_backend,
             )
     elif args.mode == "multipole_attention":
         from multipole_attn import replace_attn_multipole
@@ -932,6 +1092,13 @@ def main():
             init_inf_llm(model, INF_LLM_CONFIG)
             args._inf_llm_generator = build_inf_llm_generator(model, tokenizer, INF_LLM_CONFIG)
 
+    # Seed per-attention-module `_upstream_fi_build_kwargs` AFTER from_pretrained.
+    # `replace_*_attn` runs BEFORE model load by project convention, so this
+    # post-load walk is the only safe time to stash per-instance state.
+    if args.mode == "page_attention" and getattr(args, "attention_backend", "sdpa") == "upstream_flashinfer":
+        from dct_page_attention import _init_upstream_fi_build_kwargs
+        _init_upstream_fi_build_kwargs(model)
+
     # Evaluate each task
     all_task_results = {}
     for task in args.tasks:
@@ -970,6 +1137,7 @@ def main():
     }
     if args.mode == "page_attention":
         summary["top_k"] = args.top_k
+        summary["middle_top_k"] = _resolve_middle_top_k(args)
         summary["page_size"] = args.page_size
         summary["scoring_method"] = args.scoring_method
         summary["group_agg_method"] = args.group_agg_method

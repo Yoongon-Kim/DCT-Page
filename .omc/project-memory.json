@@ -166,8 +166,20 @@
   "hotPaths": [
     {
       "path": "speed/profile_decode_upstream_flash_infer.py",
-      "accessCount": 103,
-      "lastAccessed": 1778231564172,
+      "accessCount": 151,
+      "lastAccessed": 1778400745229,
+      "type": "file"
+    },
+    {
+      "path": "dct_page_attention.py",
+      "accessCount": 75,
+      "lastAccessed": 1778400347426,
+      "type": "file"
+    },
+    {
+      "path": "eval_ruler.py",
+      "accessCount": 55,
+      "lastAccessed": 1778398312338,
       "type": "file"
     },
     {
@@ -177,33 +189,51 @@
       "type": "file"
     },
     {
-      "path": "dct_page_attention.py",
-      "accessCount": 25,
-      "lastAccessed": 1778381831345,
-      "type": "file"
-    },
-    {
-      "path": "triton_kernels.py",
-      "accessCount": 20,
-      "lastAccessed": 1778384039795,
-      "type": "file"
-    },
-    {
-      "path": "eval_ruler.py",
-      "accessCount": 19,
-      "lastAccessed": 1778376421794,
+      "path": "eval_longbench_v1.py",
+      "accessCount": 38,
+      "lastAccessed": 1778398320006,
       "type": "file"
     },
     {
       "path": "speed/upstream_flashinfer_backend.py",
-      "accessCount": 18,
-      "lastAccessed": 1778229291163,
+      "accessCount": 36,
+      "lastAccessed": 1778398097749,
+      "type": "file"
+    },
+    {
+      "path": "eval_longbench_v2.py",
+      "accessCount": 36,
+      "lastAccessed": 1778398326052,
+      "type": "file"
+    },
+    {
+      "path": "triton_kernels.py",
+      "accessCount": 27,
+      "lastAccessed": 1778401637592,
       "type": "file"
     },
     {
       "path": "speed/profile_decode_flash_infer.py",
-      "accessCount": 12,
-      "lastAccessed": 1778229482783,
+      "accessCount": 22,
+      "lastAccessed": 1778396772942,
+      "type": "file"
+    },
+    {
+      "path": "eval_aime25.py",
+      "accessCount": 21,
+      "lastAccessed": 1778398332160,
+      "type": "file"
+    },
+    {
+      "path": "eval_gpqa.py",
+      "accessCount": 20,
+      "lastAccessed": 1778398338533,
+      "type": "file"
+    },
+    {
+      "path": "speed/flashinfer_backend.py",
+      "accessCount": 16,
+      "lastAccessed": 1778396714787,
       "type": "file"
     },
     {
@@ -213,39 +243,33 @@
       "type": "file"
     },
     {
-      "path": "eval_longbench_v2.py",
-      "accessCount": 6,
-      "lastAccessed": 1778234471058,
-      "type": "file"
-    },
-    {
-      "path": "speed/flashinfer_backend.py",
-      "accessCount": 5,
-      "lastAccessed": 1777884425648,
-      "type": "file"
-    },
-    {
-      "path": "eval_longbench_v1.py",
-      "accessCount": 5,
-      "lastAccessed": 1778234470534,
-      "type": "file"
-    },
-    {
-      "path": "eval_aime25.py",
-      "accessCount": 4,
-      "lastAccessed": 1778234470959,
-      "type": "file"
-    },
-    {
-      "path": "eval_gpqa.py",
-      "accessCount": 4,
-      "lastAccessed": 1778234471392,
-      "type": "file"
-    },
-    {
       "path": "speed/profile_decode.py",
+      "accessCount": 5,
+      "lastAccessed": 1778385787636,
+      "type": "file"
+    },
+    {
+      "path": "CLAUDE.md",
+      "accessCount": 4,
+      "lastAccessed": 1778395743065,
+      "type": "file"
+    },
+    {
+      "path": "oracle/diagnose_scoring_methods.py",
       "accessCount": 3,
-      "lastAccessed": 1777887236722,
+      "lastAccessed": 1778385711412,
+      "type": "file"
+    },
+    {
+      "path": "oracle/attention_mass_recall_ruler.py",
+      "accessCount": 3,
+      "lastAccessed": 1778385712432,
+      "type": "file"
+    },
+    {
+      "path": "config.py",
+      "accessCount": 3,
+      "lastAccessed": 1778385867737,
       "type": "file"
     },
     {
@@ -261,15 +285,15 @@
       "type": "file"
     },
     {
-      "path": "config.py",
-      "accessCount": 1,
-      "lastAccessed": 1778250294073,
-      "type": "file"
-    },
-    {
       "path": "verify_kernels.py",
       "accessCount": 1,
       "lastAccessed": 1778382469663,
+      "type": "file"
+    },
+    {
+      "path": "baselines/infllm/__init__.py",
+      "accessCount": 1,
+      "lastAccessed": 1778395297271,
       "type": "file"
     }
   ],

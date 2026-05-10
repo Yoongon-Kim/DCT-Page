@@ -1,55 +1,43 @@
-## Handoff: team-verify → COMPLETE
+## Handoff: team-verify → COMPLETE (eval-upstream-fi team)
 
-**Verifier**: worker-2 (round 1 code review) + lead (rounds 2-4 runtime + 1-line fix)
-**Date**: 2026-05-07
-**Target**: Plan v3 (`cudagraph-substep-breakdown.md`) — `_run_seal_microbench` implementation in `speed/profile_decode_upstream_flash_infer.py`
-
----
-
-### Final verdict: PASS (5/5)
-
-After 1 fix iteration (worker-1 buf_views shape off-by-one) verified at runtime.
-
-### Iteration trail
-
-- **Round 1 (worker-1 implementation)**: 4 surgical sites, ~172 LOC additive in `speed/profile_decode_upstream_flash_infer.py`. Compile OK, all 3 flags present.
-- **Round 2 (worker-2 verify)**: 4/5 PASS via code review; Gate 4 BLOCKED on GPU contention (concurrent eval_aime25 regress test on GPU 2).
-- **Round 3 (lead runtime check)**: Detected runtime defect — `fi_cache.buf_views[0]` is 7-D `(B, H, P, 2, ps, 1, d)` not 6-D as worker-1's comment assumed (verified at `speed/upstream_flashinfer_backend.py:93`). `paged_k = buf[..., 0, :, :]` left a singleton dim → `_update_comp_cache` raised "too many values to unpack (expected 5)".
-- **Round 4 (lead fix)**: 2-line correction at `_run_seal_microbench` L784-785: index dim 5 (singleton) with `0` to drop it. `paged_k = buf[:, :, sink:sink+num_pages, 0, :, 0, :]` and `paged_v = buf[:, :, sink:sink+num_pages, 1, :, 0, :]` → clean 5-D `[B, H, num_pages, ps, d]`.
-- **Round 5 (lead runtime check)**: 8K Llama-3.1-8B with `--cudagraph_breakdown_seal_microbench` produces the full 3-row reconciliation block as designed.
-
-### Gate verdict
-
-| Gate | Status | Method | Evidence |
-|---|---|---|---|
-| 1. Default invocation byte-identical | PASS | Code review + runtime | `seal_microbench=None` default at L850; `if seal_microbench is not None:` guard at L959 — block fully skipped when flag absent. 32K baseline (no flag) earlier ran clean (`/tmp/run_post.log`, Per-replay 40.237 ms/step). |
-| 2. Microbench produces non-zero forced-seal line | PASS (runtime) | 8K log `/tmp/run_seal_8k_v2.log` | `forced-seal microbench / page_size x layers: 0.236 ms/step    # truth (direct measurement, n=100)`. |
-| 3. Plausibility window | PASS (runtime) | 8K log | forced-truth=0.236, eager-avg=0.239 → ratio 0.987, well within `[eager_avg/2, eager_avg×2]` = [0.120, 0.478]. No `[INFO] outside` warning fires. Runtime-derived window functioning per plan. |
-| 4. 32K Llama smoke (no OOM, no graph regression) | PASS (mixed evidence) | (a) 32K baseline (no flag) earlier completed: Per-replay 40.237 ms/step. (b) 8K with-flag completed: per-replay 65.709 ms/step, no defects. (c) Architectural: `_run_seal_microbench` runs AFTER capture+replay completes (L1681-1714), structurally cannot affect Per-replay. (d) Direct 32K with-flag A/B blocked by environmental GPU contention (concurrent regress eval, PID 3113401, 16-18 GiB on GPU 2). When user's regress eval finishes, run `CUDA_VISIBLE_DEVICES=2 python speed/profile_decode_upstream_flash_infer.py --cudagraph --cudagraph_breakdown --cudagraph_breakdown_seal_microbench --context_length 32768 --num_decode_steps 64 --batch_size 1` to close empirically. |
-| 5. No-DCT error path | PASS | Code review | Helper L755-760: `if cfg is None: print("[ERROR]..."); return None` and `if not attn_modules: print("[ERROR]..."); return None`. Wiring L1693-1697 also prints `[ERROR]` if `attn_modules` empty before calling helper. |
-
-### Final 8K runtime output (with `--cudagraph_breakdown_seal_microbench`)
-
-```
-Compression reconciliation (4_compress):
-  graph (captured, fast-path):                  0.000 ms/step    # ~0 by design (non-sealing steps captured)
-  eager average over all steps x layers:        0.239 ms/step    # = t_seal/ps x layers (in expectation)
-  forced-seal microbench / page_size x layers:  0.236 ms/step    # truth (direct measurement, n=100)
-  note: page_size=32, microbench_iters=100, num_layers=32
-```
-
-### Files
-
-- **Modified**: `/home/yoongonkim/DCT-Page/speed/profile_decode_upstream_flash_infer.py`
-  - Worker-1 (round 1): ~172 LOC additive across 4 surgical sites (argparse L654-671; `_run_seal_microbench` L752-837; `_print_graph_breakdown` signature + reconciliation block L850 / L959-993; cudagraph wiring L1681-1714).
-  - Lead (round 4): 2-line shape correction at L784-785 (singleton-dim drop, 7-D buf_views layout).
-- **Untouched**: sibling drivers, `dct_page_attention.py`, baselines/, oracle/.
-
-### Deviations from plan
-
-- One implementation defect (buf_views shape off-by-one) corrected via direct lead edit rather than spawning a debugger — mechanical 1-line fix, faster than re-spawning workers.
-- 32K runtime A/B comparison deferred to user (GPU contention from user's own concurrent regress test). All structural requirements verified at 8K plus 32K baseline-only.
-
-### Risk
-
-None on the implementation side. The only remaining residual is the environmental 32K with-flag run — no code-side concerns.
+- **Decided**: All 8 implementation tasks (#1-#8) landed; one S0 fix applied in fix-loop iteration 1; all surface gates re-pass. Team work is done.
+- **Verifier verdict**: Initial PASS on contracts A-H, J. Contract I FAIL was a false positive — the verifier compared against `HEAD~1`, but the supposedly out-of-scope edits to `speed/upstream_flashinfer_backend.py`, `speed/flashinfer_backend.py`, and `config.py` were PRE-EXISTING uncommitted work from prior sessions (visible in the session-start git status as `M`). Workers correctly did NOT touch those files.
+- **Code-reviewer verdict**: REQUEST CHANGES with 2 S0s + several S1/S2.
+  - **S0-1 (FIXED)**: `_verify_diffs` was deleted by `reset_upstream_fi_cache_state` in `_generate_with_upstream_fi`'s `finally` block BEFORE the eval-script harvest could read it — verify path was dead code as written. Fix: added `on_post_generate=callable` parameter (per plan §5.4); harvest runs INSIDE `try` block before teardown. Wired in all 5 eval scripts.
+  - **S0-2 (DEFERRED, not actually S0)**: Code-reviewer flagged inline cache-mutation as duplicating `append_upstream_flashinfer_cache`; functionally correct but DRY-violating. Mirrors profile driver behavior. Not blocking; future cleanup.
+  - **S1 issues (DEFERRED)**: `_validate_upstream_fi_args` drift across 3 eval scripts (`args.seq_lengths` vs `args.max_input_len`); hard-coded `num_layers` for memory preflight; cache-overflow check ordering. All correct in their current contexts; not blocking, candidate refactors.
+- **Files modified by THIS team**:
+  - `dct_page_attention.py` (#1 + S0 fix)
+  - `speed/profile_decode_upstream_flash_infer.py` (#2 only — Quest mirror; OTHER changes were pre-existing)
+  - `eval_ruler.py` (#3 + S0 fix)
+  - `eval_longbench_v1.py` (#4 + S0 fix)
+  - `eval_longbench_v2.py` (#5 + S0 fix)
+  - `eval_aime25.py` (#6 + S0 fix)
+  - `eval_gpqa.py` (#7 + S0 fix)
+  - `CLAUDE.md` (#8 — pre-existing fix, no edit needed)
+- **Verify gates re-passed (post-fix)**:
+  - AST parse OK on all 7 Python files.
+  - Imports OK in DCT_Page conda env: `_select_dct_forward`, `dct_page_attention_forward_upstream_flashinfer`, `reset_upstream_fi_cache_state`, `_generate_with_upstream_fi`, `_init_upstream_fi_build_kwargs`, `_set_upstream_fi_max_decode_steps`, `_upstream_fi_cache_ref`.
+  - 3-way dispatch test PASSES (sdpa/flashinfer/upstream_flashinfer all route correctly; bogus value rejected with helpful message).
+  - `_generate_with_upstream_fi` signature includes `on_post_generate` parameter.
+  - All 5 eval scripts pass `on_post_generate=_harvest_verify_diffs` to the helper.
+  - `--help` on eval_ruler/longbench_v1/longbench_v2 shows both `--attention_backend {sdpa,upstream_flashinfer}` and `--verify_upstream_fi`.
+- **NOT verified (out of CI scope; needs GPU + dataset)**:
+  - T1 (short-KV fallback runtime test)
+  - T2 (32K smoke test)
+  - T3 (SDPA bit-identity binary diff)
+  - T4 (per-task parity at niah_multikey_2)
+  - T5 (verify-shadow distribution)
+  - T6 (per-sample memory)
+  - T11 (cache cleanup on exception)
+  - T14 (reproducibility)
+  - T17 (E2E 13-task)
+  - T18 (memory observability)
+  - T19 (verify histogram)
+  - These need a GPU and ~hours of runtime. User should run them as a final acceptance pass before sweeping.
+- **Open questions for follow-up (per plan §10/§11)**:
+  - Refactor profile driver to wrap canonical eval forward with thin event context manager (drift mitigation).
+  - DRY refactor: have new forward call `append_upstream_flashinfer_cache` instead of inlining counter advance + K/V copy.
+  - Read `num_layers` / `num_kv_heads` / `head_dim` from `AutoConfig.from_pretrained(args.base_model)` for the memory preflight instead of hard-coding.
+  - Optionally extract `_validate_upstream_fi_args` core into a shared helper in `dct_page_attention.py`.
+- **Remaining**: User should run T1-T19 on a GPU. Code is ready for that pass.

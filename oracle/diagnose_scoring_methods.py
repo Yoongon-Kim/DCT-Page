@@ -230,7 +230,7 @@ def segment_kv_from_cache(
     """
     bsz, kv_heads, kv_len, head_dim = key_states.shape
     sink_tokens = num_sink_pages * page_size
-    recent_tokens_min = (num_recent_pages - 1) * page_size
+    recent_tokens_min = num_recent_pages * page_size
     pageable_len = kv_len - sink_tokens - recent_tokens_min
     num_pages = pageable_len // page_size
     pages_end = sink_tokens + num_pages * page_size
@@ -1408,7 +1408,7 @@ def _score_one_layer(
     """
     kv_len = key_states.shape[2]
     sink_tokens = num_sink_pages * page_size
-    recent_tokens_min = (num_recent_pages - 1) * page_size
+    recent_tokens_min = num_recent_pages * page_size
     pageable_len = kv_len - sink_tokens - recent_tokens_min
     if pageable_len < page_size:
         return None
