@@ -268,7 +268,10 @@ def _build_dct_projection_matrix(page_size, comp_size, device, dtype):
     I = torch.eye(page_size, device=device, dtype=torch.float32)
     I = I.unsqueeze(0).unsqueeze(0)  # [1, 1, page_size, page_size]
     M = dct_compress_page(I, comp_size)  # [1, 1, comp_size, page_size]
-    return M.squeeze(0).squeeze(0).to(dtype)  # [comp_size, page_size]
+    # dct_compress_page ends with a transpose, so M is non-contiguous
+    # with strides (1, COMP_SIZE). compress_pages_triton hardcodes
+    # row-major access, so force a contiguous copy here (built once, cached).
+    return M.squeeze(0).squeeze(0).contiguous().to(dtype)  # [comp_size, page_size]
 
 
 def _get_or_build_projection_matrix(attn_module, page_size, comp_size, device, dtype):
