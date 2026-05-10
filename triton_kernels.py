@@ -1937,8 +1937,13 @@ def _compress_pages_kernel(
     out_ptr,    # [bsz, kv_heads, n_new, COMP_SIZE, head_dim]
     # page strides (outer b, h, n, t dims; head_dim is contiguous)
     p_stride_b, p_stride_h, p_stride_n, p_stride_t,
-    # projection matrix stride
-    m_stride_c,
+    # projection matrix strides — both passed so M can be either layout.
+    # _build_dct_projection_matrix returns a tensor whose underlying memory
+    # is laid out [PAGE_SIZE, COMP_SIZE] (it ends with a transpose), so the
+    # row stride is COMP_SIZE rather than PAGE_SIZE. Hardcoding stride=1 on
+    # the t axis silently corrupts the projection — see verify_kernels.py
+    # test_stride_sensitivity.
+    m_stride_c, m_stride_t,
     # output strides
     o_stride_b, o_stride_h, o_stride_n, o_stride_c,
     # runtime dim
@@ -1975,7 +1980,7 @@ def _compress_pages_kernel(
             mask=d_mask, other=0.0,
         ).to(tl.float32)
         # m_col[c] = M[c, t]  ->  [COMP_SIZE]
-        m_col = tl.load(m_ptr + c_idx * m_stride_c + t).to(tl.float32)
+        m_col = tl.load(m_ptr + c_idx * m_stride_c + t * m_stride_t).to(tl.float32)
         out += m_col[:, None] * page_row[None, :]
 
     out_base = out_ptr + b * o_stride_b + h * o_stride_h + pid_n * o_stride_n
@@ -2017,7 +2022,7 @@ def compress_pages_triton(
         _compress_pages_kernel[grid](
             paged_x, M, out,
             paged_x.stride(0), paged_x.stride(1), paged_x.stride(2), paged_x.stride(3),
-            M.stride(0),
+            M.stride(0), M.stride(1),
             out.stride(0), out.stride(1), out.stride(2), out.stride(3),
             num_kv_heads,
             head_dim,
