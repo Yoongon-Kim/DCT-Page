@@ -666,6 +666,19 @@ def parse_args():
                    type=int, default=5,
                    help="Discarded warmup forced-seal calls before timing begins "
                         "(default 5). Absorbs slow-path realloc + Triton JIT.")
+    p.add_argument("--cudagraph_capture_with_seal", action="store_true",
+                   default=False,
+                   help="Capture a SLOW-PATH (sealing) decode step instead of "
+                        "the default fast-path step. Just before capture, "
+                        "force `_comp_n_pages_cached -= 1` on every DCT layer "
+                        "so n_new=1 fires and the captured graph contains the "
+                        "compress GEMM + page-copy kernels. Per-replay "
+                        "`4_compress` then reports the in-graph cost (per "
+                        "replay = AS IF every step sealed); the printer also "
+                        "shows the amortized value (graph_4c / page_size). "
+                        "Replays write to a fixed cache slot every time, so "
+                        "this is for TIMING measurement only — never use for "
+                        "correctness runs. Implies --cudagraph.")
 
     return p.parse_args()
 
@@ -843,12 +856,15 @@ def _print_graph_breakdown(
     substep_per_token,
     num_layers,
     bsz,
+    mode="dct_upstream_flashinfer",
     all_kernel_sum_ms_per_step=None,
     eager_per_token=None,
     seal_microbench=None,
+    seal_capture_active=False,
+    page_size=None,
 ):
     print(f"\n{'=' * 70}")
-    print(f"PROFILE: DCT_UPSTREAM_FLASHINFER (CUDA GRAPH)")
+    print(f"PROFILE: {mode.upper()} (CUDA GRAPH)")
     print(f"{'=' * 70}")
     # C2 legend: distinguishes the two reconciliation lines that follow.
     # `non_attn_residual` ≈ MLP + layernorm + lm_head (real, non-attention work
@@ -918,12 +934,18 @@ def _print_graph_breakdown(
               f"{'ratio':>8}")
         print(f"  {'-' * 25} {'-' * 12} {'-' * 12} {'-' * 8}")
         # Critical substeps for disambig sanity (1 launch / layer / step).
-        # `7_upstream_fi_run` is INTENTIONALLY EXCLUDED: it groups multiple FI
-        # kernels (BatchDecode + MergeStates) plus per-call setup. CUDA graphs
-        # eliminate the per-FI-call CPU dispatch overhead between those
-        # sub-kernels, so the graph/eager ratio is structurally ~0.3-0.4 (the
-        # speedup is real, not a bucketing defect).
-        critical = {"5_score_pages_kernel", "6_topk_and_pack"}
+        # `7_upstream_fi_run` / `8_flashinfer_run` is INTENTIONALLY EXCLUDED:
+        # it groups multiple FI kernels (BatchDecode + MergeStates) plus
+        # per-call setup. CUDA graphs eliminate the per-FI-call CPU dispatch
+        # overhead between those sub-kernels, so the graph/eager ratio is
+        # structurally ~0.3-0.4 (the speedup is real, not a bucketing defect).
+        # Baseline has no DCT-side critical buckets; the only attention-side
+        # bucket besides FI run is `2_rope_and_cache_append` (index_kernel),
+        # which is left unconstrained.
+        if mode == "baseline":
+            critical = set()
+        else:
+            critical = {"5_score_pages_kernel", "6_topk_and_pack"}
         if substep_per_token.get("1_qkv_proj") is not None:
             # Ordering-mode disambig produces these two; merge-mode uses
             # `gemm_total` instead and they're absent.
@@ -950,77 +972,120 @@ def _print_graph_breakdown(
                 "--cudagraph_breakdown_dump_kernels"
             )
 
-    # 4_compress reconciliation block (Plan v3).
-    # Only printed when --cudagraph_breakdown_seal_microbench is active.
-    # With flag off, seal_microbench=None and this block is skipped entirely
-    # (byte-identity with pre-edit default output preserved).
-    if seal_microbench is not None:
+    # 4_compress reconciliation block.
+    # Triggered by EITHER --cudagraph_breakdown_seal_microbench (eager truth)
+    # OR --cudagraph_capture_with_seal (in-graph truth via slow-path capture).
+    # With both flags off, the block is skipped entirely (byte-identity with
+    # pre-edit default output preserved).
+    if seal_microbench is not None or seal_capture_active:
         graph_4c = substep_per_token.get("4_compress", 0.0)
         eager_4c_per_step = (
             eager_per_token.get("4_compress", 0.0) * num_layers
             if eager_per_token else 0.0
         )
-        forced_truth = seal_microbench["amortized_per_step_total_ms"]
-        mb_iters = seal_microbench["iters"]
-        mb_ps = seal_microbench["page_size"]
         print()
         print("  Compression reconciliation (4_compress):")
-        print(f"    graph (captured, fast-path):                  "
-              f"{graph_4c:.3f} ms/step"
-              f"    # ~0 by design (non-sealing steps captured)")
+        if seal_capture_active:
+            # In seal-capture mode the graph captured the slow-path, so every
+            # replay seals all layers. graph_4c is the per-replay sum (large);
+            # divide by page_size to get the per-real-decode-step amortized
+            # value comparable to eager-avg / microbench truth.
+            print(f"    graph (captured, slow-path) per replay:       "
+                  f"{graph_4c:.3f} ms/step"
+                  f"    # in-graph cost AS IF every step sealed")
+            if page_size:
+                print(f"    graph (captured, slow-path) / page_size:      "
+                      f"{graph_4c / page_size:.3f} ms/step"
+                      f"    # amortized in-graph 4_compress per real step")
+        else:
+            print(f"    graph (captured, fast-path):                  "
+                  f"{graph_4c:.3f} ms/step"
+                  f"    # ~0 by design (non-sealing steps captured)")
         print(f"    eager average over all steps x layers:        "
               f"{eager_4c_per_step:.3f} ms/step"
               f"    # = t_seal/ps x layers (in expectation)")
-        print(f"    forced-seal microbench / page_size x layers:  "
-              f"{forced_truth:.3f} ms/step"
-              f"    # truth (direct measurement, n={mb_iters})")
-        print(f"    note: page_size={mb_ps}, microbench_iters={mb_iters}, "
-              f"num_layers={num_layers}")
-        # Plausibility advisory: runtime-derived window from eager average.
-        # Fallback [0.05, 5.0] ms/step only when eager average is unavailable.
-        if eager_4c_per_step > 0:
-            lo, hi = eager_4c_per_step / 2.0, eager_4c_per_step * 2.0
-        else:
-            lo, hi = 0.05, 5.0
-        if not (lo <= forced_truth <= hi):
-            print(
-                f"  [INFO] forced-seal/ps ({forced_truth:.3f} ms/step) outside "
-                f"+-2x eager avg [{lo:.3f}, {hi:.3f}]; consider verifying with nsys."
-            )
+        if seal_microbench is not None:
+            forced_truth = seal_microbench["amortized_per_step_total_ms"]
+            mb_iters = seal_microbench["iters"]
+            mb_ps = seal_microbench["page_size"]
+            print(f"    forced-seal microbench / page_size x layers:  "
+                  f"{forced_truth:.3f} ms/step"
+                  f"    # eager truth (direct measurement, n={mb_iters})")
+            print(f"    note: page_size={mb_ps}, microbench_iters={mb_iters}, "
+                  f"num_layers={num_layers}")
+            # Plausibility advisory: runtime-derived window from eager average.
+            # Fallback [0.05, 5.0] ms/step only when eager average is unavailable.
+            if eager_4c_per_step > 0:
+                lo, hi = eager_4c_per_step / 2.0, eager_4c_per_step * 2.0
+            else:
+                lo, hi = 0.05, 5.0
+            if not (lo <= forced_truth <= hi):
+                print(
+                    f"  [INFO] forced-seal/ps ({forced_truth:.3f} ms/step) outside "
+                    f"+-2x eager avg [{lo:.3f}, {hi:.3f}]; consider verifying with nsys."
+                )
 
-    # DCT-only attention substeps. {3, 4, 5, 6, 7} is the work that REPLACES
-    # SDPA full attention (page segmenting, page compression, scoring, top-k
-    # selection, paged FI run). Substeps {1, 2, 8} are model-shared (qkv, RoPE
-    # + cache append, o_proj) and would run in any attention method, so they
-    # are excluded from this comparison. Sum this against the equivalent SDPA
-    # attention latency (run with `attention_backend=sdpa` baseline) to see
-    # the per-step cost of DCT vs full-KV attention.
-    DCT_ATTN_SUBSTEPS = (
-        "3_segment", "4_compress", "5_score_pages_kernel",
-        "6_topk_and_pack", "7_upstream_fi_run",
-    )
-    graph_dct_sum = sum(
-        substep_per_token.get(name, 0.0) for name in DCT_ATTN_SUBSTEPS
-    )
-    eager_dct_sum_per_step = None
+    # Non-shared attention substeps — the work that DIFFERS between
+    # baseline (full-KV FI) and DCT (page-selected FI + DCT preprocessing).
+    # Model-shared substeps {1_qkv_proj, 2_rope_and_cache_append, o_proj}
+    # are excluded from this sum; they fire in any attention method.
+    #
+    # DCT (3+4+5+6+7): segmenting, compression, scoring, top-k, paged FI run.
+    # Baseline (8): full-KV FI run only.
+    #
+    # Subtracting the two gives the marginal cost of DCT page selection vs
+    # full attention.
+    if mode == "baseline":
+        attn_substeps = ("8_flashinfer_run",)
+        attn_label = "Baseline non-shared attention (8) — full-KV FI run"
+        compare_hint = (
+            "    Compare against DCT mode's 'DCT-only attention substeps' "
+            "to see the cost of page selection vs full attention."
+        )
+    else:
+        attn_substeps = (
+            "3_segment", "4_compress", "5_score_pages_kernel",
+            "6_topk_and_pack", "7_upstream_fi_run",
+        )
+        attn_label = (
+            "DCT-only attention substeps (3+4+5+6+7) — REPLACES SDPA full "
+            "attention"
+        )
+        compare_hint = (
+            "    Compare against SDPA full-attention latency (same model + "
+            "context, attention_backend=sdpa) to evaluate DCT replacement cost."
+        )
+    # When seal-capture is active, 4_compress in substep_per_token is the
+    # per-replay slow-path cost (every replay seals all layers). To get the
+    # apples-to-apples per-real-decode-step value, divide by page_size.
+    if seal_capture_active and page_size:
+        graph_attn_sum = sum(
+            (substep_per_token.get(name, 0.0) / page_size
+             if name == "4_compress"
+             else substep_per_token.get(name, 0.0))
+            for name in attn_substeps
+        )
+    else:
+        graph_attn_sum = sum(
+            substep_per_token.get(name, 0.0) for name in attn_substeps
+        )
+    eager_attn_sum_per_step = None
     if eager_per_token:
-        eager_dct_sum_per_step = sum(
+        eager_attn_sum_per_step = sum(
             eager_per_token.get(name, 0.0) * num_layers
-            for name in DCT_ATTN_SUBSTEPS
+            for name in attn_substeps
         )
     print()
-    print("  DCT-only attention substeps (3+4+5+6+7) — REPLACES SDPA full "
-          "attention:")
-    if eager_dct_sum_per_step is not None and eager_dct_sum_per_step > 0:
-        speedup = eager_dct_sum_per_step / graph_dct_sum if graph_dct_sum > 0 else float("inf")
-        print(f"    eager DCT total: {eager_dct_sum_per_step:>7.3f} ms/step  "
+    print(f"  {attn_label}:")
+    if eager_attn_sum_per_step is not None and eager_attn_sum_per_step > 0:
+        speedup = eager_attn_sum_per_step / graph_attn_sum if graph_attn_sum > 0 else float("inf")
+        print(f"    eager total: {eager_attn_sum_per_step:>7.3f} ms/step  "
               f"(per-layer × {num_layers} layers)")
-        print(f"    graph DCT total: {graph_dct_sum:>7.3f} ms/step  "
+        print(f"    graph total: {graph_attn_sum:>7.3f} ms/step  "
               f"(graph speedup: {speedup:.2f}x)")
     else:
-        print(f"    graph DCT total: {graph_dct_sum:>7.3f} ms/step")
-    print("    Compare against SDPA full-attention latency (same model + "
-          "context, attention_backend=sdpa) to evaluate DCT replacement cost.")
+        print(f"    graph total: {graph_attn_sum:>7.3f} ms/step")
+    print(compare_hint)
 
 
 # ---------------------------------------------------------------------------
@@ -1094,8 +1159,11 @@ def _print_graph_breakdown(
 # this dict when names drift.
 
 _SUBSTEP_NAME_PATTERNS = {
-    # Triton kernels (substring match against the demangled kernel name)
-    "_update_comp_cache_kernel":   "4_compress",
+    # Triton kernels (substring match against the demangled kernel name).
+    # Compression Triton kernel is `_compress_pages_kernel` (triton_kernels.py:1934).
+    # The cublasLt GEMM portion of the seal (DCT projection matmul) lands in
+    # gemm_total — not bucketed here.
+    "_compress_pages_kernel":      "4_compress",
     # Score-pages: substring covers all `_score_pages_<scoring>_<group_agg>_kernel`
     # specializations (e.g. `_score_pages_max_max_kernel`, plus `*_c4_g4` /
     # `*_c1_g4` constexpr variants).
@@ -1110,6 +1178,25 @@ _SUBSTEP_NAME_PATTERNS = {
     # DELIBERATELY UNMAPPED — see the comment block above.
     "index_kernel":                "2_rope_and_cache_append",
 }
+
+# Baseline (full-KV FI) only fires {1_qkv_proj, 2_rope_and_cache_append,
+# 8_flashinfer_run, 9_o_proj} per the eager-stash in profile_decode_flash_infer.
+# `profiled_baseline_flashinfer_forward`. The DCT-only Triton patterns can't
+# fire in baseline, so we only need to remap the FI bucket to match the
+# baseline eager-stash name (`8_flashinfer_run` vs DCT's `7_upstream_fi_run`).
+_SUBSTEP_NAME_PATTERNS_BASELINE = {
+    "BatchDecodeWithPagedKVCacheKernel": "8_flashinfer_run",
+    "PersistentVariableLengthMergeStatesKernel": "8_flashinfer_run",
+    "index_kernel":                "2_rope_and_cache_append",
+}
+
+
+def _substep_patterns_for(mode):
+    """Per-mode kernel-name → bucket dict. Baseline uses 8_flashinfer_run
+    (matches its eager forward); DCT modes use 7_upstream_fi_run."""
+    if mode == "baseline":
+        return _SUBSTEP_NAME_PATTERNS_BASELINE
+    return _SUBSTEP_NAME_PATTERNS
 # cublasLt gemms: by default merged into a single `gemm_total` bucket. This
 # bucket includes ALL cublasLt matmuls in the captured forward — attention
 # (qkv + o_proj), MLP (gate + up + down), AND lm_head — because they share the
@@ -1132,6 +1219,35 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
     _reset_mode_state()
     _pd._sync_mode = args.sync
     _pd._profile_topk_impl.value = args.topk_impl
+
+    # Per-mode breakdown overrides (locals, not args mutation — args is reused
+    # across modes when --mode all). Baseline can't run DCT-only breakdown
+    # features: ordering disambig anchors on `_score_pages_*` (DCT-only),
+    # seal microbench probes `_comp_n_pages_cached` (DCT-only), and
+    # capture-with-seal forces the DCT slow path. Downgrade these silently
+    # with an info message so --mode all + --cudagraph_breakdown still works.
+    _breakdown_disambig = args.cudagraph_breakdown_disambig
+    _seal_microbench = args.cudagraph_breakdown_seal_microbench
+    _capture_with_seal = args.cudagraph_capture_with_seal
+    if mode == "baseline":
+        if _breakdown_disambig == "ordering":
+            print(
+                "[INFO] baseline mode: --cudagraph_breakdown_disambig=ordering "
+                "is DCT-only (anchor = _score_pages_*); falling back to merge."
+            )
+            _breakdown_disambig = "merge"
+        if _seal_microbench:
+            print(
+                "[INFO] baseline mode: --cudagraph_breakdown_seal_microbench "
+                "is DCT-only (probes _comp_n_pages_cached); disabling."
+            )
+            _seal_microbench = False
+        if _capture_with_seal:
+            print(
+                "[INFO] baseline mode: --cudagraph_capture_with_seal is "
+                "DCT-only (forces DCT slow path); disabling."
+            )
+            _capture_with_seal = False
 
     if mode == "baseline":
         _pd._profile_attn_backend.value = "sdpa"
@@ -1422,6 +1538,38 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
                 if args.cudagraph_breakdown:
                     # discard priming-loop events; only capture-time events should be read
                     _pd._pending_events.clear()
+
+                # Seal-capture: force n_new=1 on every DCT layer just before
+                # capture so the captured graph contains the slow-path
+                # (compress GEMM + page-copies). Replays then time the
+                # in-graph 4_compress cost. Per-layer state is mutated and
+                # restored AFTER the replay loop completes (before bucketing
+                # / microbench, both of which depend on a clean state).
+                seal_capture_state = []
+                if _capture_with_seal:
+                    dct_modules_all = [
+                        m for m in model.modules()
+                        if hasattr(m, '_comp_n_pages_cached')
+                    ]
+                    if not dct_modules_all:
+                        print(
+                            "[ERROR] --cudagraph_capture_with_seal: no DCT "
+                            "attention modules found; mode is likely baseline"
+                        )
+                    else:
+                        for m in dct_modules_all:
+                            seal_capture_state.append(
+                                (m, m._comp_n_pages_cached)
+                            )
+                            if m._comp_n_pages_cached > 0:
+                                m._comp_n_pages_cached -= 1
+                        print(
+                            f"  Seal-capture: forced n_new=1 on "
+                            f"{len(dct_modules_all)} DCT layers "
+                            f"(captured graph will run slow-path; replays "
+                            f"overwrite a fixed cache slot — TIMING ONLY)"
+                        )
+
                 g = torch.cuda.CUDAGraph()
                 print(f"  Capturing CUDA graph...")
                 with torch.cuda.graph(g):
@@ -1463,6 +1611,18 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
                         f"  CUDA graph: {per_replay_ms:.3f} ms/step  "
                         f"({graph_tok_s:.1f} step/s, {graph_tok_s * args.batch_size:.1f} agg tok/s @ bsz={args.batch_size})"
                     )
+
+                # Seal-capture restore: replays don't mutate Python state
+                # (only GPU kernels replay), so by here the slow-path during
+                # capture already wrote _comp_n_pages_cached back to num_pages
+                # at dct_page_attention.py:722. Defensive restore + invalidate
+                # _last_comp_kv so the seal microbench (if also enabled) sees
+                # a clean state and any future eager forward isn't poisoned
+                # by stale tuple identity.
+                for m, orig in seal_capture_state:
+                    m._comp_n_pages_cached = orig
+                    m._last_comp_kv = None
+
                 if args.cudagraph_breakdown:
                     # Layer windowing — required reading before touching the disambig logic.
                     #
@@ -1561,7 +1721,7 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
                             # disambig, so the message would mislead.
                             if (
                                 len(score_idx) != expected_score_hits
-                                and args.cudagraph_breakdown_disambig == "ordering"
+                                and _breakdown_disambig == "ordering"
                             ):
                                 print(
                                     f"[INFO] score-kernel hit count mismatch: "
@@ -1569,7 +1729,7 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
                                     f"{expected_score_hits}. Forcing merged gemm bucket."
                                 )
                             use_ordering = (
-                                args.cudagraph_breakdown_disambig == "ordering"
+                                _breakdown_disambig == "ordering"
                                 and len(score_idx) == expected_score_hits
                             )
 
@@ -1641,7 +1801,7 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
                                     # else: gemm in non-attention region
                                     # (MLP / lm_head) — skip
                                 else:
-                                    for pat, b in _SUBSTEP_NAME_PATTERNS.items():
+                                    for pat, b in _substep_patterns_for(mode).items():
                                         if pat in ev.key:
                                             bucket = b
                                             break
@@ -1682,7 +1842,7 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
                         # layer_idx==0 pin: model.modules() registration order is
                         # not spec-guaranteed; pinning makes the choice deterministic.
                         seal_mb = None
-                        if args.cudagraph_breakdown_seal_microbench:
+                        if _seal_microbench:
                             attn_modules = [
                                 m for m in model.modules()
                                 if hasattr(m, '_comp_n_pages_cached')
@@ -1701,6 +1861,7 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
                         _print_graph_breakdown(
                             per_replay_ms, substep_per_token,
                             num_layers_local, args.batch_size,
+                            mode=mode,
                             all_kernel_sum_ms_per_step=(
                                 all_kernel_sum_ms / num_replays
                                 if all_kernel_sum_ms is not None else None
@@ -1709,11 +1870,13 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
                                 _pd, "_last_eager_per_token", None
                             ),
                             seal_microbench=seal_mb,
+                            seal_capture_active=_capture_with_seal,
+                            page_size=args.page_size,
                         )
                         # C4: ordering-mode-only INFO about excluded final o_proj.
                         if (
                             args.cudagraph_breakdown_method == "profiler"
-                            and args.cudagraph_breakdown_disambig == "ordering"
+                            and _breakdown_disambig == "ordering"
                         ):
                             print(
                                 "  [INFO] 8_o_proj excludes the final-layer "

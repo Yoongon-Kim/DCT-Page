@@ -59,7 +59,10 @@ def resolve_model_family(model_name_or_path: str) -> str:
 
 def default_run_name(args: argparse.Namespace) -> str:
     short = args.model_name_or_path.split("/")[-1].lower().replace(".", "")
-    return f"{short}_{args.context_len}_ps{args.page_size}_{args.task}"
+    base = f"{short}_{args.context_len}_ps{args.page_size}_{args.task}"
+    if getattr(args, "granularity", "layer") == "head":
+        base += "_ghead"
+    return base
 
 
 def load_samples(path: Path, num_samples: int) -> list[dict]:
@@ -113,34 +116,63 @@ def extract_layer_kv(past_key_values):
     return ks, vs
 
 
-def per_bin_k_energy(paged_k: torch.Tensor) -> np.ndarray:
-    """paged_k: [B, H, P, page_size, D] → normalized energy vector of length page_size."""
+def per_bin_k_energy(paged_k: torch.Tensor, *, per_head: bool = False) -> np.ndarray:
+    """paged_k: [B, H, P, page_size, D] → normalized energy.
+
+    per_head=False (default): reduce over (B, H, P, D) → shape [page_size].
+    per_head=True: reduce over (B, P, D) only → shape [H, page_size]; rows are
+    individually normalized; rows whose sum < 1e-12 are filled with NaN.
+    """
     x = paged_k.to(torch.float32)
     x = x.permute(0, 1, 2, 4, 3).contiguous()  # page_size to last dim
     X = dct(x, norm="ortho")
-    energy = X.pow(2).mean(dim=(0, 1, 2, 3))  # (page_size,)
-    arr = energy.detach().cpu().numpy()
-    total = float(arr.sum())
-    if total <= 0:
-        return arr
-    return arr / total
+    if not per_head:
+        energy = X.pow(2).mean(dim=(0, 1, 2, 3))  # (page_size,)
+        arr = energy.detach().cpu().numpy()
+        total = float(arr.sum())
+        if total <= 0:
+            return arr
+        return arr / total
+    # per_head=True: keep H axis (=axis 1).
+    energy = X.pow(2).mean(dim=(0, 2, 3))  # (H, page_size)
+    arr = energy.detach().cpu().numpy().astype(np.float64)
+    row_sums = arr.sum(axis=1)
+    out = np.empty_like(arr)
+    bad = row_sums < 1e-12
+    if bad.any():
+        out[bad, :] = np.nan
+    good = ~bad
+    if good.any():
+        out[good, :] = arr[good, :] / row_sums[good, None]
+    return out
 
 
 def compute_layer_energies(
     k_caches: list[torch.Tensor],
     v_caches: list[torch.Tensor],
     cfg: DCTPageConfig,
-) -> list[dict]:
-    rows = []
+    *,
+    granularity: str = "layer",
+) -> tuple[list[dict], list[dict] | None]:
+    """Run one sample through segment_kv + per_bin_k_energy across all layers.
+
+    granularity="layer": returns (per_layer_rows, None). Identical to legacy.
+    granularity="head":  returns (per_layer_rows, per_head_rows) where the
+    per_layer_rows path uses the same fully-reduced call as legacy (bitwise
+    parity required) and per_head_rows holds one row per (layer_idx, kv_head).
+    """
+    per_layer_rows: list[dict] = []
+    per_head_rows: list[dict] | None = [] if granularity == "head" else None
     for layer_idx, (k, v) in enumerate(zip(k_caches, v_caches)):
         if k is None:
             continue
         _, _, paged_k, _, _, _, num_pages, _ = segment_kv(k, v, cfg)
         if num_pages == 0:
             continue
-        frac = per_bin_k_energy(paged_k)
+        # BITWISE-LOAD-BEARING: do not refactor
+        frac = per_bin_k_energy(paged_k, per_head=False)  # site (a)
         cum = np.cumsum(frac)
-        rows.append(
+        per_layer_rows.append(
             {
                 "layer_idx": layer_idx,
                 "num_pages": int(num_pages),
@@ -148,7 +180,20 @@ def compute_layer_energies(
                 "k_cumulative": cum.tolist(),
             }
         )
-    return rows
+        if per_head_rows is not None:
+            head_frac = per_bin_k_energy(paged_k, per_head=True)  # [H, page_size]
+            head_cum = np.cumsum(head_frac, axis=1)
+            for h_idx in range(head_frac.shape[0]):
+                per_head_rows.append(
+                    {
+                        "layer_idx": layer_idx,
+                        "kv_head_idx": int(h_idx),
+                        "num_pages": int(num_pages),
+                        "k_energy_fraction": head_frac[h_idx].tolist(),
+                        "k_cumulative": head_cum[h_idx].tolist(),
+                    }
+                )
+    return per_layer_rows, per_head_rows
 
 
 def aggregate_layers(per_layer: list[dict], page_size: int) -> dict:
@@ -167,13 +212,82 @@ def aggregate_layers(per_layer: list[dict], page_size: int) -> dict:
     }
 
 
-def write_outputs(run_dir: Path, config_dict: dict, per_layer: list[dict], summary: dict) -> None:
+def aggregate_layers_per_head(
+    layer_head_accum: list,
+    num_hidden_layers: int,
+    num_kv_heads: int,
+    page_size: int,
+) -> dict:
+    """Build the [L, H, page_size] head-resolved summary block.
+
+    layer_head_accum: list of length num_hidden_layers; each entry is either
+    None / [] (skipped layer) or a list of np.ndarrays of shape [H, page_size]
+    (one per sample). Skipped layers become NaN rows so the heatmap renders
+    them as full-gray strips.
+    """
+    fracs = np.full((num_hidden_layers, num_kv_heads, page_size), np.nan, dtype=np.float64)
+    cums = np.full((num_hidden_layers, num_kv_heads, page_size), np.nan, dtype=np.float64)
+    for li in range(num_hidden_layers):
+        runs = layer_head_accum[li] if li < len(layer_head_accum) else None
+        if not runs:
+            continue
+        stacked = np.stack(runs, axis=0)  # [num_samples, H, page_size]
+        with np.errstate(all="ignore"):
+            mean_frac = np.nanmean(stacked, axis=0)  # [H, page_size]
+            row_sums = np.nansum(mean_frac, axis=1)  # [H]
+            good = row_sums > 1e-12
+            renorm = np.full_like(mean_frac, np.nan)
+            if good.any():
+                renorm[good, :] = mean_frac[good, :] / row_sums[good, None]
+            cum = np.full_like(renorm, np.nan)
+            if good.any():
+                cum[good, :] = np.cumsum(renorm[good, :], axis=1)
+        fracs[li] = renorm
+        cums[li] = cum
+
+    headline: dict[str, list] = {}
+    head_cv: dict[str, float] = {}
+    with np.errstate(all="ignore"):
+        for c in HEADLINE_CUTOFFS:
+            if c > page_size:
+                continue
+            cut = cums[:, :, c - 1]  # [L, H]
+            headline[str(c)] = cut.tolist()
+            std_h = np.nanstd(cut, axis=1, ddof=0)  # per-layer
+            mean_h = np.nanmean(cut, axis=1)
+            ratio = np.where(mean_h > 0, std_h / np.where(mean_h == 0, np.nan, mean_h), np.nan)
+            cv = float(np.nanmean(ratio))
+            head_cv[str(c)] = cv
+
+    return {
+        "k_energy_fraction": fracs.tolist(),
+        "k_cumulative": cums.tolist(),
+        "headline": headline,
+        "head_cv": head_cv,
+    }
+
+
+def write_outputs(
+    run_dir: Path,
+    config_dict: dict,
+    per_layer: list[dict],
+    summary: dict,
+    *,
+    per_head_rows: list[dict] | None = None,
+    summary_per_head: dict | None = None,
+) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     with (run_dir / "config.json").open("w") as fp:
         json.dump(config_dict, fp, indent=2)
     with (run_dir / "per_layer.jsonl").open("w") as fp:
         for row in per_layer:
             fp.write(json.dumps(row) + "\n")
+    # Layer-mode summary.json invariant: legacy keys only. Conditional add.
+    if per_head_rows is not None:
+        summary["per_head"] = summary_per_head
+        with (run_dir / "per_head.jsonl").open("w") as fp:
+            for row in per_head_rows:
+                fp.write(json.dumps(row) + "\n")
     with (run_dir / "summary.json").open("w") as fp:
         json.dump(summary, fp, indent=2)
 
@@ -290,6 +404,296 @@ def render_per_layer_grid(
     print(f"[per-layer plot] {out}")
 
 
+def render_per_head_grid(
+    run_dir: Path,
+    summary_per_head: dict,
+    page_size: int,
+    title: str,
+    head_cols: int = 4,
+) -> None:
+    import math
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fracs = np.array(summary_per_head["k_energy_fraction"], dtype=np.float64)  # [L, H, P]
+    cums = np.array(summary_per_head["k_cumulative"], dtype=np.float64)        # [L, H, P]
+    L, H, _ = fracs.shape
+
+    bin_x = np.arange(page_size)
+    kept_x = np.arange(1, page_size + 1)
+
+    nrows = math.ceil(H / head_cols)
+    ncols = 2 * head_cols
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(2.6 * ncols, 2.0 * nrows),
+        squeeze=False,
+    )
+
+    with np.errstate(all="ignore"):
+        head_mean_frac = np.nanmean(fracs, axis=0)  # [H, P]
+        head_mean_cum = np.nanmean(cums, axis=0)    # [H, P]
+
+    for h in range(H):
+        row = h // head_cols
+        col_pair = h % head_cols
+        ax_frac = axes[row][2 * col_pair]
+        ax_cum = axes[row][2 * col_pair + 1]
+
+        for li in range(L):
+            ax_frac.plot(bin_x, fracs[li, h, :], color="lightgray", linewidth=0.5)
+            ax_cum.plot(kept_x, cums[li, h, :], color="lightgray", linewidth=0.5)
+
+        ax_frac.plot(bin_x, head_mean_frac[h], color="C0", linewidth=1.4)
+        ax_frac.set_yscale("log")
+        ax_frac.set_title(f"head {h} fraction", fontsize=9)
+        if row == nrows - 1:
+            ax_frac.set_xlabel("DCT bin", fontsize=8)
+        if col_pair == 0:
+            ax_frac.set_ylabel("energy frac", fontsize=8)
+        ax_frac.tick_params(labelsize=7)
+
+        ax_cum.plot(kept_x, head_mean_cum[h], color="C0", linewidth=1.4)
+        for c in HEADLINE_CUTOFFS:
+            if c <= page_size:
+                ax_cum.axvline(c, color="red", alpha=0.25, linestyle="--")
+        ax_cum.axhline(0.9, color="black", alpha=0.3, linestyle=":")
+        ax_cum.axhline(0.99, color="black", alpha=0.3, linestyle=":")
+        ax_cum.set_ylim(0.0, 1.02)
+        ax_cum.set_title(f"head {h} cumulative", fontsize=9)
+        if row == nrows - 1:
+            ax_cum.set_xlabel("bins kept", fontsize=8)
+        ax_cum.tick_params(labelsize=7)
+
+    total_cells = nrows * head_cols
+    for idx in range(H, total_cells):
+        row = idx // head_cols
+        col_pair = idx % head_cols
+        axes[row][2 * col_pair].set_visible(False)
+        axes[row][2 * col_pair + 1].set_visible(False)
+
+    fig.suptitle(f"{title}\nper-head K energy (page_size={page_size})", fontsize=11)
+    plt.tight_layout()
+    fig.subplots_adjust(top=1.0 - 0.6 / max(nrows, 1))
+    out = run_dir / "energy_curve_per_head.png"
+    plt.savefig(out, dpi=120)
+    plt.close(fig)
+    print(f"[per-head plot] {out}")
+
+
+def render_per_head_heatmap(
+    run_dir: Path,
+    summary_per_head: dict,
+    page_size: int,
+    title: str,
+) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+
+    fracs = np.array(summary_per_head["k_energy_fraction"], dtype=np.float64)  # [L, H, P]
+    cums = np.array(summary_per_head["k_cumulative"], dtype=np.float64)        # [L, H, P]
+    L, H, _ = fracs.shape
+
+    nrows = H
+    ncols = 2
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(2.6 * ncols + 2.0, max(1.0, 0.35 * L) * nrows),
+        squeeze=False,
+    )
+    cmap_frac = plt.get_cmap("viridis").copy()
+    cmap_frac.set_bad("lightgray")
+    cmap_cum = plt.get_cmap("viridis").copy()
+    cmap_cum.set_bad("lightgray")
+
+    norm_frac = LogNorm(vmin=1e-6, vmax=1.0)
+
+    last_left = None
+    last_right = None
+    for h in range(H):
+        ax_l = axes[h][0]
+        ax_r = axes[h][1]
+
+        last_left = ax_l.imshow(
+            fracs[:, h, :],
+            aspect="auto",
+            origin="upper",
+            cmap=cmap_frac,
+            norm=norm_frac,
+            interpolation="nearest",
+        )
+        ax_l.set_title(f"head {h} fraction", fontsize=8)
+        ax_l.set_ylabel("layer", fontsize=8)
+        if h == H - 1:
+            ax_l.set_xlabel("DCT bin", fontsize=8)
+        ax_l.tick_params(labelsize=7)
+
+        last_right = ax_r.imshow(
+            cums[:, h, :],
+            aspect="auto",
+            origin="upper",
+            cmap=cmap_cum,
+            vmin=0.0,
+            vmax=1.0,
+            interpolation="nearest",
+        )
+        for c in HEADLINE_CUTOFFS:
+            if c <= page_size:
+                ax_r.axvline(c - 0.5, color="red", alpha=0.5, linestyle="--", linewidth=0.8)
+        ax_r.set_title(f"head {h} cumulative", fontsize=8)
+        if h == H - 1:
+            ax_r.set_xlabel("bins kept", fontsize=8)
+        ax_r.tick_params(labelsize=7)
+
+    if last_left is not None:
+        fig.colorbar(last_left, ax=axes[:, 0].tolist(), shrink=0.6, label="energy fraction")
+    if last_right is not None:
+        fig.colorbar(last_right, ax=axes[:, 1].tolist(), shrink=0.6, label="cumulative")
+
+    fig.suptitle(f"{title}\nper-head K energy heatmap (page_size={page_size})", fontsize=11)
+    out = run_dir / "energy_curve_per_head_heatmap.png"
+    plt.savefig(out, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[per-head heatmap] {out}")
+
+
+def render_per_head_heatmap_norm(
+    run_dir: Path,
+    summary_per_head: dict,
+    page_size: int,
+    title: str,
+) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fracs = np.array(summary_per_head["k_energy_fraction"], dtype=np.float64)  # [L, H, P]
+    L, H, P = fracs.shape
+    if P < 2:
+        print("[per-head heatmap norm] page_size < 2; nothing to render after dropping DC")
+        return
+
+    ac = fracs[:, :, 1:]  # [L, H, P-1]
+    with np.errstate(all="ignore"):
+        denom = np.nansum(ac, axis=2, keepdims=True)
+        denom = np.where(denom > 1e-12, denom, np.nan)
+        ac_norm = ac / denom  # [L, H, P-1]
+
+    ncols = H
+    fig, axes = plt.subplots(
+        1,
+        ncols,
+        figsize=(2.4 * ncols + 1.5, max(2.0, 0.35 * L)),
+        squeeze=False,
+    )
+    cmap = plt.get_cmap("viridis").copy()
+    cmap.set_bad("lightgray")
+    ac_vmax = float(np.nanmax(ac_norm)) if np.isfinite(np.nanmax(ac_norm)) else 1.0
+    if ac_vmax <= 0:
+        ac_vmax = 1.0
+
+    last_im = None
+    for h in range(H):
+        ax = axes[0][h]
+        last_im = ax.imshow(
+            ac_norm[:, h, :],
+            aspect="auto",
+            origin="upper",
+            cmap=cmap,
+            vmin=0.0,
+            vmax=ac_vmax,
+            interpolation="nearest",
+        )
+        ax.set_title(f"head {h}", fontsize=9)
+        if h == 0:
+            ax.set_ylabel("layer", fontsize=8)
+        ax.set_xlabel(f"DCT bin (1..{page_size - 1})", fontsize=8)
+        ax.tick_params(labelsize=7)
+
+    if last_im is not None:
+        fig.colorbar(
+            last_im,
+            ax=axes[0, :].tolist(),
+            shrink=0.7,
+            label=f"energy fraction (DC dropped, renormalized; vmax={ac_vmax:.3f})",
+        )
+
+    fig.suptitle(
+        f"{title}\nper-head AC-only K energy heatmap (page_size={page_size}, DC dropped)",
+        fontsize=11,
+    )
+    out = run_dir / "energy_curve_head_heatmap_norm.png"
+    plt.savefig(out, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[per-head heatmap norm] {out}")
+
+
+def render_layer_head_heatmap(
+    run_dir: Path,
+    summary_per_head: dict,
+    page_size: int,
+    title: str,
+) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    headline = summary_per_head.get("headline", {})
+    head_cv = summary_per_head.get("head_cv", {})
+    cutoffs = [c for c in HEADLINE_CUTOFFS if c <= page_size and str(c) in headline]
+    if not cutoffs:
+        print("[layer-head heatmap] no cutoffs to render")
+        return
+
+    cmap = plt.get_cmap("viridis").copy()
+    cmap.set_bad("lightgray")
+
+    ncols = len(cutoffs)
+    fig, axes = plt.subplots(
+        1,
+        ncols,
+        figsize=(3.4 * ncols, 5.0),
+        squeeze=False,
+    )
+    last_im = None
+    for ci, c in enumerate(cutoffs):
+        ax = axes[0][ci]
+        mat = np.array(headline[str(c)], dtype=np.float64)  # [L, H]
+        last_im = ax.imshow(
+            mat,
+            aspect="auto",
+            origin="upper",
+            cmap=cmap,
+            vmin=0.0,
+            vmax=1.0,
+            interpolation="nearest",
+        )
+        ax.set_title(f"cum @ {c}", fontsize=10)
+        ax.set_xlabel("kv-head", fontsize=9)
+        if ci == 0:
+            ax.set_ylabel("layer", fontsize=9)
+        ax.tick_params(labelsize=7)
+
+    if last_im is not None:
+        fig.colorbar(last_im, ax=axes[0].tolist(), shrink=0.85, label="cumulative energy")
+
+    cv_str = ", ".join(f"{c}={head_cv.get(str(c), float('nan')):.3f}" for c in cutoffs)
+    fig.suptitle(
+        f"{title}\nper-layer-head cum @ cutoffs (head_cv: {cv_str})",
+        fontsize=11,
+    )
+    out = run_dir / "energy_heatmap_layer_head.png"
+    plt.savefig(out, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[layer-head heatmap] {out}")
+
+
 def render_compare(run_dirs: list[Path]) -> None:
     import matplotlib
     matplotlib.use("Agg")
@@ -358,9 +762,27 @@ def run_measurement(args: argparse.Namespace) -> None:
     run_name = args.run_name or default_run_name(args)
     run_dir = args.output_dir / run_name
 
+    # Pre-write clobber guard: refuse to mix granularities in one run_dir.
+    existing_per_layer = run_dir / "per_layer.jsonl"
+    existing_cfg_path = run_dir / "config.json"
+    if existing_per_layer.exists() and existing_cfg_path.exists():
+        try:
+            with existing_cfg_path.open() as fp:
+                existing_cfg = json.load(fp)
+        except Exception:
+            existing_cfg = {}
+        existing_g = existing_cfg.get("granularity", "layer")
+        if existing_g != args.granularity and not args.overwrite:
+            raise RuntimeError(
+                f"refusing to clobber {run_dir}: existing run was --granularity={existing_g} "
+                f"but --granularity={args.granularity} was requested. "
+                f"Pass --overwrite or use --run_name <new>."
+            )
+
     samples = load_samples(data_path, args.num_samples)
     print(f"[setup] model={args.model_name_or_path} family={model_family} "
-          f"ctx={args.context_len} task={args.task} samples={len(samples)}")
+          f"ctx={args.context_len} task={args.task} samples={len(samples)} "
+          f"granularity={args.granularity}")
     print(f"[setup] data={data_path}")
     print(f"[setup] run_dir={run_dir}")
 
@@ -369,8 +791,15 @@ def run_measurement(args: argparse.Namespace) -> None:
     device = next(model.parameters()).device
     cfg = build_config(args)
 
+    num_hidden_layers = int(model.config.num_hidden_layers)
+    num_kv_heads = int(getattr(model.config, "num_key_value_heads", model.config.num_attention_heads))
+
     layer_accum: list[list[np.ndarray]] = []
     layer_num_pages: list[int] = []
+    # Head-mode parallel buffer; sized to num_hidden_layers (NOT post-skip).
+    layer_head_accum: list[list[np.ndarray]] = (
+        [[] for _ in range(num_hidden_layers)] if args.granularity == "head" else []
+    )
 
     for s_idx, sample in enumerate(samples, start=1):
         encoded = tokenizer(sample["input"], return_tensors="pt")
@@ -379,13 +808,28 @@ def run_measurement(args: argparse.Namespace) -> None:
         with torch.no_grad():
             out = model(input_ids, use_cache=True)
         k_caches, v_caches = extract_layer_kv(out.past_key_values)
-        per_layer = compute_layer_energies(k_caches, v_caches, cfg)
+        per_layer, per_head_sample = compute_layer_energies(
+            k_caches, v_caches, cfg, granularity=args.granularity
+        )
 
         if not layer_accum:
             layer_accum = [[] for _ in per_layer]
             layer_num_pages = [r["num_pages"] for r in per_layer]
         for i, r in enumerate(per_layer):
-            layer_accum[i].append(np.array(r["k_energy_fraction"], dtype=np.float64))
+            # BITWISE-LOAD-BEARING: do not refactor
+            layer_accum[i].append(np.array(r["k_energy_fraction"], dtype=np.float64))  # site (b)
+
+        if args.granularity == "head" and per_head_sample is not None:
+            # Bucket per-head rows by layer_idx, stack into [H, page_size] per layer.
+            by_layer: dict[int, list[np.ndarray]] = {}
+            for r in per_head_sample:
+                li = int(r["layer_idx"])
+                by_layer.setdefault(li, []).append(
+                    np.array(r["k_energy_fraction"], dtype=np.float64)
+                )
+            for li, rows in by_layer.items():
+                stacked = np.stack(rows, axis=0)  # [H, page_size]
+                layer_head_accum[li].append(stacked)
 
         del out
         torch.cuda.empty_cache()
@@ -393,7 +837,8 @@ def run_measurement(args: argparse.Namespace) -> None:
     per_layer_rows = []
     for li, runs in enumerate(layer_accum):
         mean_frac = np.mean(np.stack(runs, axis=0), axis=0)
-        mean_frac = mean_frac / mean_frac.sum()  # re-normalize after averaging
+        # BITWISE-LOAD-BEARING: do not refactor
+        mean_frac = mean_frac / mean_frac.sum()  # site (c) — re-normalize after averaging
         cum = np.cumsum(mean_frac)
         per_layer_rows.append(
             {
@@ -406,6 +851,44 @@ def run_measurement(args: argparse.Namespace) -> None:
 
     summary = aggregate_layers(per_layer_rows, args.page_size)
 
+    per_head_rows: list[dict] | None = None
+    summary_per_head: dict | None = None
+    if args.granularity == "head":
+        # Zero-valid-layers guard: fire BEFORE aggregate_layers_per_head.
+        if not any(layer_head_accum[li] for li in range(num_hidden_layers)):
+            raise RuntimeError(
+                "zero valid layers in layer_head_accum; check context length / page config"
+            )
+        per_head_rows = []
+        for li in range(num_hidden_layers):
+            runs = layer_head_accum[li]
+            if not runs:
+                continue
+            stacked = np.stack(runs, axis=0)  # [num_samples, H, page_size]
+            with np.errstate(all="ignore"):
+                mean_frac = np.nanmean(stacked, axis=0)  # [H, page_size]
+                row_sums = np.nansum(mean_frac, axis=1)
+            for h_idx in range(mean_frac.shape[0]):
+                rs = float(row_sums[h_idx])
+                if rs <= 1e-12 or not np.isfinite(rs):
+                    frac_row = np.full(args.page_size, np.nan, dtype=np.float64)
+                    cum_row = np.full(args.page_size, np.nan, dtype=np.float64)
+                else:
+                    frac_row = mean_frac[h_idx] / rs
+                    cum_row = np.cumsum(frac_row)
+                per_head_rows.append(
+                    {
+                        "layer_idx": li,
+                        "kv_head_idx": int(h_idx),
+                        "num_pages": layer_num_pages[li] if li < len(layer_num_pages) else 0,
+                        "k_energy_fraction": frac_row.tolist(),
+                        "k_cumulative": cum_row.tolist(),
+                    }
+                )
+        summary_per_head = aggregate_layers_per_head(
+            layer_head_accum, num_hidden_layers, num_kv_heads, args.page_size
+        )
+
     config_dict = {
         "model_name_or_path": args.model_name_or_path,
         "model_family": model_family,
@@ -417,14 +900,27 @@ def run_measurement(args: argparse.Namespace) -> None:
         "num_recent_pages": args.num_recent_pages,
         "data_path": str(data_path),
         "run_name": run_name,
+        "granularity": args.granularity,
     }
 
-    write_outputs(run_dir, config_dict, per_layer_rows, summary)
+    write_outputs(
+        run_dir,
+        config_dict,
+        per_layer_rows,
+        summary,
+        per_head_rows=per_head_rows,
+        summary_per_head=summary_per_head,
+    )
 
     if args.plot:
         title = f"{model_family} @ {args.context_len} ({args.task})"
         render_plot(run_dir, per_layer_rows, summary, args.page_size, title)
         render_per_layer_grid(run_dir, per_layer_rows, args.page_size, title)
+        if args.granularity == "head" and summary_per_head is not None:
+            render_per_head_grid(run_dir, summary_per_head, args.page_size, title)
+            render_per_head_heatmap(run_dir, summary_per_head, args.page_size, title)
+            render_per_head_heatmap_norm(run_dir, summary_per_head, args.page_size, title)
+            render_layer_head_heatmap(run_dir, summary_per_head, args.page_size, title)
 
     print_headline_table(run_name, summary, args.page_size)
 
@@ -435,14 +931,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--context_len", type=int, default=32768)
     p.add_argument("--task", default="niah_single_1")
     p.add_argument("--num_samples", type=int, default=25)
-    p.add_argument("--page_size", type=int, default=16)
+    p.add_argument("--page_size", type=int, default=32)
     p.add_argument("--num_sink_pages", type=int, default=1)
-    p.add_argument("--num_recent_pages", type=int, default=9)
+    p.add_argument("--num_recent_pages", type=int, default=4)
     p.add_argument("--data_root", type=Path, default=_REPO_ROOT / "benchmark" / "data" / "ruler_data")
     p.add_argument("--output_dir", type=Path, default=_REPO_ROOT / "observations" / "results" / "dct_page_energy")
     p.add_argument("--run_name", default=None)
     p.add_argument("--cuda_device", type=int, default=0)
     p.add_argument("--plot", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--granularity",
+        choices=["layer", "head"],
+        default="layer",
+        help="Reduction axis for the energy measurement. 'layer' (default) "
+             "averages over batch+heads+pages+head_dim; output is unchanged. "
+             "'head' keeps the kv-head axis separate and writes per_head.jsonl "
+             "plus a per-head block inside summary.json.",
+    )
+    p.add_argument(
+        "--overwrite",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow writing into a run_dir whose existing config.json records a "
+             "different --granularity. Default refuses to clobber.",
+    )
     p.add_argument(
         "--compare_runs",
         default=None,
@@ -471,6 +983,16 @@ def replot(run_dir: Path) -> None:
     title = f"{cfg.get('model_family', run_dir.name)} @ {cfg.get('context_len', '?')} ({cfg.get('task', '?')})"
     render_plot(run_dir, per_layer, summary, cfg["page_size"], title)
     render_per_layer_grid(run_dir, per_layer, cfg["page_size"], title)
+
+    # Head plots are additive: detect by file presence, not config flag.
+    per_head_present = (run_dir / "per_head.jsonl").exists()
+    if per_head_present and isinstance(summary.get("per_head"), dict):
+        summary_per_head = summary["per_head"]
+        render_per_head_grid(run_dir, summary_per_head, cfg["page_size"], title)
+        render_per_head_heatmap(run_dir, summary_per_head, cfg["page_size"], title)
+        render_per_head_heatmap_norm(run_dir, summary_per_head, cfg["page_size"], title)
+        render_layer_head_heatmap(run_dir, summary_per_head, cfg["page_size"], title)
+
     print_headline_table(cfg.get("run_name", run_dir.name), summary, cfg["page_size"])
 
 

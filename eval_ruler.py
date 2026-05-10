@@ -105,7 +105,7 @@ def parse_args():
 
     # Model
     parser.add_argument("--base_model", type=str,
-                        default="Qwen/Qwen3-8B")
+                        default="meta-llama/Llama-3.1-8B-Instruct")
 
     # Data preparation
     parser.add_argument("--prepare", action="store_true",
@@ -122,8 +122,8 @@ def parse_args():
     parser.add_argument("--run_name", type=str, default=None)
 
     # DCT Page Attention params
-    parser.add_argument("--page_size", type=int, default=16)
-    parser.add_argument("--top_k", type=int, default=128)
+    parser.add_argument("--page_size", type=int, default=32)
+    parser.add_argument("--top_k", type=int, default=64)
     parser.add_argument("--num_sink_pages", type=int, default=1)
     parser.add_argument("--num_recent_pages", type=int, default=5)
     parser.add_argument("--compress_ratio", type=float, default=0.125)
@@ -163,14 +163,22 @@ def parse_args():
     parser.add_argument("--chunk_size", type=int, default=8,
                         help="ShadowKV: tokens per landmark chunk.")
 
-    # InfLLM baseline params (only used when --mode inf_llm). Main sparsity
-    # knobs (topk, n_local, block_size) stay config-only for now.
-    parser.add_argument("--inf_llm_n_init", type=int, default=128,
+    # InfLLM baseline params (only used when --mode inf_llm). All five
+    # accuracy-relevant knobs (topk, block_size, n_local, n_init, repr_topk)
+    # plus max_cached_block / chunk_size are exposed as CLI overrides on top
+    # of baselines/infllm/config.py.
+    parser.add_argument("--inf_llm_topk", type=int, default=64,
+                        help="InfLLM: blocks attended per decode step (main sparsity dial).")
+    parser.add_argument("--inf_llm_block_size", type=int, default=32,
+                        help="InfLLM: tokens per block (retrieval granularity).")
+    parser.add_argument("--inf_llm_n_local", type=int, default=4096,
+                        help="InfLLM: sliding-window of always-attended recent tokens.")
+    parser.add_argument("--inf_llm_n_init", type=int, default=32,
                         help="InfLLM: sink token count.")
     parser.add_argument("--inf_llm_repr_topk", type=int, default=4,
                         help="InfLLM: representative tokens per block.")
-    parser.add_argument("--inf_llm_max_cached_block", type=int, default=32,
-                        help="InfLLM: GPU block cache size.")
+    parser.add_argument("--inf_llm_max_cached_block", type=int, default=128,
+                        help="InfLLM: GPU block cache size (must be >= --inf_llm_topk).")
     parser.add_argument("--inf_llm_chunk_size", type=int, default=8192,
                         help="InfLLM: prefill chunk size for GreedySearch.")
 
@@ -201,7 +209,10 @@ def parse_args():
                              f"_sb{args.sparse_budget}_r{args.rank}"
                              f"_cs{args.chunk_size}")
         elif args.mode == "inf_llm":
-            args.run_name = (f"{tag}_inf_llm_nini{args.inf_llm_n_init}"
+            args.run_name = (f"{tag}_inf_llm_topk{args.inf_llm_topk}"
+                             f"_bs{args.inf_llm_block_size}"
+                             f"_nlocal{args.inf_llm_n_local}"
+                             f"_nini{args.inf_llm_n_init}"
                              f"_repr{args.inf_llm_repr_topk}")
 
     if args.skip_existing:
@@ -529,6 +540,9 @@ def load_model_and_tokenizer(args):
             from infllm.config import INF_LLM_CONFIG
             assert_llama_only(args.base_model)
             INF_LLM_CONFIG["base_model"] = args.base_model
+            INF_LLM_CONFIG["topk"] = args.inf_llm_topk
+            INF_LLM_CONFIG["block_size"] = args.inf_llm_block_size
+            INF_LLM_CONFIG["n_local"] = args.inf_llm_n_local
             INF_LLM_CONFIG["n_init"] = args.inf_llm_n_init
             INF_LLM_CONFIG["repr_topk"] = args.inf_llm_repr_topk
             INF_LLM_CONFIG["max_cached_block"] = args.inf_llm_max_cached_block
