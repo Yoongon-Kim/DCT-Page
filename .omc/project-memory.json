@@ -178,8 +178,8 @@
     },
     {
       "path": "eval_ruler.py",
-      "accessCount": 59,
-      "lastAccessed": 1778408204589,
+      "accessCount": 72,
+      "lastAccessed": 1778415783489,
       "type": "file"
     },
     {
@@ -348,6 +348,30 @@
       "path": "baselines/seer_attn/prefill_sparse/llama/configuration_llama_seerattn.py",
       "accessCount": 1,
       "lastAccessed": 1778408750232,
+      "type": "file"
+    },
+    {
+      "path": "baselines/seer_attn/decode_sparse/attn_gate_inf.py",
+      "accessCount": 1,
+      "lastAccessed": 1778413801214,
+      "type": "file"
+    },
+    {
+      "path": "baselines/seer_attn/decode_sparse/qwen3/modeling_qwen3_seerattn_inference.py",
+      "accessCount": 1,
+      "lastAccessed": 1778413802381,
+      "type": "file"
+    },
+    {
+      "path": "baselines/seer_attn/decode_sparse/attention_forward_sparse.py",
+      "accessCount": 1,
+      "lastAccessed": 1778413802671,
+      "type": "file"
+    },
+    {
+      "path": "baselines/seer_attn/decode_sparse/attention_forward_dense.py",
+      "accessCount": 1,
+      "lastAccessed": 1778413803077,
       "type": "file"
     }
   ],

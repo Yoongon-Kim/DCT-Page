@@ -196,6 +196,32 @@ def parse_args():
     parser.add_argument("--inf_llm_chunk_size", type=int, default=8192,
                         help="InfLLM: prefill chunk size for GreedySearch.")
 
+    # SeerAttention-R overrides (only used when --mode seer_attention).
+    # CLI takes precedence over baselines/seer_attn/config.py (None = fall back).
+    parser.add_argument("--seer_model", type=str, default="SeerAttention/SeerAttention-Decode-Qwen3-8B-AttnGates",
+                        help="SeerAttention-R AttnGates checkpoint (HF Hub ID or local path). "
+                             "Default None → use SEER_ATTN_CONFIG['seer_model'].")
+    parser.add_argument("--seerattn_sparsity_method", type=str, default="token_budget",
+                        choices=["token_budget", "threshold"],
+                        help="Decode sparsity method. Default None → use config.py value. "
+                             "'token_budget' selects top-k blocks per step (k = "
+                             "token_budget // gate_block_size). 'threshold' keeps blocks whose "
+                             "gate softmax score exceeds SEER_ATTN_CONFIG['threshold']. "
+                             "Note: 'nz_ratio' is prefill-only and rejected here.")
+    parser.add_argument("--seerattn_token_budget", type=int, default=2048,
+                        help="Active tokens per decode step (only used when "
+                             "sparsity_method='token_budget'). Default None → use config.py "
+                             "value. Internally rounded to block_budget = token_budget // "
+                             "gate_block_size; pass a multiple of gate_block_size (default 64) "
+                             "to avoid truncation.")
+    parser.add_argument("--seerattn_gate_block_size", type=int, default=64,
+                        choices=[16, 32, 64],
+                        help="SeerAttention-R gate block size (= sparse-decode tile size). "
+                             "Default 64 matches the released SeerAttention/SeerAttention-Decode-* "
+                             "AttnGates checkpoints. Overriding to 16 or 32 feeds the gate K-pool "
+                             "reps at a different granularity than it was trained on, so accuracy "
+                             "degrades. Useful only as an ablation/sanity sweep.")
+
     parser.add_argument("--skip_existing", action="store_true",
                         help="Skip run if summary.json already exists in output dir")
 
@@ -210,6 +236,12 @@ def parse_args():
                              f"_ps{args.page_size}_{args.unselected_mode}_{args.comp_kv_quant}")
         elif args.mode == "seer_attention":
             args.run_name = f"{tag}_seer_attention"
+            if args.seerattn_sparsity_method is not None:
+                args.run_name += f"_{args.seerattn_sparsity_method}"
+            if args.seerattn_token_budget is not None:
+                args.run_name += f"_b{args.seerattn_token_budget}"
+            if args.seerattn_gate_block_size != 64:
+                args.run_name += f"_bs{args.seerattn_gate_block_size}"
         elif args.mode == "seer_prefill":
             args.run_name = f"{tag}_seer_prefill"
         elif args.mode == "multipole_attention":
@@ -520,15 +552,29 @@ def load_model_and_tokenizer(args):
         from seer_attn.config import SEER_ATTN_CONFIG
         from seer_attn import SeerDecodingQwen3ForCausalLM
 
-        seer_model = SEER_ATTN_CONFIG["seer_model"]
+        seer_model = args.seer_model or SEER_ATTN_CONFIG["seer_model"]
+        sparsity_method = args.seerattn_sparsity_method or SEER_ATTN_CONFIG["sparsity_method"]
+        token_budget = (args.seerattn_token_budget
+                        if args.seerattn_token_budget is not None
+                        else SEER_ATTN_CONFIG["token_budget"])
         print(f"Loading SeerAttention-R model: {seer_model}")
+        if args.seer_model is not None:
+            print(f"  Override: seer_model={args.seer_model}")
+        if args.seerattn_sparsity_method is not None:
+            print(f"  Override: seerattn_sparsity_method={args.seerattn_sparsity_method}")
+        if args.seerattn_token_budget is not None:
+            print(f"  Override: seerattn_token_budget={args.seerattn_token_budget}")
+        if args.seerattn_gate_block_size != 64:
+            print(f"  Override: seerattn_gate_block_size={args.seerattn_gate_block_size} "
+                  f"(checkpoint default is 64; ablation only)")
         model = SeerDecodingQwen3ForCausalLM.from_pretrained(
             seer_model,
             torch_dtype=torch.bfloat16,
-            seerattn_sparsity_method=SEER_ATTN_CONFIG["sparsity_method"],
-            seerattn_token_budget=SEER_ATTN_CONFIG["token_budget"],
+            seerattn_sparsity_method=sparsity_method,
+            seerattn_token_budget=token_budget,
             seerattn_threshold=SEER_ATTN_CONFIG["threshold"],
             seerattn_start_layer=SEER_ATTN_CONFIG["start_layer"],
+            seerattn_gate_block_size=args.seerattn_gate_block_size,
             rope_scaling={
                 "rope_type": "yarn",
                 "factor": 4.0,
@@ -926,7 +972,15 @@ def _save_summary(args, all_seq_results):
         summary["unselected_mode"] = args.unselected_mode
     elif args.mode == "seer_attention":
         from seer_attn.config import SEER_ATTN_CONFIG
-        summary["seer_attn_config"] = SEER_ATTN_CONFIG
+        summary["seer_attn_config"] = dict(SEER_ATTN_CONFIG)
+        if args.seer_model is not None:
+            summary["seer_attn_config"]["seer_model"] = args.seer_model
+        if args.seerattn_sparsity_method is not None:
+            summary["seer_attn_config"]["sparsity_method"] = args.seerattn_sparsity_method
+        if args.seerattn_token_budget is not None:
+            summary["seer_attn_config"]["token_budget"] = args.seerattn_token_budget
+        if args.seerattn_gate_block_size is not None:
+            summary["seer_attn_config"]["seerattn_gate_block_size"] = args.seerattn_gate_block_size
     elif args.mode == "multipole_attention":
         from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
         summary["multipole_attn_config"] = MULTIPOLE_ATTN_CONFIG
