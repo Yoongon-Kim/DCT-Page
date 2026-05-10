@@ -50,7 +50,7 @@ ALL_TASKS = [
     "vt", "cwe", "fwe", "qa_1", "qa_2",
 ]
 
-DEFAULT_SEQ_LENGTHS = [32768] #[4096, 8192, 16384, 32768, 65536, 131072]
+DEFAULT_SEQ_LENGTHS = [32768, 8192, 16384] #[4096, 8192, 16384, 32768, 65536, 131072]
 
 RULER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark", "eval_ruler")
 RULER_DATA_DIR = Path(os.path.dirname(os.path.abspath(__file__))) / "benchmark" / "data" / "ruler_data"
@@ -145,7 +145,7 @@ def parse_args():
     parser.add_argument("--score_use_quest_minmax", action="store_true",
                         help="Use QUEST-style min/max key metadata scoring instead of compressed proxy scoring")
     parser.add_argument("--no_triton", action="store_true")
-    parser.add_argument("--attention_backend", type=str, default="sdpa",
+    parser.add_argument("--attention_backend", type=str, default="upastream_flashinfer",
                         choices=["sdpa", "upstream_flashinfer"],
                         help="Attention backend for page_attention mode. "
                              "'sdpa' (default): assemble + torch.scaled_dot_product_attention "
