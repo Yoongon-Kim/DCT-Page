@@ -92,16 +92,27 @@ def multipole_attention_forward(
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ):
-    # Derive past_seen_tokens from cache_position or past_key_values
+    # Derive past_seen_tokens from this layer's own KV cache size.
+    # Using cache_position[0] or past_key_values.get_seq_length() is unreliable
+    # in transformers >= 5.x: cache_position is often None at the attention level,
+    # and get_seq_length() reflects already-updated layers' caches, so layer 1+
+    # in the same forward see a non-zero past_seen even at sample start.
+    layer_kv_len_before = 0
+    if past_key_values is not None and hasattr(past_key_values, "layers"):
+        if self.layer_idx < len(past_key_values.layers):
+            _keys = past_key_values.layers[self.layer_idx].keys
+            if _keys is not None:
+                layer_kv_len_before = _keys.shape[2]
+
     if cache_position is not None:
         past_seen_tokens = cache_position[0].item()
-    elif past_key_values is not None:
-        past_seen_tokens = past_key_values.get_seq_length()
     else:
-        past_seen_tokens = 0
+        past_seen_tokens = layer_kv_len_before
 
-    # Reset per-example state
-    if past_seen_tokens == 0:
+    # Reset per-example state when this layer's cache is empty (new sample).
+    # We can't rely on past_seen_tokens == 0 alone, since with the fallback
+    # from get_seq_length() it would only be 0 for layer 0.
+    if layer_kv_len_before == 0:
         self._mp_num_clusters_lst = None
         self._mp_cos_cache = None
         self._mp_sin_cache = None
