@@ -1,7 +1,0 @@
-{
-  "tool_name": "Edit",
-  "tool_input_preview": "{\"file_path\":\"/home/yoongonkim/DCT-Page/eval_ruler.py\",\"old_string\":\"    parser.add_argument(\\\"--inf_llm_chunk_size\\\", type=int, default=8192,\\n                        help=\\\"InfLLM: prefill chunk siz...",
-  "error": "File content has changed since it was last read. This commonly happens when a linter or formatter run via Bash rewrites the file. Call Read on this file to refresh, then retry the edit.",
-  "timestamp": "2026-05-14T05:18:49.174Z",
-  "retry_count": 1
-}
