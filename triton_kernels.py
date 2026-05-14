@@ -302,6 +302,10 @@ def _score_pages_torch_fallback(
         group_page_scores = group_token_scores.mean(dim=-1)
     elif scoring_method == "sum":
         group_page_scores = group_token_scores.sum(dim=-1)
+    elif scoring_method == "lse":
+        # log-sum-exp over compressed positions — approximates mass-oracle ranking
+        # while preserving spike sensitivity via max-dominant term.
+        group_page_scores = torch.logsumexp(group_token_scores, dim=-1)
     else:
         raise ValueError(f"Unsupported scoring_method: {scoring_method}")
 
@@ -378,7 +382,19 @@ def score_pages_triton(
     ps_stride_0 = page_scores.stride(0)
     ps_stride_bh = page_scores.stride(1)
 
-    if group_agg_method == "topp":
+    if group_agg_method == "topp" or scoring_method == "lse":
+        # Triton kernel doesn't implement topp group_agg or LSE scoring; fall back.
+        return _score_pages_torch_fallback(
+            query_states,
+            compressed_keys,
+            scoring_method,
+            group_agg_method,
+            num_kv_groups,
+            out=out,
+        )
+    # Triton kernel requires power-of-2 COMP_SIZE for tl.arange. Fall back to PyTorch
+    # when callers (e.g. Haar detail with ± negation pairs) yield non-power-of-2 comp_size.
+    if (comp_size & (comp_size - 1)) != 0:
         return _score_pages_torch_fallback(
             query_states,
             compressed_keys,

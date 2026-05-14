@@ -99,6 +99,7 @@ def parse_args():
                         choices=["baseline", "page_attention", "seer_attention",
                                  "seer_prefill",
                                  "multipole_attention", "quest_attention",
+                                 "quest_pytorch",
                                  "duo_attention",
                                  "shadowkv",
                                  "inf_llm"])
@@ -126,13 +127,23 @@ def parse_args():
     parser.add_argument("--top_k", type=int, default=64,
                         help="Total selected page budget (sink + middle + recent). "
                              "DCTPageConfig receives total - sink - recent as its internal top_k.")
-    parser.add_argument("--num_sink_pages", type=int, default=1)
-    parser.add_argument("--num_recent_pages", type=int, default=4)
+    parser.add_argument("--num_sink_pages", type=int, default=0)
+    parser.add_argument("--num_recent_pages", type=int, default=0)
     parser.add_argument("--compress_ratio", type=float, default=0.125)
+    parser.add_argument("--dense_first_n_layers", type=int, default=0,
+                        help="Skip sparse attention on first N layers (use dense full attention). Quest baseline uses 2.")
     parser.add_argument("--scoring_method", type=str, default="max",
-                        choices=["mean", "max"])
+                        choices=["mean", "max", "lse"])
     parser.add_argument("--group_agg_method", type=str, default="max",
-                        choices=["mean", "max"])
+                        choices=["mean", "max", "per_head_union"])
+    parser.add_argument("--score_softmax", action="store_true",
+                        help="ShadowKV-style: per qo-head softmax over pages before GQA "
+                             "group reduction (head-magnitude normalization). DCT path only.")
+    parser.add_argument("--qaware_lastq_topbins", type=int, default=0,
+                        help="If >0, route DCT scoring through Q-aware lastq adaptive bin selection. "
+                             "Bin selection frozen from Q_lastq (first decode step), score with current Q via partial-IDCT recon.")
+    parser.add_argument("--qaware_lastq_window", type=int, default=1,
+                        help="Q_lastq window: 1 = first decode-step Q. >1 = TBD (prefill window not yet wired).")
     parser.add_argument("--unselected_mode", type=str, default="drop",
                         choices=["drop", "compressed"])
     parser.add_argument("--compressed_token_rope", type=str, default="mixed",
@@ -144,6 +155,17 @@ def parse_args():
                         help="Temporarily disabled — raises error if used")
     parser.add_argument("--score_use_quest_minmax", action="store_true",
                         help="Use QUEST-style min/max key metadata scoring instead of compressed proxy scoring")
+    parser.add_argument("--select_with_oracle_page_scores", action="store_true",
+                        help="Oracle ceiling: use max(q·K) per page (full Q·K, expensive). Upper bound for any score-based selector.")
+    parser.add_argument("--oracle_score_mode", type=str, default="max",
+                        choices=["max", "mass"],
+                        help="Oracle scoring used when --select_with_oracle_page_scores. "
+                             "'max' (default): max(q·K) per page → oracle_max (= cs=page_size proxy). "
+                             "'mass': Σ_t exp(q·K) per page → softmax-mass oracle (different ordering).")
+    parser.add_argument("--score_combine_quest_dct", action="store_true",
+                        help="Best-rank fusion: combine DCT lowpass + Quest min/max scores via -min(rank) per page")
+    parser.add_argument("--km_quest_split", type=int, default=0,
+                        help="K-M union: DCT top-(K-M) + Quest top-M (not in DCT). Recommended M=8.")
     parser.add_argument("--no_triton", action="store_true")
     parser.add_argument("--attention_backend", type=str, default="upastream_flashinfer",
                         choices=["sdpa", "upstream_flashinfer"],
@@ -157,6 +179,33 @@ def parse_args():
                         help="When --attention_backend upstream_flashinfer, run a per-layer SDPA "
                              "shadow comparison and log the per-step max-abs-diff distribution. "
                              "bf16 noise floor on this hardware is 0.05.")
+    parser.add_argument("--proxy_method", type=str, default="dct",
+                        choices=["dct", "haar", "haar_c2f", "dct_haar", "harp",
+                                 "pca_qaware", "fasa_fc"],
+                        help="Page-score proxy compression method. "
+                             "'dct' = DCT-lowpass-IDCT (default). "
+                             "'haar' = Haar block-mean lowpass (= 8-token block mean at comp_size=4). "
+                             "'dct_haar' = DCT lowpass + per-block Haar detail. "
+                             "'pca_qaware' = head-dim PCA (D1/D2 calibrated; requires --proxy_basis_path "
+                             "to a qpca_d*_cs*_*.pt file). "
+                             "'fasa_fc' = FASA dominant-FC channel subset (requires --proxy_basis_path "
+                             "to a fasa_idom_*.pt file).")
+    parser.add_argument("--proxy_basis_path", type=str, default="",
+                        help="Path to calibrated proxy basis file for pca_qaware / fasa_fc.")
+    parser.add_argument("--pca_cs_h", type=int, default=0,
+                        help="pca_qaware: head_dim projection rank (0 = use file's cs_h_max).")
+    parser.add_argument("--fasa_n_tip", type=int, default=0,
+                        help="fasa_fc: dominant FC count per (layer, q-head) (0 = file's n_tip_max).")
+    parser.add_argument("--haar_detail_per_block", type=int, default=0,
+                        help="Number of per-block Haar detail (wavelet) rows. With proxy_method=dct_haar and "
+                             "haar_detail_per_block=N, the projection has comp_size DCT lowpass + comp_size*N "
+                             "Haar detail rows. Requires compressed_token_rope='mixed' (no block_center).")
+    parser.add_argument("--haar_detail_with_negation", action="store_true",
+                        help="Append the negation of every detail row so that max-aggregated scoring picks "
+                             "|Q · detail| instead of signed Q · detail. Doubles the detail-row count.")
+    parser.add_argument("--harp_detail_topk", type=int, default=4,
+                        help="HARP only: # of blocks per page that get H_3 expansion at scoring time "
+                             "(top-K by per-block H_3 L2 norm). K=comp_size = Haar 8 equiv; K=0 = Haar 4.")
     parser.add_argument("--comp_kv_quant", type=str, default="none",
                         choices=["none", "fp8_e4m3", "fp8_e5m2", "int8", "int4"],
                         help="Fake-quantization of compressed K/V at write time "
@@ -164,11 +213,39 @@ def parse_args():
     parser.add_argument("--comp_kv_quant_granularity", type=str, default="per_page",
                         choices=["per_page", "per_comp_token"],
                         help="Scale granularity for comp_kv_quant")
+    parser.add_argument("--outlier_budget", type=int, default=0,
+                        help="Outlier bank: top-M outlier tokens per kv_head detected "
+                             "post-prefill and always included in decode attention. "
+                             "0 disables the bank.")
+    parser.add_argument("--outlier_detector", type=str, default="lastq_mean",
+                        choices=["knorm", "lastq_mean", "cluster_dyn"],
+                        help="Outlier detector: knorm = L2 norm of K; "
+                             "lastq_mean = top-M tokens by group-mean(first decode Q · K); "
+                             "cluster_dyn = k-means clustering once post-prefill, then per-step "
+                             "top-K clusters by Q·centroid → top-M tokens by Q·K within members.")
+    parser.add_argument("--cluster_outlier_N", type=int, default=256,
+                        help="cluster_dyn: number of k-means clusters per kv_head.")
+    parser.add_argument("--cluster_outlier_iters", type=int, default=5,
+                        help="cluster_dyn: k-means Lloyd iterations.")
+    parser.add_argument("--cluster_outlier_top_k", type=int, default=8,
+                        help="cluster_dyn: top-K clusters selected per step before Q·K refinement.")
+    parser.add_argument("--cluster_outlier_q_agg", type=str, default="mean",
+                        choices=["mean", "max"],
+                        help="cluster_dyn: GQA aggregation. 'mean' averages Q over the group (1× compute); "
+                             "'max' takes max of per-qo-head dot products (G× compute on scoring AND refinement).")
+    parser.add_argument("--cluster_outlier_scoring", type=str, default="centroid",
+                        choices=["centroid", "minmax"],
+                        help="cluster_dyn: cluster representation. 'centroid' = Q·mean(K) (default). "
+                             "'minmax' = Quest-style upper bound Σ_d max(q_d·K_max, q_d·K_min) — captures "
+                             "single-token outliers within a cluster (mk3 needle).")
     
     # Quest baseline (--mode quest_attention) — separate from DCT's --page_size/--top_k.
     # token_budget = quest_page_size * quest_top_k.
     parser.add_argument("--quest_page_size", type=int, default=32,
                         help="Quest baseline: tokens per KV page (Quest paper default: 16)")
+    parser.add_argument("--quest_pytorch_gqa_mode", type=str, default="per_qo_head",
+                        choices=["per_qo_head", "per_kv_head"],
+                        help="GQA aggregation mode for quest_pytorch")
     parser.add_argument("--quest_top_k", type=int, default=64,
                         help="Quest baseline: page budget (=token_budget/page_size). "
                              "Default 128 → token_budget=2048 with quest_page_size=16")
@@ -256,6 +333,8 @@ def parse_args():
             args.run_name = f"{tag}_multipole_attention"
         elif args.mode == "quest_attention":
             args.run_name = f"{tag}_quest_ps{args.quest_page_size}_pb{args.quest_top_k}"
+        elif args.mode == "quest_pytorch":
+            args.run_name = f"{tag}_questpt_ps{args.quest_page_size}_pb{args.quest_top_k}"
         elif args.mode == "duo_attention":
             args.run_name = f"{tag}_duo_attention"
         elif args.mode == "shadowkv":
@@ -421,8 +500,8 @@ def _validate_upstream_fi_args(args):
     max_seq_len = max(seq_lengths)
     max_decode_steps = max(int(getattr(args, "max_new_tokens", 0)), 256)
     page_size = int(getattr(args, "page_size", 32))
-    num_sink_pages = int(getattr(args, "num_sink_pages", 1))
-    num_recent_pages = int(getattr(args, "num_recent_pages", 5))
+    num_sink_pages = int(getattr(args, "num_sink_pages", 0))
+    num_recent_pages = int(getattr(args, "num_recent_pages", 0))
 
     name = (getattr(args, "base_model", "") or "").lower()
     if "llama" in name:
@@ -478,8 +557,16 @@ def apply_monkey_patch(args):
                 num_sink_pages=args.num_sink_pages,
                 num_recent_pages=args.num_recent_pages,
                 compress_ratio=args.compress_ratio,
+                dense_first_n_layers=args.dense_first_n_layers,
+                proxy_method=args.proxy_method,
+                haar_detail_per_block=args.haar_detail_per_block,
+                haar_detail_with_negation=args.haar_detail_with_negation,
+                harp_detail_topk=args.harp_detail_topk,
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,
+                score_softmax=args.score_softmax,
+                qaware_lastq_topbins=args.qaware_lastq_topbins,
+                qaware_lastq_window=args.qaware_lastq_window,
                 unselected_mode=args.unselected_mode,
                 compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
@@ -488,7 +575,21 @@ def apply_monkey_patch(args):
                 comp_kv_quant=args.comp_kv_quant,
                 comp_kv_quant_granularity=args.comp_kv_quant_granularity,
                 score_use_quest_minmax=args.score_use_quest_minmax,
+                score_combine_quest_dct=args.score_combine_quest_dct,
+                km_quest_split=args.km_quest_split,
+                select_with_oracle_page_scores=args.select_with_oracle_page_scores,
+                oracle_score_mode=args.oracle_score_mode,
+                outlier_budget=args.outlier_budget,
+                outlier_detector=args.outlier_detector,
+                cluster_outlier_N=args.cluster_outlier_N,
+                cluster_outlier_iters=args.cluster_outlier_iters,
+                cluster_outlier_top_k=args.cluster_outlier_top_k,
+                cluster_outlier_q_agg=args.cluster_outlier_q_agg,
+                cluster_outlier_scoring=args.cluster_outlier_scoring,
                 attention_backend=args.attention_backend,
+                proxy_basis_path=args.proxy_basis_path,
+                pca_cs_h=args.pca_cs_h,
+                fasa_n_tip=args.fasa_n_tip,
             )
         elif "qwen3" in model_name_lower:
             from dct_page_attention import replace_qwen3_attn
@@ -498,8 +599,16 @@ def apply_monkey_patch(args):
                 num_sink_pages=args.num_sink_pages,
                 num_recent_pages=args.num_recent_pages,
                 compress_ratio=args.compress_ratio,
+                dense_first_n_layers=args.dense_first_n_layers,
+                proxy_method=args.proxy_method,
+                haar_detail_per_block=args.haar_detail_per_block,
+                haar_detail_with_negation=args.haar_detail_with_negation,
+                harp_detail_topk=args.harp_detail_topk,
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,
+                score_softmax=args.score_softmax,
+                qaware_lastq_topbins=args.qaware_lastq_topbins,
+                qaware_lastq_window=args.qaware_lastq_window,
                 unselected_mode=args.unselected_mode,
                 compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
@@ -508,7 +617,21 @@ def apply_monkey_patch(args):
                 comp_kv_quant=args.comp_kv_quant,
                 comp_kv_quant_granularity=args.comp_kv_quant_granularity,
                 score_use_quest_minmax=args.score_use_quest_minmax,
+                score_combine_quest_dct=args.score_combine_quest_dct,
+                km_quest_split=args.km_quest_split,
+                select_with_oracle_page_scores=args.select_with_oracle_page_scores,
+                oracle_score_mode=args.oracle_score_mode,
+                outlier_budget=args.outlier_budget,
+                outlier_detector=args.outlier_detector,
+                cluster_outlier_N=args.cluster_outlier_N,
+                cluster_outlier_iters=args.cluster_outlier_iters,
+                cluster_outlier_top_k=args.cluster_outlier_top_k,
+                cluster_outlier_q_agg=args.cluster_outlier_q_agg,
+                cluster_outlier_scoring=args.cluster_outlier_scoring,
                 attention_backend=args.attention_backend,
+                proxy_basis_path=args.proxy_basis_path,
+                pca_cs_h=args.pca_cs_h,
+                fasa_n_tip=args.fasa_n_tip,
             )
         else:
             from dct_page_attention import replace_qwen2_attn
@@ -518,8 +641,16 @@ def apply_monkey_patch(args):
                 num_sink_pages=args.num_sink_pages,
                 num_recent_pages=args.num_recent_pages,
                 compress_ratio=args.compress_ratio,
+                dense_first_n_layers=args.dense_first_n_layers,
+                proxy_method=args.proxy_method,
+                haar_detail_per_block=args.haar_detail_per_block,
+                haar_detail_with_negation=args.haar_detail_with_negation,
+                harp_detail_topk=args.harp_detail_topk,
                 scoring_method=args.scoring_method,
                 group_agg_method=args.group_agg_method,
+                score_softmax=args.score_softmax,
+                qaware_lastq_topbins=args.qaware_lastq_topbins,
+                qaware_lastq_window=args.qaware_lastq_window,
                 unselected_mode=args.unselected_mode,
                 compressed_token_rope=args.compressed_token_rope,
                 continuous_rope=args.continuous_rope,
@@ -528,7 +659,21 @@ def apply_monkey_patch(args):
                 comp_kv_quant=args.comp_kv_quant,
                 comp_kv_quant_granularity=args.comp_kv_quant_granularity,
                 score_use_quest_minmax=args.score_use_quest_minmax,
+                score_combine_quest_dct=args.score_combine_quest_dct,
+                km_quest_split=args.km_quest_split,
+                select_with_oracle_page_scores=args.select_with_oracle_page_scores,
+                oracle_score_mode=args.oracle_score_mode,
+                outlier_budget=args.outlier_budget,
+                outlier_detector=args.outlier_detector,
+                cluster_outlier_N=args.cluster_outlier_N,
+                cluster_outlier_iters=args.cluster_outlier_iters,
+                cluster_outlier_top_k=args.cluster_outlier_top_k,
+                cluster_outlier_q_agg=args.cluster_outlier_q_agg,
+                cluster_outlier_scoring=args.cluster_outlier_scoring,
                 attention_backend=args.attention_backend,
+                proxy_basis_path=args.proxy_basis_path,
+                pca_cs_h=args.pca_cs_h,
+                fasa_n_tip=args.fasa_n_tip,
             )
     elif args.mode == "multipole_attention":
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "baselines"))
@@ -539,6 +684,24 @@ def apply_monkey_patch(args):
         replace_attn_multipole(MULTIPOLE_ATTN_CONFIG)
     elif args.mode == "quest_attention":
         pass  # Quest uses custom model class, no monkey-patch needed
+    elif args.mode == "quest_pytorch":
+        from quest_pytorch import (
+            replace_qwen3_attn_quest_pytorch,
+            replace_llama_attn_quest_pytorch,
+        )
+        token_budget = args.quest_page_size * args.quest_top_k
+        if "qwen3" in args.base_model.lower():
+            replace_qwen3_attn_quest_pytorch(
+                page_size=args.quest_page_size, token_budget=token_budget,
+                gqa_mode=args.quest_pytorch_gqa_mode,
+            )
+        elif "llama" in args.base_model.lower():
+            replace_llama_attn_quest_pytorch(
+                page_size=args.quest_page_size, token_budget=token_budget,
+                gqa_mode=args.quest_pytorch_gqa_mode,
+            )
+        else:
+            raise ValueError(f"quest_pytorch supports Qwen3 / Llama, got {args.base_model}")
     elif args.mode == "duo_attention":
         pass  # DuoAttention patches per-instance forwards post-load (see load_model_and_tokenizer)
     elif args.mode == "shadowkv":
@@ -623,16 +786,35 @@ def load_model_and_tokenizer(args):
                 f"got: {base_model}"
             )
         print(f"Loading Quest model: {base_model} (page_size={page_size}, page_budget={args.quest_top_k}, token_budget={token_budget})")
+        # Quest CUDA kernels (page.cu, estimate.cu, approx_attn.cu) only dispatch
+        # fp16 (`at::ScalarType::Half`). Loading bf16 raises "failed to dispatch".
+        # The original gibberish at 32k was YARN missing, not fp16 overflow.
+        _quest_dtype = torch.float16
+        _quest_extra = {}
+        if "qwen3" in model_name_lower:
+            # transformers v5: Qwen3 stores rope_theta inside rope_scaling dict.
+            # Our YARN override must re-include rope_theta=1000000 (otherwise the
+            # _compute_yarn_parameters path reads None and crashes).
+            _quest_extra = {
+                "rope_scaling": {
+                    "rope_type": "yarn",
+                    "rope_theta": 1000000,
+                    "factor": 4.0,
+                    "original_max_position_embeddings": 32768,
+                },
+                "max_position_embeddings": 131072,
+            }
         model = QuestModel.from_pretrained(
             base_model,
             device_map="cuda:0",
-            torch_dtype=torch.float16,
+            torch_dtype=_quest_dtype,
+            **_quest_extra,
         )
         model.quest_init(
             page_size=page_size,
             max_seq_len=max_seq_len,
             token_budget=token_budget,
-            dtype=torch.float16,
+            dtype=_quest_dtype,
             device=torch.device("cuda:0"),
         )
         model.eval()
@@ -904,10 +1086,18 @@ def evaluate_task(predictions, task_config):
 
 
 def write_summary_csv(eval_results, pred_dir):
-    """Write summary.csv to pred_dir (same format as eval_ruler/eval/evaluate.py)."""
+    """Write summary.csv to pred_dir (same format as eval_ruler/eval/evaluate.py).
+
+    Tasks are emitted in canonical ``ALL_TASKS`` order regardless of which
+    --tasks the user passed and in what order they completed. Tasks not present
+    in ALL_TASKS (custom or future additions) are appended after the canonical
+    set, in their evaluation order.
+    """
     import pandas as pd
 
-    tasks = list(eval_results.keys())
+    canonical = [t for t in ALL_TASKS if t in eval_results]
+    extras = [t for t in eval_results.keys() if t not in ALL_TASKS]
+    tasks = canonical + extras
     scores = [eval_results[t]["score"] for t in tasks]
     nulls = [eval_results[t]["nulls"] for t in tasks]
 
@@ -974,6 +1164,7 @@ def _save_summary(args, all_seq_results):
         summary["compress_ratio"] = args.compress_ratio
         summary["scoring_method"] = args.scoring_method
         summary["group_agg_method"] = args.group_agg_method
+        summary["score_softmax"] = args.score_softmax
         summary["unselected_mode"] = args.unselected_mode
     elif args.mode == "seer_attention":
         from seer_attn.config import SEER_ATTN_CONFIG
@@ -1016,8 +1207,13 @@ def _print_results_table(args, all_seq_results):
     print(header)
     print("-" * len(header))
 
+    # Display tasks in canonical ALL_TASKS order regardless of --tasks ordering.
+    tasks_requested = set(args.tasks)
+    ordered_tasks = [t for t in ALL_TASKS if t in tasks_requested]
+    ordered_tasks += [t for t in args.tasks if t not in ALL_TASKS]
+
     task_avgs = {}
-    for task in args.tasks:
+    for task in ordered_tasks:
         scores = []
         row = f"{task:24s}"
         for sl in seq_lens:

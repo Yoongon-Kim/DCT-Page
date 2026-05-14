@@ -93,9 +93,11 @@ def parse_args():
     parser.add_argument("--top_k", type=int, default=64,
                         help="Total selected page budget (sink + middle + recent). "
                              "DCTPageConfig receives total - sink - recent as its internal top_k.")
-    parser.add_argument("--num_sink_pages", type=int, default=1)
-    parser.add_argument("--num_recent_pages", type=int, default=5)
+    parser.add_argument("--num_sink_pages", type=int, default=0)
+    parser.add_argument("--num_recent_pages", type=int, default=0)
     parser.add_argument("--compress_ratio", type=float, default=0.03125)
+    parser.add_argument("--score_use_quest_minmax", action="store_true",
+                        help="Use QUEST-style per-channel min/max key metadata scoring via DCT-Page's GQA path.")
     parser.add_argument("--scoring_method", type=str, default="max",
                         choices=["mean", "max"])
     parser.add_argument("--group_agg_method", type=str, default="mean",
@@ -678,6 +680,7 @@ def main():
                 weight_compressed_by_population=True,
                 comp_kv_quant=args.comp_kv_quant,
                 comp_kv_quant_granularity=args.comp_kv_quant_granularity,
+                score_use_quest_minmax=args.score_use_quest_minmax,
                 attention_backend=args.attention_backend,
             )
         elif "qwen3" in model_name_lower:
@@ -697,6 +700,7 @@ def main():
                 weight_compressed_by_population=True,
                 comp_kv_quant=args.comp_kv_quant,
                 comp_kv_quant_granularity=args.comp_kv_quant_granularity,
+                score_use_quest_minmax=args.score_use_quest_minmax,
                 attention_backend=args.attention_backend,
             )
         else:
@@ -716,6 +720,7 @@ def main():
                 weight_compressed_by_population=True,
                 comp_kv_quant=args.comp_kv_quant,
                 comp_kv_quant_granularity=args.comp_kv_quant_granularity,
+                score_use_quest_minmax=args.score_use_quest_minmax,
                 attention_backend=args.attention_backend,
             )
     elif args.mode == "rope_gap":

@@ -280,16 +280,161 @@ def _build_dct_projection_matrix(page_size, comp_size, device, dtype):
     return M.squeeze(0).squeeze(0).contiguous().to(dtype)  # [comp_size, page_size]
 
 
+def _build_block_haar_basis(block_size: int, dtype) -> torch.Tensor:
+    """Build orthonormal Haar basis [block_size, block_size] (block_size must be 2^k).
+    Coarse-to-fine ordering: row 0 = DC, row 1 = top-level wavelet, ..., last rows = finest wavelets.
+    """
+    assert block_size > 0 and (block_size & (block_size - 1)) == 0, "block_size must be power of 2"
+    H = torch.zeros(block_size, block_size, dtype=torch.float32)
+    H[0] = 1.0 / math.sqrt(block_size)
+    row = 1
+    scale = 1  # number of wavelet groups at this level
+    while scale < block_size:
+        span = block_size // scale          # tokens per wavelet at this level
+        half = span // 2
+        for grp in range(scale):
+            base = grp * span
+            v = 1.0 / math.sqrt(span)
+            H[row, base : base + half] = v
+            H[row, base + half : base + span] = -v
+            row += 1
+        scale *= 2
+    return H.to(dtype)
+
+
+def _build_haar_projection_matrix(page_size, comp_size, n_detail_per_block, device, dtype,
+                                  detail_with_negation: bool = False):
+    """Build Haar projection: comp_size lowpass + detail rows (optionally with ± negation pair).
+
+    With detail_with_negation=True, every detail row is duplicated with its negation so that
+    max(Q·row, Q·−row) = |Q·row| (max-aggregated scoring effectively uses |·|).
+    Output shape: [comp_size * (1 + n_detail_per_block * (2 if negation else 1)), page_size].
+    """
+    assert page_size % comp_size == 0, "page_size must be divisible by comp_size"
+    block_size = page_size // comp_size
+    detail_mult = 2 if detail_with_negation else 1
+    detail_rows_per_block = max(0, n_detail_per_block) * detail_mult
+    out_rows = comp_size * (1 + detail_rows_per_block)
+    H = torch.zeros(out_rows, page_size, device=device, dtype=dtype)
+    lp_norm = 1.0 / math.sqrt(block_size)
+    for i in range(comp_size):
+        H[i, i * block_size : (i + 1) * block_size] = lp_norm
+    if n_detail_per_block > 0:
+        assert (block_size & (block_size - 1)) == 0, "n_detail_per_block > 0 requires power-of-2 block_size"
+        per_block = _build_block_haar_basis(block_size, dtype=dtype).to(device)
+        N = min(n_detail_per_block, block_size - 1)
+        for i in range(comp_size):
+            for j in range(N):
+                row_off = comp_size + i * detail_rows_per_block + j * detail_mult
+                H[row_off, i * block_size : (i + 1) * block_size] = per_block[j + 1]
+                if detail_with_negation:
+                    H[row_off + 1, i * block_size : (i + 1) * block_size] = -per_block[j + 1]
+    return H.contiguous()
+
+
+def _build_haar_c2f_projection_matrix(page_size, comp_size, device, dtype):
+    """Haar coarse-to-fine truncation: first comp_size rows of the page-wide ortho Haar basis.
+
+    Row 0 = DC (page mean), row 1 = top-level wavelet (first half − second half),
+    rows 2-3 = next-level wavelets, etc. Spans the same K-dim subspace as scaling
+    at depth log2(N/K) (= block means), but uses signed wavelet rows instead of
+    positive block-mean indicators — different scoring behavior under Q·comp_K max.
+    """
+    assert page_size > 0 and (page_size & (page_size - 1)) == 0, "page_size must be power of 2"
+    assert 0 < comp_size <= page_size
+    H = _build_block_haar_basis(page_size, dtype=dtype).to(device)
+    return H[:comp_size].contiguous()
+
+
+def _build_dct_haar_projection_matrix(page_size, comp_size, detail_per_block, device, dtype,
+                                       detail_with_negation: bool = False):
+    """DCT lowpass + Haar detail. Optionally duplicates each detail row with its negation.
+
+    Structure (rows in order):
+      [0..comp_size-1]                        DCT lowpass rows.
+      [comp_size..]                           Detail rows per block: detail_per_block rows per block,
+                                              each optionally followed by its negation.
+    Shape: [comp_size * (1 + detail_per_block * (2 if negation else 1)), page_size].
+    """
+    dct_rows = _build_dct_projection_matrix(page_size, comp_size, device, dtype)
+    if detail_per_block <= 0:
+        return dct_rows
+    assert page_size % comp_size == 0, "page_size must be divisible by comp_size"
+    block_size = page_size // comp_size
+    assert (block_size & (block_size - 1)) == 0, "block_size must be power of 2 for detail"
+    per_block = _build_block_haar_basis(block_size, dtype=dtype).to(device)
+    detail_mult = 2 if detail_with_negation else 1
+    detail_rows_per_block = detail_per_block * detail_mult
+    total = comp_size * (1 + detail_rows_per_block)
+    M = torch.zeros(total, page_size, device=device, dtype=dtype)
+    M[:comp_size] = dct_rows
+    N = min(detail_per_block, block_size - 1)
+    for i in range(comp_size):
+        for j in range(N):
+            row_off = comp_size + i * detail_rows_per_block + j * detail_mult
+            M[row_off, i * block_size : (i + 1) * block_size] = per_block[j + 1]
+            if detail_with_negation:
+                M[row_off + 1, i * block_size : (i + 1) * block_size] = -per_block[j + 1]
+    return M.contiguous()
+
+
+def _proxy_effective_comp_size(cfg, base_comp_size: int) -> int:
+    """Effective comp_size after Haar detail expansion (used for cache shape).
+    'dct': base_comp_size unchanged.
+    'haar' / 'dct_haar': base * (1 + detail_per_block * (2 if negation else 1)).
+    'harp': base * 2 (L_3 + H_3 per block; expansion is decided at scoring time, not storage)."""
+    proxy = getattr(cfg, "proxy_method", "dct")
+    if proxy == "harp":
+        return base_comp_size * 2
+    detail_n = max(0, int(getattr(cfg, "haar_detail_per_block", 0)))
+    if proxy in ("haar", "dct_haar") and detail_n > 0:
+        mult = 2 if getattr(cfg, "haar_detail_with_negation", False) else 1
+        return base_comp_size * (1 + detail_n * mult)
+    return base_comp_size
+
+
 def _get_or_build_projection_matrix(attn_module, page_size, comp_size, device, dtype):
-    """Return cached projection matrix, building it on first call."""
+    """Return cached projection matrix, building it on first call.
+    Dispatches on cfg.proxy_method ('dct' | 'haar' | 'dct_haar'). The returned matrix has
+    shape [_proxy_effective_comp_size(cfg, comp_size), page_size]."""
+    cfg = _dct_page_cfg
+    proxy = getattr(cfg, "proxy_method", "dct")
+    detail_n = max(0, int(getattr(cfg, "haar_detail_per_block", 0)))
+    detail_neg = bool(getattr(cfg, "haar_detail_with_negation", False))
+    effective_rows = _proxy_effective_comp_size(cfg, comp_size)
     M = getattr(attn_module, '_dct_proj_matrix', None)
+    cached_proxy = getattr(attn_module, '_dct_proj_method', None)
+    cached_detail = getattr(attn_module, '_dct_proj_detail_n', None)
+    cached_neg = getattr(attn_module, '_dct_proj_detail_neg', None)
     if (
         M is None
-        or M.shape != (comp_size, page_size)
+        or M.shape != (effective_rows, page_size)
         or M.device != device
+        or cached_proxy != proxy
+        or cached_detail != detail_n
+        or cached_neg != detail_neg
     ):
-        M = _build_dct_projection_matrix(page_size, comp_size, device, dtype)
+        if proxy == "haar":
+            M = _build_haar_projection_matrix(page_size, comp_size, detail_n, device, dtype,
+                                              detail_with_negation=detail_neg)
+        elif proxy == "haar_c2f":
+            M = _build_haar_c2f_projection_matrix(page_size, comp_size, device, dtype)
+        elif proxy == "dct_haar":
+            M = _build_dct_haar_projection_matrix(page_size, comp_size, detail_n, device, dtype,
+                                                   detail_with_negation=detail_neg)
+        elif proxy == "harp":
+            # HARP stores L_3 (block-mean) + H_3 (top-level wavelet per block) per page.
+            # Adaptive expansion happens in scoring (`_score_pages_harp`) using H_3 L2 norms.
+            M = _build_haar_projection_matrix(
+                page_size, comp_size, n_detail_per_block=1,
+                device=device, dtype=dtype, detail_with_negation=False,
+            )
+        else:  # "dct"
+            M = _build_dct_projection_matrix(page_size, comp_size, device, dtype)
         attn_module._dct_proj_matrix = M
+        attn_module._dct_proj_method = proxy
+        attn_module._dct_proj_detail_n = detail_n
+        attn_module._dct_proj_detail_neg = detail_neg
     return M
 
 
@@ -529,6 +674,9 @@ def paged_views_from_buf(buf_layer, num_sink_pages, num_pages, bsz=1, pages_per_
 # Incremental compressed page cache
 # ---------------------------------------------------------------------------
 def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg):
+    # When Haar detail is enabled, the projection matrix returns more rows than
+    # `comp_size`; the persistent cache must be sized to the effective row count.
+    comp_size_eff = _proxy_effective_comp_size(cfg, comp_size)
     """
     Incrementally maintain compressed page representations using DCT-IDCT
     projection (via _compress_pages).
@@ -574,7 +722,7 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
         # between decode loops that would otherwise be caught by the slow path).
         if (last is not None
                 and last[0].shape[0] == bsz
-                and last[0].shape[3] == comp_size):
+                and last[0].shape[3] == comp_size_eff):
             return last
 
     cached_k = getattr(attn_module, '_comp_k_cache', None)
@@ -592,7 +740,7 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
             or (store_v and cached_v is None)
             or num_pages < n_cached
             or cached_k.shape[0] != bsz
-            or cached_k.shape[3] != comp_size
+            or cached_k.shape[3] != comp_size_eff
             or cached_strategy != cur_strategy
             or cached_quant != cur_quant
             or cached_quant_granularity != cur_quant_granularity
@@ -649,6 +797,10 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
 
         # Step C: re-apply RoPE to compressed K at block-center positions (still bf16).
         if cur_strategy == "block_center":
+            assert comp_size_eff == comp_size, (
+                "block_center RoPE strategy is incompatible with Haar detail expansion; "
+                "use compressed_token_rope='mixed' when haar_detail_per_block > 0."
+            )
             new_positions = _block_center_positions(
                 n_cached, n_new, cfg.page_size, comp_size, cfg.num_sink_pages, new_comp_k.device,
             ).reshape(-1)
@@ -679,7 +831,7 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
             new_capacity = _next_page_capacity(num_pages, capacity)
             storage_dtype, storage_d = _comp_cache_spec(cur_quant, head_dim)
             new_k_cache = torch.empty(
-                bsz, num_kv_heads, new_capacity, comp_size, storage_d,
+                bsz, num_kv_heads, new_capacity, comp_size_eff, storage_d,
                 dtype=storage_dtype, device=paged_k.device,
             )
             if n_cached > 0 and attn_module._comp_k_cache is not None:
@@ -697,7 +849,7 @@ def _update_comp_cache(attn_module, paged_k, paged_v, num_pages, comp_size, cfg)
 
             if cur_quant != "none":
                 scale_shape = _comp_scale_shape(
-                    cur_quant_granularity, bsz, num_kv_heads, new_capacity, comp_size,
+                    cur_quant_granularity, bsz, num_kv_heads, new_capacity, comp_size_eff,
                 )
                 new_k_scale_cache = torch.empty(
                     scale_shape, dtype=torch.float32, device=paged_k.device,
@@ -912,16 +1064,23 @@ def _update_quest_metadata(attn_module, paged_k, num_pages):
     return cached_min, cached_max
 
 
-def _score_pages_quest(query, min_k, max_k, group_agg_method, num_kv_groups, out=None):
+def _score_pages_quest(query, min_k, max_k, group_agg_method, num_kv_groups, out=None, top_k=None):
     """QUEST-style page scoring: score = sum_d max(q_d * max_d, q_d * min_d).
 
     Args:
         query: [bsz, num_heads, 1, head_dim]
         min_k: [bsz, num_kv_heads, num_pages, head_dim]
         max_k: [bsz, num_kv_heads, num_pages, head_dim]
-        group_agg_method: "mean" | "max" | "topp"
+        group_agg_method: "mean" | "max" | "topp" | "per_head_union"
+            - per_head_union: each query head in a GQA group picks its own
+              top-(top_k // num_kv_groups) pages; per-kv-head selection is the
+              union across the G heads. Returns scores where union pages have
+              their max-over-G score and non-union pages have -inf (so a
+              downstream top-K respects the union). Requires top_k arg.
         num_kv_groups: number of GQA groups (num_heads // num_kv_heads)
         out: optional pre-allocated [bsz, num_kv_heads, num_pages] buffer
+        top_k: required when group_agg_method == "per_head_union"; size of the
+            per-(kv_head) page budget the union must fit in.
 
     Returns:
         page_scores: [bsz, num_kv_heads, num_pages]
@@ -934,10 +1093,19 @@ def _score_pages_quest(query, min_k, max_k, group_agg_method, num_kv_groups, out
     q = query.squeeze(2).float()
     q = q.reshape(bsz, num_kv_heads, num_kv_groups, head_dim)
 
-    # QUEST scoring per kv-head, per GQA group
-    q_max = torch.einsum('bhgd,bhpd->bhgp', q, max_k.float())   # [B, kv_heads, G, P]
-    q_min = torch.einsum('bhgd,bhpd->bhgp', q, min_k.float())   # [B, kv_heads, G, P]
-    page_scores = torch.maximum(q_max, q_min)                     # [B, kv_heads, G, P]
+    # QUEST scoring formula (Tang et al., MLSys 2024):
+    #   score[p] = Σ_d max(q[d]*K_max[p,d], q[d]*K_min[p,d])
+    # Per-channel: pick K_max if q[d]≥0 else K_min, then sum. Equivalent via:
+    #   score = einsum(q⁺, K_max) + einsum(q⁻, K_min)
+    # NOT max(Σ q·K_max, Σ q·K_min) — that's a different formula and was a bug.
+    q_pos = q.clamp(min=0)
+    q_neg = q.clamp(max=0)
+    max_k_f = max_k.float()
+    min_k_f = min_k.float()
+    page_scores = (
+        torch.einsum('bhgd,bhpd->bhgp', q_pos, max_k_f) +
+        torch.einsum('bhgd,bhpd->bhgp', q_neg, min_k_f)
+    )                                                             # [B, kv_heads, G, P]
 
     # Group aggregation (matches existing score_pages_triton logic)
     if group_agg_method == "mean":
@@ -947,6 +1115,22 @@ def _score_pages_quest(query, min_k, max_k, group_agg_method, num_kv_groups, out
     elif group_agg_method == "topp":
         k_top = min(2, num_kv_groups)
         page_scores = page_scores.topk(k_top, dim=2).values.mean(dim=2)
+    elif group_agg_method == "per_head_union":
+        # Per-query-head selection: each of G heads picks top-(top_k/G) pages.
+        # Per-kv-head selected set = UNION across G. Returned score masks non-union
+        # pages with -inf so the downstream top-(top_k) call selects only union
+        # members (and tiebreaks by max-over-heads score within the union).
+        if top_k is None:
+            raise ValueError("per_head_union requires top_k argument")
+        K_per_head = max(1, top_k // num_kv_groups)
+        per_head_topk_idx = page_scores.topk(K_per_head, dim=-1).indices       # [B, kv, G, K/G]
+        flat_topk = per_head_topk_idx.reshape(bsz, num_kv_heads, num_kv_groups * K_per_head)
+        union_mask = torch.zeros(bsz, num_kv_heads, num_pages,
+                                 dtype=torch.bool, device=page_scores.device)
+        union_mask.scatter_(-1, flat_topk, True)
+        max_score = page_scores.max(dim=2).values                              # [B, kv, P]
+        neg_inf = torch.full_like(max_score, float('-inf'))
+        page_scores = torch.where(union_mask, max_score, neg_inf)
     else:
         raise ValueError(f"Unsupported group_agg_method: {group_agg_method}")
 
@@ -956,13 +1140,585 @@ def _score_pages_quest(query, min_k, max_k, group_agg_method, num_kv_groups, out
     return page_scores
 
 
+def _score_pages_dct_perheadunion(query, comp_k, scoring_method,
+                                  num_kv_groups, top_k, out=None):
+    """DCT scoring with per_head_union group aggregation.
+
+    Each qo-head in a GQA group picks its own top-(top_k // num_kv_groups) pages;
+    per-kv-head selection = UNION across G heads. Returns scores where non-union
+    pages are -inf so the downstream top-(top_k) call selects only union members
+    (tiebreaks by max-over-heads score). Mirrors `_score_pages_quest`'s
+    per_head_union branch.
+    """
+    bsz, num_q_heads, q_len, head_dim = query.shape
+    _, num_kv_heads, num_pages, _comp_size, _ = comp_k.shape
+    assert q_len == 1, "per_head_union DCT scoring is decode-only"
+    if top_k is None:
+        raise ValueError("per_head_union requires top_k argument")
+
+    q = query.float().squeeze(2).view(bsz, num_kv_heads, num_kv_groups, head_dim)
+    k = comp_k.float()
+    scale = head_dim ** -0.5
+    # [B, kv, G, P, C]
+    group_token_scores = torch.einsum("bhgd,bhpcd->bhgpc", q, k) * scale
+    if scoring_method == "max":
+        group_page_scores = group_token_scores.amax(dim=-1)               # [B, kv, G, P]
+    elif scoring_method == "mean":
+        group_page_scores = group_token_scores.mean(dim=-1)
+    elif scoring_method == "sum":
+        group_page_scores = group_token_scores.sum(dim=-1)
+    else:
+        raise ValueError(f"Unsupported scoring_method: {scoring_method!r}")
+
+    K_per_head = max(1, top_k // num_kv_groups)
+    per_head_topk_idx = group_page_scores.topk(K_per_head, dim=-1).indices  # [B, kv, G, K/G]
+    flat_topk = per_head_topk_idx.reshape(bsz, num_kv_heads, num_kv_groups * K_per_head)
+    union_mask = torch.zeros(
+        bsz, num_kv_heads, num_pages,
+        dtype=torch.bool, device=query.device,
+    )
+    union_mask.scatter_(-1, flat_topk, True)
+    max_score = group_page_scores.amax(dim=2)                              # [B, kv, P]
+    neg_inf = torch.full_like(max_score, float('-inf'))
+    page_scores = torch.where(union_mask, max_score, neg_inf)
+
+    if out is not None:
+        out[:, :, :num_pages].copy_(page_scores)
+        return out[:, :, :num_pages]
+    return page_scores
+
+
+_full_dct_matrix_cache: dict[tuple, torch.Tensor] = {}
+
+
+# ---- Head-dim selection proxy basis caches (PCA D1/D2 and FASA-FC) --------
+# Loaded by `load_proxy_basis()` once at startup; consumed in the scoring
+# dispatch via cfg.proxy_method == "pca_qaware" / "fasa_fc".
+_PROXY_BASIS_PCA: dict[int, torch.Tensor] = {}   # layer_idx -> [H_basis, cs_h_max, head_dim]
+_PROXY_BASIS_FASA: dict[int, torch.Tensor] = {}  # layer_idx -> [H_q, n_tip_max]
+_PROXY_BASIS_META: dict = {}                     # last-loaded metadata
+
+
+def load_proxy_basis(path: str) -> None:
+    """Load a calibrated proxy basis file produced by
+    ``oracle/calibrate_proxy_bases.py``.
+
+    Two formats supported, distinguished by which key is present:
+      - PCA-style: {"M": {layer_idx: [H_basis, cs_h_max, d]}, "cs_h_max": int,
+                    "granularity": "q_head" | "kv_head", ...}
+      - FASA-style: {"idom": {layer_idx: [H_q, n_tip_max]}, "n_tip_max": int, ...}
+    """
+    d = torch.load(path, weights_only=False, map_location="cpu")
+    global _PROXY_BASIS_PCA, _PROXY_BASIS_FASA, _PROXY_BASIS_META
+    if "M" in d:
+        _PROXY_BASIS_PCA = d["M"]
+        _PROXY_BASIS_META = {k: v for k, v in d.items() if k != "M"}
+    elif "idom" in d:
+        _PROXY_BASIS_FASA = d["idom"]
+        _PROXY_BASIS_META = {k: v for k, v in d.items() if k != "idom"}
+    else:
+        raise ValueError(f"Unrecognized basis file format: keys={list(d.keys())}")
+
+
+def _score_pages_pca_qaware(query, paged_k, M_layer, cs_h, scoring_method,
+                            group_agg_method, num_kv_groups, out=None):
+    """Dense head-dim PCA scoring: project K via per-(layer, head) basis M of
+    rank cs_h, project q via the same M, score = max_t (proj_q · proj_K).
+
+    M_layer can be either:
+      - [H_kv, cs_h_max, d]   — per-(layer, kv-head)
+      - [H_q,  cs_h_max, d]   — per-(layer, q-head)
+    Returns [bsz, num_kv_heads, num_pages] page scores."""
+    bsz, H_q, q_len, d = query.shape
+    _, H_kv, P, S, _ = paged_k.shape
+    assert q_len == 1 and H_q == H_kv * num_kv_groups
+    H_basis = M_layer.shape[0]
+    assert H_basis in (H_kv, H_q)
+    cs_h = max(1, min(int(cs_h), M_layer.shape[1]))
+    scale = d ** -0.5
+
+    M = M_layer[:, :cs_h, :].to(paged_k.device).to(paged_k.dtype)
+
+    if H_basis == H_kv:
+        # Per-kv-head basis. comp_K shared across GQA group.
+        comp_K = torch.einsum("bhpsd,hcd->bhpsc", paged_k.float(), M.float())  # [1, H_kv, P, S, cs_h]
+        M_q = M.repeat_interleave(num_kv_groups, dim=0).float()                # [H_q, cs_h, d]
+        proj_q = torch.einsum("bhqd,hcd->bhqc", query.float(), M_q)            # [1, H_q, 1, cs_h]
+        comp_K_q = comp_K.repeat_interleave(num_kv_groups, dim=1)              # [1, H_q, P, S, cs_h]
+    else:
+        # Per-q-head basis. K stored per kv-head; expand via index_select.
+        kv_idx = torch.arange(H_q, device=paged_k.device) // num_kv_groups
+        K_q_view = paged_k.index_select(1, kv_idx)                             # [1, H_q, P, S, d]
+        M_q = M.float()                                                        # [H_q, cs_h, d]
+        comp_K_q = torch.einsum("bhpsd,hcd->bhpsc", K_q_view.float(), M_q)     # [1, H_q, P, S, cs_h]
+        proj_q = torch.einsum("bhqd,hcd->bhqc", query.float(), M_q)            # [1, H_q, 1, cs_h]
+
+    scores_per_token = torch.einsum("bhqc,bhpsc->bhps", proj_q, comp_K_q) * scale  # [1, H_q, P, S]
+
+    if scoring_method == "max":
+        score_q = scores_per_token.amax(dim=-1)
+    elif scoring_method == "mean":
+        score_q = scores_per_token.mean(dim=-1)
+    elif scoring_method == "lse":
+        score_q = torch.logsumexp(scores_per_token, dim=-1)
+    else:
+        raise ValueError(f"pca_qaware: unsupported scoring={scoring_method!r}")
+
+    score_g = score_q.view(bsz, H_kv, num_kv_groups, P)
+    if group_agg_method == "max":
+        page_scores = score_g.amax(dim=2)
+    elif group_agg_method == "mean":
+        page_scores = score_g.mean(dim=2)
+    else:
+        raise ValueError(f"pca_qaware: unsupported group_agg={group_agg_method!r}")
+
+    if out is not None:
+        out[:, :, :P].copy_(page_scores)
+        return out[:, :, :P]
+    return page_scores
+
+
+def _score_pages_fasa_fc(query, paged_k, idom_layer, n_tip, scoring_method,
+                         group_agg_method, num_kv_groups, out=None):
+    """FASA dominant-FC channel-subset scoring: gather n_tip RoPE-pair channel
+    pairs per q-head, score = max_t (sum_{i ∈ I_dom[h]} q[2i:2i+2] · K[..., 2i:2i+2]).
+    idom_layer: [H_q, n_tip_max] integer FC indices in [0, head_dim/2).
+    Returns [bsz, num_kv_heads, num_pages] page scores."""
+    bsz, H_q, q_len, d = query.shape
+    _, H_kv, P, S, _ = paged_k.shape
+    assert q_len == 1 and H_q == H_kv * num_kv_groups
+    nFC = d // 2
+    assert idom_layer.shape[0] == H_q
+    n_tip = max(1, min(int(n_tip), idom_layer.shape[1]))
+    scale = d ** -0.5
+
+    idom = idom_layer[:, :n_tip].to(paged_k.device).long()                    # [H_q, n_tip]
+    channels = torch.stack([2 * idom, 2 * idom + 1], dim=-1).view(H_q, n_tip * 2)  # [H_q, 2*n_tip]
+
+    # Gather q on selected channels.
+    ch_q = channels.view(1, H_q, 1, n_tip * 2)
+    q_sel = torch.gather(query, dim=-1, index=ch_q)                           # [1, H_q, 1, 2*n_tip]
+
+    # Expand K to per-q-head view (via index_select on kv-head axis), gather channels.
+    kv_idx = torch.arange(H_q, device=paged_k.device) // num_kv_groups
+    K_q_view = paged_k.index_select(1, kv_idx)                                # [1, H_q, P, S, d]
+    ch_K = channels.view(1, H_q, 1, 1, n_tip * 2).expand(bsz, H_q, P, S, n_tip * 2)
+    K_sel = torch.gather(K_q_view, dim=-1, index=ch_K)                        # [1, H_q, P, S, 2*n_tip]
+
+    scores_per_token = torch.einsum(
+        "bhqc,bhpsc->bhps", q_sel.float(), K_sel.float(),
+    ) * scale                                                                 # [1, H_q, P, S]
+
+    if scoring_method == "max":
+        score_q = scores_per_token.amax(dim=-1)
+    elif scoring_method == "mean":
+        score_q = scores_per_token.mean(dim=-1)
+    elif scoring_method == "lse":
+        score_q = torch.logsumexp(scores_per_token, dim=-1)
+    else:
+        raise ValueError(f"fasa_fc: unsupported scoring={scoring_method!r}")
+
+    score_g = score_q.view(bsz, H_kv, num_kv_groups, P)
+    if group_agg_method == "max":
+        page_scores = score_g.amax(dim=2)
+    elif group_agg_method == "mean":
+        page_scores = score_g.mean(dim=2)
+    else:
+        raise ValueError(f"fasa_fc: unsupported group_agg={group_agg_method!r}")
+
+    if out is not None:
+        out[:, :, :P].copy_(page_scores)
+        return out[:, :, :P]
+    return page_scores
+
+
+def _get_full_dct_matrix_prod(page_size: int, device, dtype):
+    key = ("dct_full_prod", page_size, device, dtype)
+    M = _full_dct_matrix_cache.get(key)
+    if M is None:
+        import numpy as np
+        from scipy.fft import dct as _scipy_dct
+        I_S = np.eye(page_size, dtype=np.float64)
+        D = _scipy_dct(I_S, axis=0, norm="ortho")               # [S, S]
+        M = torch.from_numpy(D).to(device=device, dtype=dtype).contiguous()
+        _full_dct_matrix_cache[key] = M
+    return M
+
+
+def _score_pages_dct_qaware_lastq(attn_module, query, paged_k, top_bins,
+                                  num_kv_groups, lastq_window=1, out=None):
+    """Q-aware lastq adaptive bin selection (production).
+
+    Bin selection frozen from Q_lastq (first-decode Q if window=1, else mean of
+    last-`lastq_window` prefill queries cached on `attn_module._qaware_lastq_q`).
+    At each decode step:
+      1. Full DCT of paged_k along page-token axis → K_dct [B, kv, P, S, d]
+      2. selection scores = |Q_lastq · K_dct| → top-N bins per (page, qo-head)
+      3. masked signed bin scores from current Q, IDCT back to time domain
+      4. score = max_t v_recon[t], group-aggregated via max
+
+    Note: this uses paged_k (full uncompressed K of all paged pages), so the
+    DCT cost is O(P·S^2·d) per step — heavier than lowpass cs=N scoring.
+    Quality-only measurement for now.
+    """
+    bsz, num_q_heads, q_len, d = query.shape
+    _, num_kv_heads, P, S, _ = paged_k.shape
+    assert q_len == 1
+    G = num_kv_groups
+    scale = d ** -0.5
+
+    D = _get_full_dct_matrix_prod(S, paged_k.device, paged_k.dtype).float()        # [S, S]
+    K_dct = torch.einsum("ks,nhpsd->nhpkd", D, paged_k.float())                    # [B, kv, P, S, d]
+    K_dct_q = K_dct.repeat_interleave(G, dim=1)                                    # [B, H_q, P, S, d]
+
+    # Lastq Q for bin selection — cached on attn_module per (sample, layer).
+    Q_sel = getattr(attn_module, "_qaware_lastq_q", None)
+    if Q_sel is None:
+        # First decode step: capture current Q (the user-requested lastq_window=1
+        # falls back here; window>1 is captured at prefill end in a hook we don't
+        # have in production — treated as window=1 here unless populated elsewhere).
+        Q_sel = query.detach().clone()
+        attn_module._qaware_lastq_q = Q_sel
+    Q_sel = Q_sel.float()
+
+    sel_scores = torch.einsum("nhqd,nhpkd->nhpk", Q_sel, K_dct_q) * scale          # [B, H_q, P, S_bins]
+    N = max(1, min(int(top_bins), S))
+    _, topN_idx = sel_scores.abs().topk(N, dim=-1)                                 # [B, H_q, P, N]
+
+    Q = query.float()
+    bin_scores = torch.einsum("nhqd,nhpkd->nhpk", Q, K_dct_q) * scale              # [B, H_q, P, S_bins]
+    masked = torch.zeros_like(bin_scores)
+    masked.scatter_(-1, topN_idx, bin_scores.gather(-1, topN_idx))
+    v_recon = torch.einsum("kt,nhpk->nhpt", D, masked)                             # [B, H_q, P, S]
+    score_q = v_recon.amax(dim=-1)                                                 # [B, H_q, P]
+    score_g = score_q.view(bsz, num_kv_heads, G, P)
+    page_scores = score_g.amax(dim=2)                                              # [B, kv, P]
+
+    if out is not None:
+        out[:, :, :P].copy_(page_scores)
+        return out[:, :, :P]
+    return page_scores
+
+
+def _score_pages_dct_softmax(query, comp_k, scoring_method, group_agg_method,
+                             num_kv_groups, out=None):
+    """DCT scoring with per-qo-head softmax over pages BEFORE group aggregation.
+
+    Matches `oracle/attention_mass_recall_ruler.compute_dct_lowpass_proxy_scores`
+    with softmax_before_group=True. ShadowKV-style head-magnitude normalization.
+
+    Args:
+        query: [bsz, num_q_heads, 1, head_dim]
+        comp_k: [bsz, num_kv_heads, num_pages, comp_size, head_dim]
+        scoring_method: "max" | "mean" | "sum" over comp axis.
+        group_agg_method: "mean" | "max" over GQA group axis.
+        num_kv_groups: H_q // H_kv.
+        out: optional [bsz, num_kv_heads, capacity] float32 buffer.
+
+    Returns:
+        page_scores: [bsz, num_kv_heads, num_pages] float32.
+    """
+    bsz, num_q_heads, q_len, head_dim = query.shape
+    _, num_kv_heads, num_pages, _comp_size, _ = comp_k.shape
+    assert q_len == 1, "softmax DCT scoring is decode-only"
+    scale = head_dim ** -0.5
+
+    q = query.float().squeeze(2).view(bsz, num_kv_heads, num_kv_groups, head_dim)
+    comp_k_f = comp_k.float()                                                 # [B, kv, P, C, d]
+    # [B, kv, G, P, C] = einsum(q[B,kv,G,d], comp_k[B,kv,P,C,d])
+    scores_per_comp = torch.einsum("bhgd,bhpcd->bhgpc", q, comp_k_f) * scale
+
+    if scoring_method == "max":
+        score_q = scores_per_comp.amax(dim=-1)
+    elif scoring_method == "mean":
+        score_q = scores_per_comp.mean(dim=-1)
+    elif scoring_method == "sum":
+        score_q = scores_per_comp.sum(dim=-1)
+    else:
+        raise ValueError(f"Unsupported scoring_method: {scoring_method!r}")
+
+    # Softmax over pages per qo-head before group aggregation.
+    score_q = torch.softmax(score_q, dim=-1)                                  # [B, kv, G, P]
+
+    if group_agg_method == "max":
+        page_scores = score_q.amax(dim=2)
+    elif group_agg_method == "mean":
+        page_scores = score_q.mean(dim=2)
+    else:
+        raise ValueError(
+            f"score_softmax + group_agg={group_agg_method!r} not supported"
+        )
+
+    if out is not None:
+        out[:, :, :num_pages].copy_(page_scores)
+        return out[:, :, :num_pages]
+    return page_scores
+
+
+def _detect_outliers_knorm(paged_k, paged_v, M):
+    """Pick top-M outlier tokens per (batch, kv_head) by L2 norm of K.
+
+    Args:
+        paged_k: [bsz, kv_heads, num_pages, page_size, head_dim]
+        paged_v: same shape
+        M: number of outlier tokens per kv_head
+
+    Returns:
+        outlier_K, outlier_V: [bsz, kv_heads, M_eff, head_dim]
+    """
+    bsz, kv_heads, num_pages, page_size, head_dim = paged_k.shape
+    flat_k = paged_k.reshape(bsz, kv_heads, num_pages * page_size, head_dim)
+    flat_v = paged_v.reshape(bsz, kv_heads, num_pages * page_size, head_dim)
+    knorm = flat_k.float().norm(dim=-1)  # [bsz, kv_heads, T]
+    M_eff = min(M, knorm.shape[-1])
+    top_idx = knorm.topk(M_eff, dim=-1).indices  # [bsz, kv_heads, M_eff]
+    idx_exp = top_idx.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+    outlier_K = flat_k.gather(2, idx_exp)
+    outlier_V = flat_v.gather(2, idx_exp)
+    return outlier_K.contiguous(), outlier_V.contiguous()
+
+
+def _detect_outliers_lastq_mean(query_states, paged_k, paged_v, M, num_kv_groups):
+    """Pick top-M tokens per (batch, kv_head) by group-mean(Q · K).
+
+    Q is the first decode-step query (post-RoPE, post-q_norm), mean-aggregated
+    across each GQA group; scoring against K is then per-kv-head dot product.
+
+    Args:
+        query_states: [bsz, num_q_heads, 1, head_dim]
+        paged_k, paged_v: [bsz, kv_heads, num_pages, page_size, head_dim]
+        M: outlier budget per kv_head
+        num_kv_groups: num_q_heads // kv_heads
+    """
+    bsz, kv_heads, num_pages, page_size, head_dim = paged_k.shape
+    flat_k = paged_k.reshape(bsz, kv_heads, num_pages * page_size, head_dim)
+    flat_v = paged_v.reshape(bsz, kv_heads, num_pages * page_size, head_dim)
+    Q = query_states.float()
+    Q_g = Q.view(bsz, kv_heads, num_kv_groups, 1, head_dim).mean(dim=2).squeeze(2)  # [bsz, kv_heads, d]
+    scores = torch.einsum("bhd, bhtd -> bht", Q_g, flat_k.float())                    # [bsz, kv_heads, T]
+    M_eff = min(M, scores.shape[-1])
+    top_idx = scores.topk(M_eff, dim=-1).indices                                      # [bsz, kv_heads, M_eff]
+    idx_exp = top_idx.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+    outlier_K = flat_k.gather(2, idx_exp)
+    outlier_V = flat_v.gather(2, idx_exp)
+    return outlier_K.contiguous(), outlier_V.contiguous()
+
+
+def _kmeans_outlier(K: torch.Tensor, N: int, iters: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-kv-head k-means (single-level, hard assignment).
+
+    Args:
+        K: [H_kv, T, d] candidate K vectors (float)
+        N: cluster count
+        iters: Lloyd iterations
+    Returns:
+        centroids: [H_kv, N, d]
+        cluster_ids: [H_kv, T] long
+    """
+    H_kv, T, d = K.shape
+    g = torch.Generator(device=K.device).manual_seed(seed)
+    init_idx = torch.stack([
+        torch.randperm(T, generator=g, device=K.device)[:N]
+        for _ in range(H_kv)
+    ])  # [H_kv, N]
+    centroids = K.gather(1, init_idx.unsqueeze(-1).expand(-1, -1, d)).clone()
+    cluster_ids = torch.zeros(H_kv, T, dtype=torch.long, device=K.device)
+    # Cap peak memory of the [H_kv, T, N] dots tensor by chunking the token axis.
+    # At T=128k, N=4096, fp32, the full tensor would be 16 GB and OOM.
+    bytes_per_elem = K.element_size()
+    max_dots_bytes = 2 * 1024**3
+    T_chunk = max(1, min(T, max_dots_bytes // max(1, H_kv * N * bytes_per_elem)))
+    for _ in range(iters):
+        c_norm_sq = (centroids * centroids).sum(-1)                # [H_kv, N]
+        for t0 in range(0, T, T_chunk):
+            t1 = min(t0 + T_chunk, T)
+            dots_c = torch.einsum("htd, hnd -> htn", K[:, t0:t1, :], centroids)
+            d_sq_c = c_norm_sq.unsqueeze(1) - 2.0 * dots_c
+            cluster_ids[:, t0:t1] = d_sq_c.argmin(dim=-1)
+        sums = torch.zeros(H_kv, N, d, device=K.device, dtype=K.dtype)
+        sums.scatter_add_(1, cluster_ids.unsqueeze(-1).expand(-1, -1, d), K)
+        counts = torch.zeros(H_kv, N, device=K.device, dtype=K.dtype)
+        counts.scatter_add_(1, cluster_ids, torch.ones_like(cluster_ids, dtype=K.dtype))
+        keep = (counts > 0).unsqueeze(-1)
+        centroids = torch.where(keep, sums / counts.unsqueeze(-1).clamp(min=1), centroids)
+    return centroids, cluster_ids
+
+
+def _build_cluster_state(paged_k, N, iters, seed, scoring: str = "centroid"):
+    """Run k-means on the flattened pageable region (one-shot, post-prefill).
+    Returns (centroids, cluster_ids, T_init, K_max, K_min) — K_max/K_min are None
+    when scoring='centroid', and per-(kv_h, cluster, dim) min/max when 'minmax'.
+    paged_k may grow during decode; selection at later steps must clip to T_init."""
+    bsz, kv_heads, num_pages, page_size, head_dim = paged_k.shape
+    assert bsz == 1, "cluster_dyn outlier currently supports bsz=1 only"
+    T_init = num_pages * page_size
+    flat_k = paged_k.reshape(bsz, kv_heads, T_init, head_dim).squeeze(0).float()
+    centroids, cluster_ids = _kmeans_outlier(flat_k, N, iters, seed)
+
+    K_max = K_min = None
+    if scoring == "minmax":
+        idx = cluster_ids.unsqueeze(-1).expand(-1, -1, head_dim)
+        K_max = torch.full(
+            (kv_heads, N, head_dim), float("-inf"),
+            device=flat_k.device, dtype=flat_k.dtype,
+        )
+        K_max.scatter_reduce_(1, idx, flat_k, reduce="amax", include_self=False)
+        K_min = torch.full(
+            (kv_heads, N, head_dim), float("inf"),
+            device=flat_k.device, dtype=flat_k.dtype,
+        )
+        K_min.scatter_reduce_(1, idx, flat_k, reduce="amin", include_self=False)
+        # Empty clusters: leave K_max=-inf, K_min=inf — scoring will return -inf for them.
+        # Replace inf/-inf with 0 so the sum doesn't NaN out.
+        empty_mask = ~K_max.isfinite()  # both K_max=-inf and K_min=+inf for empty clusters
+        K_max = torch.where(empty_mask, torch.zeros_like(K_max), K_max)
+        K_min = torch.where(empty_mask, torch.zeros_like(K_min), K_min)
+    return centroids, cluster_ids, T_init, K_max, K_min
+
+
+def _select_cluster_outliers_dynamic(
+    query_states, paged_k, paged_v,
+    centroids, cluster_ids, T_init,
+    M, K_top, num_kv_groups,
+    q_agg: str = "mean",
+    scoring: str = "centroid",
+    K_max=None, K_min=None,
+):
+    """Per-step outlier selection: top-K clusters by Q·centroid, refine within by Q·K, take top-M.
+
+    Args:
+        query_states: [bsz, num_q_heads, 1, head_dim]
+        paged_k, paged_v: [bsz, kv_heads, num_pages, page_size, head_dim] (may grow)
+        centroids: [kv_heads, N, head_dim] (float)
+        cluster_ids: [kv_heads, T_init] long
+        T_init: token count used at cluster build time; later positions are ignored.
+        M: outlier budget per kv_head
+        K_top: # of top clusters
+        num_kv_groups: GQA group factor
+        q_agg: "mean" | "max" — aggregate scores across qo-heads in each GQA group.
+            "mean" averages Q first (1 dot product per kv_head).
+            "max" computes per-qo-head dot products, max-reduces over the group
+            (G× more compute on cluster scoring AND refinement).
+    """
+    bsz, kv_heads, num_pages, page_size, head_dim = paged_k.shape
+    flat_k_all = paged_k.reshape(bsz, kv_heads, num_pages * page_size, head_dim)
+    flat_v_all = paged_v.reshape(bsz, kv_heads, num_pages * page_size, head_dim)
+    flat_k = flat_k_all[:, :, :T_init, :]
+    flat_v = flat_v_all[:, :, :T_init, :]
+    Q_grouped = query_states.view(bsz, kv_heads, num_kv_groups, head_dim).squeeze(0).float()  # [kv_h, G, d]
+    if scoring == "minmax":
+        assert K_max is not None and K_min is not None, "minmax scoring requires K_max/K_min"
+        # Quest-style upper bound: Σ_d max(q_d · K_max[c,d], q_d · K_min[c,d])
+        # Decomposes into q_pos · K_max + q_neg · K_min (since q>0 picks K_max, q<0 picks K_min).
+        if q_agg == "max":
+            q_pos = Q_grouped.clamp(min=0)  # [kv_h, G, d]
+            q_neg = Q_grouped.clamp(max=0)
+            scores_hg = (
+                torch.einsum("hgd, hnd -> hgn", q_pos, K_max)
+                + torch.einsum("hgd, hnd -> hgn", q_neg, K_min)
+            )
+            cluster_scores = scores_hg.amax(dim=1)
+        else:
+            Q_g = Q_grouped.mean(dim=1)
+            q_pos = Q_g.clamp(min=0)
+            q_neg = Q_g.clamp(max=0)
+            cluster_scores = (
+                torch.einsum("hd, hnd -> hn", q_pos, K_max)
+                + torch.einsum("hd, hnd -> hn", q_neg, K_min)
+            )
+    elif q_agg == "max":
+        # Per-qo-head scoring, max over GQA group.
+        cluster_scores_hg = torch.einsum("hgd, hnd -> hgn", Q_grouped, centroids)             # [kv_h, G, N]
+        cluster_scores = cluster_scores_hg.amax(dim=1)                                         # [kv_h, N]
+    else:
+        Q_g = Q_grouped.mean(dim=1)                                                            # [kv_h, d]
+        cluster_scores = torch.einsum("hd, hnd -> hn", Q_g, centroids)                         # [kv_h, N]
+    top_c = cluster_scores.topk(min(K_top, cluster_scores.shape[-1]), dim=-1).indices          # [kv_h, K_top]
+    member_mask = (cluster_ids.unsqueeze(-1) == top_c.unsqueeze(1)).any(dim=-1)                # [kv_h, T_init]
+    if q_agg == "max":
+        qk_hg = torch.einsum("hgd, htd -> hgt", Q_grouped, flat_k.squeeze(0).float())          # [kv_h, G, T]
+        qk = qk_hg.amax(dim=1)                                                                 # [kv_h, T]
+    else:
+        Q_g = Q_grouped.mean(dim=1)
+        qk = torch.einsum("hd, htd -> ht", Q_g, flat_k.squeeze(0).float())                     # [kv_h, T]
+    qk = qk.masked_fill(~member_mask, float("-inf"))
+    M_eff = min(M, qk.shape[-1])
+    top_idx = qk.topk(M_eff, dim=-1).indices.unsqueeze(0)                                      # [1, kv_h, M_eff]
+    idx_exp = top_idx.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+    outlier_K = flat_k.gather(2, idx_exp)
+    outlier_V = flat_v.gather(2, idx_exp)
+    return outlier_K.contiguous(), outlier_V.contiguous()
+
+
+def _score_pages_harp(query, comp_k, num_kv_groups, scoring_method, group_agg_method,
+                      harp_detail_topk, out=None):
+    """HARP scoring: L_3 (block-mean) + H_3 (top-level wavelet) with adaptive expansion.
+
+    comp_k layout: [bsz, kv_heads, num_pages, 2*comp_size_lp, head_dim]
+      slots 0..cs_lp-1   = L_3 (block-mean rows, all positive)
+      slots cs_lp..2cs_lp-1 = H_3 (top-level wavelet rows, signed +/-)
+
+    Per page, the top-`harp_detail_topk` blocks (by per-block |H_3| L2 norm) are
+    'expanded' — their score adds |Q·H_3| to Q·L_3 (= max of L_2 half-block scores).
+    The remaining blocks score with Q·L_3 only (no expansion).
+
+    Returns: [bsz, kv_heads, num_pages] page scores (float).
+    """
+    bsz, _num_q_heads, q_len, d = query.shape
+    _, kv_heads, num_pages, total_cs, _ = comp_k.shape
+    assert q_len == 1, "HARP scoring is decode-only"
+    assert total_cs % 2 == 0, f"HARP expects even comp_size_total, got {total_cs}"
+    cs_lp = total_cs // 2
+
+    L_3 = comp_k[..., :cs_lp, :].float()
+    H_3 = comp_k[..., cs_lp:, :].float()
+
+    h3_norm = H_3.norm(dim=-1)  # [B, kv_h, P, cs_lp]
+
+    k_d = max(0, min(int(harp_detail_topk), cs_lp))
+    if k_d == 0:
+        expanded_mask = torch.zeros_like(h3_norm, dtype=torch.bool)
+    elif k_d >= cs_lp:
+        expanded_mask = torch.ones_like(h3_norm, dtype=torch.bool)
+    else:
+        threshold = h3_norm.topk(k_d, dim=-1).values[..., -1:]
+        expanded_mask = h3_norm >= threshold
+
+    Q = query.float()  # [B, H_q, 1, d]
+    Q_grouped = Q.view(bsz, kv_heads, num_kv_groups, d)
+
+    if group_agg_method == "mean":
+        Q_g = Q_grouped.mean(dim=2)  # [B, kv_h, d]
+        QL3 = torch.einsum("bhd, bhpcd -> bhpc", Q_g, L_3)
+        QH3 = torch.einsum("bhd, bhpcd -> bhpc", Q_g, H_3)
+        block_scores = QL3 + expanded_mask.float() * QH3.abs()
+        page_scores = block_scores.amax(dim=-1)
+    else:  # "max"
+        QL3 = torch.einsum("bhgd, bhpcd -> bhgpc", Q_grouped, L_3)
+        QH3 = torch.einsum("bhgd, bhpcd -> bhgpc", Q_grouped, H_3)
+        block_scores = QL3 + expanded_mask.unsqueeze(2).float() * QH3.abs()
+        page_scores = block_scores.amax(dim=-1).amax(dim=2)
+
+    # Scoring across blocks within page: HARP uses max (the formula already does amax(-1)).
+    # 'mean'/'sum' alternatives would require different per-block aggregation; not supported here.
+    if out is not None:
+        out[..., :num_pages].copy_(page_scores.to(out.dtype))
+        return out[..., :num_pages]
+    return page_scores.to(comp_k.dtype if comp_k.is_floating_point() else torch.float32)
+
+
 def _compress_pages(attn_module, paged_x, comp_size):
     """Project [bsz, kv_heads, num_pages, page_size, head_dim] pages to comp_size via DCT."""
     page_size = paged_x.shape[3]
     M = _get_or_build_projection_matrix(
         attn_module, page_size, comp_size, paged_x.device, paged_x.dtype
     )
-    if _dct_page_cfg.use_triton and paged_x.stride(-1) == 1:
+    # Triton compress kernel uses tl.arange(0, COMP_SIZE) which requires power-of-2.
+    # Haar detail with ± negation pairs can produce non-power-of-2 effective comp_size;
+    # fall back to einsum in that case.
+    comp_rows = M.shape[0]
+    is_pow2 = (comp_rows > 0) and ((comp_rows & (comp_rows - 1)) == 0)
+    if _dct_page_cfg.use_triton and paged_x.stride(-1) == 1 and is_pow2:
         from triton_kernels import compress_pages_triton
         return compress_pages_triton(paged_x, M)
     return torch.einsum('cs,bhnsd->bhncd', M, paged_x)
@@ -1005,7 +1761,15 @@ def _apply_original_position_rope_to_paged_k(paged_k, num_sink_pages, page_size_
 
 
 def _compute_debug_oracle_page_scores(attn_module, query_states, paged_k, cfg, cos, sin):
-    """Compute full-page oracle scores for debug comparisons against proxies."""
+    """Compute full-page oracle scores for debug comparisons against proxies.
+
+    Two modes (selected by cfg.oracle_score_mode):
+      - "max":  oracle_max — score_per_page = max(q·K) over the page's tokens,
+                then group-aggregated. Same selection as cs=page_size proxy.
+      - "mass": mass oracle — score_per_page = Σ_t exp(q·K[p, t]) (proportional
+                to the page's softmax mass since the denominator is shared),
+                then group-aggregated.
+    """
     oracle_query_states = query_states
     oracle_paged_k = paged_k
     if cfg.continuous_rope:
@@ -1015,6 +1779,12 @@ def _compute_debug_oracle_page_scores(attn_module, query_states, paged_k, cfg, c
         oracle_paged_k = _apply_original_position_rope_to_paged_k(
             paged_k, cfg.num_sink_pages, cfg.page_size, attn_module.config
         )
+    if cfg.oracle_score_mode == "mass":
+        return _compute_mass_oracle_page_scores(
+            oracle_query_states, oracle_paged_k,
+            attn_module.num_key_value_groups,
+            cfg.group_agg_method,
+        )
     return score_pages_triton(
         oracle_query_states,
         oracle_paged_k,
@@ -1022,6 +1792,38 @@ def _compute_debug_oracle_page_scores(attn_module, query_states, paged_k, cfg, c
         cfg.group_agg_method,
         attn_module.num_key_value_groups,
     )
+
+
+def _compute_mass_oracle_page_scores(query_states, paged_k, num_kv_groups,
+                                     group_agg_method):
+    """Per-page softmax mass over paged region, group-aggregated.
+
+    score[b, kv_h, p] = group_agg_g( Σ_t exp(q[b,h,t']·K[b,kv_h,p,t]) / Z )
+    where Z normalizes over all paged tokens. Since Z is shared across pages
+    within a qo-head, ranking by this mass = ranking by unnormalized
+    Σ_t exp(q·K[p,t]) — sink/recent regions are not needed for ordering.
+    """
+    bsz, H_q, q_len, d = query_states.shape
+    _, H_kv, P, S, _ = paged_k.shape
+    assert q_len == 1, "mass oracle is decode-only"
+    G = num_kv_groups
+    scale = d ** -0.5
+
+    q = query_states.float()                                            # [B, H_q, 1, d]
+    k_expanded = paged_k.float().repeat_interleave(G, dim=1)            # [B, H_q, P, S, d]
+    flat_k = k_expanded.reshape(bsz, H_q, P * S, d)
+    logits = torch.matmul(q, flat_k.transpose(-1, -2)).squeeze(2) * scale  # [B, H_q, P*S]
+    weights = torch.softmax(logits, dim=-1)                             # [B, H_q, P*S]
+    page_mass = weights.view(bsz, H_q, P, S).sum(-1)                    # [B, H_q, P]
+    page_mass_g = page_mass.view(bsz, H_kv, G, P)
+    if group_agg_method == "max":
+        return page_mass_g.amax(dim=2)
+    elif group_agg_method == "mean":
+        return page_mass_g.mean(dim=2)
+    elif group_agg_method == "sum":
+        return page_mass_g.sum(dim=2)
+    else:
+        raise ValueError(f"mass oracle: unsupported group_agg={group_agg_method!r}")
 
 
 def _apply_original_position_rope_to_final_k(
@@ -1117,6 +1919,23 @@ _DCT_RUNTIME_STATE_ATTRS = (
     "_orig_pos_rope_sin_2d",
     "_orig_pos_rope_cache_len",
     "_q_rope_buf",
+    # Quest min/max metadata (used by score_use_quest_minmax / score_combine_quest_dct).
+    # Must be reset between samples or stale min/max from prior sample's K leaks in.
+    "_quest_min_k_cache",
+    "_quest_max_k_cache",
+    "_quest_n_pages_cached",
+    # Outlier bank: detected once post-prefill, then always included in decode attention.
+    "_outlier_K",
+    "_outlier_V",
+    "_outlier_indices",
+    # Cluster outlier (cluster_dyn): centroids + cluster_ids built post-prefill, reused per step.
+    "_cluster_centroids",
+    "_cluster_ids",
+    "_cluster_T_init",
+    # Q-aware lastq adaptive bin selection.
+    "_qaware_lastq_q",
+    "_cluster_K_max",
+    "_cluster_K_min",
 )
 
 
@@ -1247,8 +2066,13 @@ def dct_page_attention_forward(
         )
     kv_len = key_states.shape[2]
 
-    # Fallback to standard attention when KV cache is too short for paging.
-    if kv_len < min_len_for_paging:
+    # Fallback to standard attention when KV cache is too short for paging
+    # OR when this layer is in the dense-first-N-layers range (Quest-style skip).
+    dense_layer_skip = (
+        getattr(cfg, "dense_first_n_layers", 0) > 0
+        and self.layer_idx < cfg.dense_first_n_layers
+    )
+    if kv_len < min_len_for_paging or dense_layer_skip:
         attention_interface = _get_attention_interface(self)
         attn_output, _ = attention_interface(
             self,
@@ -1271,6 +2095,41 @@ def dct_page_attention_forward(
         recent_k, recent_v, num_pages, actual_recent) = segment_kv(
         key_states, value_states, cfg
     )
+
+    # Outlier bank: detect once on the first decode step (per generation/sample)
+    # using the post-prefill pageable region only (sink/recent are already always
+    # attended). Outliers are concatenated to the gathered KV before SDPA below.
+    if cfg.outlier_budget > 0:
+        if cfg.outlier_detector == "knorm":
+            if getattr(self, "_outlier_K", None) is None:
+                self._outlier_K, self._outlier_V = _detect_outliers_knorm(
+                    paged_k, paged_v, cfg.outlier_budget
+                )
+        elif cfg.outlier_detector == "lastq_mean":
+            if getattr(self, "_outlier_K", None) is None:
+                self._outlier_K, self._outlier_V = _detect_outliers_lastq_mean(
+                    query_states, paged_k, paged_v, cfg.outlier_budget, self.num_key_value_groups,
+                )
+        elif cfg.outlier_detector == "cluster_dyn":
+            # Build cluster state once post-prefill, then refresh outlier K/V per step.
+            if getattr(self, "_cluster_centroids", None) is None:
+                (self._cluster_centroids, self._cluster_ids, self._cluster_T_init,
+                 self._cluster_K_max, self._cluster_K_min) = _build_cluster_state(
+                    paged_k, cfg.cluster_outlier_N, cfg.cluster_outlier_iters,
+                    seed=self.layer_idx + 12345, scoring=cfg.cluster_outlier_scoring,
+                )
+            self._outlier_K, self._outlier_V = _select_cluster_outliers_dynamic(
+                query_states, paged_k, paged_v,
+                self._cluster_centroids, self._cluster_ids, self._cluster_T_init,
+                cfg.outlier_budget, cfg.cluster_outlier_top_k, self.num_key_value_groups,
+                q_agg=cfg.cluster_outlier_q_agg,
+                scoring=cfg.cluster_outlier_scoring,
+                K_max=self._cluster_K_max, K_min=self._cluster_K_min,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported outlier_detector: {cfg.outlier_detector!r}"
+            )
     # Step 4: Compressed cache maintenance.
     # comp_k is always built (used for scoring). comp_v is built only in
     # compressed mode (used for assembly); drop mode returns comp_v=None.
@@ -1293,11 +2152,126 @@ def dct_page_attention_forward(
         )
 
     score_query_states = query_states
-    if cfg.score_use_quest_minmax:
+    if getattr(cfg, "km_quest_split", 0) > 0:
+        # K-M union strategy: DCT top-(K-M) + Quest top-M (Quest restricted to
+        # pages NOT in DCT's set). Total = K pages. Boosts attn_recall via mass-
+        # heavy Quest contributions at the margin while preserving DCT's needle
+        # picks at the core.
+        dct_scores = score_pages_triton(
+            score_query_states, comp_k, cfg.scoring_method, cfg.group_agg_method, self.num_key_value_groups,
+        )
+        quest_min_k, quest_max_k = _update_quest_metadata(self, paged_k, num_pages)
+        quest_scores = _score_pages_quest(
+            score_query_states, quest_min_k, quest_max_k,
+            cfg.group_agg_method, self.num_key_value_groups,
+        )
+        K_topk = min(cfg.top_k, num_pages)
+        M = min(int(cfg.km_quest_split), K_topk - 1)
+        K_dct = K_topk - M
+        dct_topkm = torch.topk(dct_scores, K_dct, dim=-1).indices                   # [bsz, kv, K-M]
+        dct_mask = torch.zeros_like(dct_scores, dtype=torch.bool)
+        dct_mask.scatter_(-1, dct_topkm, True)
+        quest_scores_masked = quest_scores.masked_fill(dct_mask, float('-inf'))
+        quest_topM = torch.topk(quest_scores_masked, M, dim=-1).indices             # [bsz, kv, M]
+        # Build fused scores: DCT-selected get rank 0..K-M-1 (highest), Quest-selected
+        # get rank K-M..K-1, rest get -K_topk (so top-K downstream picks exactly the union).
+        fused = torch.full_like(
+            self._page_scores_buf[:, :, :num_pages], float('-inf'),
+        )
+        # Rank values: highest score for DCT-selected, slightly lower for Quest-supplement,
+        # -inf for others. Within each subset, give monotonic ranks for deterministic order.
+        dct_ranks = torch.arange(K_dct, 0, -1, device=paged_k.device, dtype=torch.float32)  # K-M..1
+        dct_ranks = dct_ranks.view(1, 1, K_dct).expand(bsz, _num_kv_heads, K_dct)
+        fused.scatter_(-1, dct_topkm.long(), dct_ranks + M)                          # K_dct..K
+        quest_ranks = torch.arange(M, 0, -1, device=paged_k.device, dtype=torch.float32)
+        quest_ranks = quest_ranks.view(1, 1, M).expand(bsz, _num_kv_heads, M)
+        fused.scatter_(-1, quest_topM.long(), quest_ranks)                           # 1..M
+        self._page_scores_buf[:, :, :num_pages].copy_(fused)
+        page_scores = self._page_scores_buf[:, :, :num_pages]
+    elif cfg.score_combine_quest_dct:
+        # Best-rank fusion: compute both DCT lowpass + Quest min/max scores, derive a
+        # per-page rank in each, set page_scores = -min(rank_dct, rank_quest). Downstream
+        # topk on these fused scores selects the union of top-K from each in min-rank order.
+        dct_scores = score_pages_triton(
+            score_query_states, comp_k, cfg.scoring_method, cfg.group_agg_method, self.num_key_value_groups,
+        )                                                                       # [bsz, num_kv_heads, num_pages]
+        quest_min_k, quest_max_k = _update_quest_metadata(self, paged_k, num_pages)
+        quest_scores = _score_pages_quest(
+            score_query_states, quest_min_k, quest_max_k,
+            cfg.group_agg_method, self.num_key_value_groups,
+        )                                                                       # [bsz, num_kv_heads, num_pages]
+        K_topk = min(cfg.top_k, num_pages)
+        dct_topk_idx = dct_scores.topk(K_topk, dim=-1).indices                  # [bsz, num_kv_heads, K]
+        quest_topk_idx = quest_scores.topk(K_topk, dim=-1).indices              # [bsz, num_kv_heads, K]
+        arange_K = torch.arange(K_topk, device=paged_k.device, dtype=torch.long)
+        arange_K = arange_K.view(1, 1, K_topk).expand(bsz, _num_kv_heads, K_topk)
+        sentinel = K_topk  # pages outside top-K get rank = K (excluded)
+        dct_rank = torch.full(
+            (bsz, _num_kv_heads, num_pages), sentinel,
+            dtype=torch.long, device=paged_k.device,
+        )
+        dct_rank.scatter_(-1, dct_topk_idx.long(), arange_K)
+        quest_rank = torch.full_like(dct_rank, sentinel)
+        quest_rank.scatter_(-1, quest_topk_idx.long(), arange_K)
+        min_rank = torch.minimum(dct_rank, quest_rank).float()                  # [bsz, num_kv_heads, num_pages]
+        fused = (-min_rank).to(self._page_scores_buf.dtype)
+        self._page_scores_buf[:, :, :num_pages].copy_(fused)
+        page_scores = self._page_scores_buf[:, :, :num_pages]
+    elif cfg.score_use_quest_minmax:
         quest_min_k, quest_max_k = _update_quest_metadata(self, paged_k, num_pages)
         page_scores = _score_pages_quest(
             score_query_states, quest_min_k, quest_max_k,
             cfg.group_agg_method, self.num_key_value_groups,
+            out=self._page_scores_buf, top_k=cfg.top_k,
+        )
+    elif cfg.proxy_method == "pca_qaware":
+        M_layer = _PROXY_BASIS_PCA.get(int(self.layer_idx))
+        if M_layer is None:
+            raise RuntimeError(
+                f"pca_qaware: no PCA basis loaded for layer {self.layer_idx}; "
+                f"call load_proxy_basis() with a calibrated qpca_*.pt file."
+            )
+        cs_h_used = cfg.pca_cs_h if cfg.pca_cs_h > 0 else M_layer.shape[1]
+        page_scores = _score_pages_pca_qaware(
+            score_query_states, paged_k, M_layer, cs_h_used,
+            cfg.scoring_method, cfg.group_agg_method,
+            self.num_key_value_groups, out=self._page_scores_buf,
+        )
+    elif cfg.proxy_method == "fasa_fc":
+        idom_layer = _PROXY_BASIS_FASA.get(int(self.layer_idx))
+        if idom_layer is None:
+            raise RuntimeError(
+                f"fasa_fc: no FASA I_dom loaded for layer {self.layer_idx}; "
+                f"call load_proxy_basis() with a calibrated fasa_idom_*.pt file."
+            )
+        n_tip_used = cfg.fasa_n_tip if cfg.fasa_n_tip > 0 else idom_layer.shape[1]
+        page_scores = _score_pages_fasa_fc(
+            score_query_states, paged_k, idom_layer, n_tip_used,
+            cfg.scoring_method, cfg.group_agg_method,
+            self.num_key_value_groups, out=self._page_scores_buf,
+        )
+    elif cfg.proxy_method == "harp":
+        page_scores = _score_pages_harp(
+            score_query_states, comp_k, self.num_key_value_groups,
+            cfg.scoring_method, cfg.group_agg_method,
+            cfg.harp_detail_topk, out=self._page_scores_buf,
+        )
+    elif cfg.score_softmax:
+        page_scores = _score_pages_dct_softmax(
+            score_query_states, comp_k, cfg.scoring_method, cfg.group_agg_method,
+            self.num_key_value_groups, out=self._page_scores_buf,
+        )
+    elif cfg.group_agg_method == "per_head_union":
+        page_scores = _score_pages_dct_perheadunion(
+            score_query_states, comp_k, cfg.scoring_method,
+            self.num_key_value_groups, top_k=cfg.top_k,
+            out=self._page_scores_buf,
+        )
+    elif cfg.qaware_lastq_topbins > 0:
+        page_scores = _score_pages_dct_qaware_lastq(
+            self, score_query_states, paged_k, cfg.qaware_lastq_topbins,
+            self.num_key_value_groups,
+            lastq_window=cfg.qaware_lastq_window,
             out=self._page_scores_buf,
         )
     else:
@@ -1648,6 +2622,19 @@ def dct_page_attention_forward(
     else:
         attn_bias = None
 
+    # Outlier bank: append always-attended outlier K/V (detected once post-prefill)
+    # to the assembled KV. Outliers get zero bias so they participate with their
+    # natural QK logits alongside sink + selected + recent.
+    if cfg.outlier_budget > 0 and getattr(self, "_outlier_K", None) is not None:
+        final_k = torch.cat([final_k, self._outlier_K], dim=2)
+        final_v = torch.cat([final_v, self._outlier_V], dim=2)
+        if attn_bias is not None:
+            M_out = self._outlier_K.shape[2]
+            zero_pad = attn_bias.new_zeros(
+                attn_bias.shape[0], attn_bias.shape[1], attn_bias.shape[2], M_out
+            )
+            attn_bias = torch.cat([attn_bias, zero_pad], dim=3)
+
     attn_output = F.scaled_dot_product_attention(
         query_states, final_k, final_v,
         attn_mask=attn_bias,
@@ -1828,6 +2815,12 @@ def dct_page_attention_forward_flashinfer(
         page_scores = _score_pages_quest(
             query_states, quest_min_k, quest_max_k,
             cfg.group_agg_method, self.num_key_value_groups,
+            out=self._page_scores_buf[:, :, :num_pages],
+        )
+    elif cfg.score_softmax:
+        page_scores = _score_pages_dct_softmax(
+            query_states, comp_k, cfg.scoring_method, cfg.group_agg_method,
+            self.num_key_value_groups,
             out=self._page_scores_buf[:, :, :num_pages],
         )
     else:
@@ -2124,6 +3117,12 @@ def dct_page_attention_forward_upstream_flashinfer(
             cfg.group_agg_method, self.num_key_value_groups,
             out=self._page_scores_buf[:, :, :num_pages],
         )
+    elif cfg.score_softmax:
+        page_scores = _score_pages_dct_softmax(
+            query_states, comp_k, cfg.scoring_method, cfg.group_agg_method,
+            self.num_key_value_groups,
+            out=self._page_scores_buf[:, :, :num_pages],
+        )
     else:
         page_scores = score_pages_triton(
             query_states, comp_k, cfg.scoring_method, cfg.group_agg_method,
@@ -2314,23 +3313,44 @@ def _select_dct_forward(attention_backend):
 def replace_qwen2_attn(
     page_size=32,
     top_k=64,
-    num_sink_pages=1,
-    num_recent_pages=5,
+    num_sink_pages=0,
+    num_recent_pages=0,
     compress_ratio=0.03125,
+    proxy_method="dct",
+    haar_detail_per_block=0,
+    haar_detail_with_negation=False,
+    harp_detail_topk=4,
     min_decode_kv_len_for_paging=8192,
+    dense_first_n_layers=0,
     scoring_method="max",
     group_agg_method="mean",
+    score_softmax=False,
+    qaware_lastq_topbins=0,
+    qaware_lastq_window=1,
     unselected_mode="drop",
     compressed_token_rope="mixed",
     continuous_rope=False,
     score_use_quest_minmax=False,
+    score_combine_quest_dct=False,
+    km_quest_split=0,
     select_with_oracle_page_scores=False,
+    oracle_score_mode="max",
     use_triton=True,
     weight_compressed_by_population=False,
     max_unselected_compressed=-1,
     comp_kv_quant="none",
     comp_kv_quant_granularity="per_page",
+    outlier_budget=0,
+    outlier_detector="lastq_mean",
+    cluster_outlier_N=256,
+    cluster_outlier_iters=5,
+    cluster_outlier_top_k=8,
+    cluster_outlier_q_agg="mean",
+    cluster_outlier_scoring="centroid",
     attention_backend="sdpa",
+    proxy_basis_path: str = "",
+    pca_cs_h: int = 0,
+    fasa_n_tip: int = 0,
 ):
     """
     Replace Qwen2Attention.forward with DCT Page Attention.
@@ -2344,27 +3364,51 @@ def replace_qwen2_attn(
         num_sink_pages=num_sink_pages,
         num_recent_pages=num_recent_pages,
         compress_ratio=compress_ratio,
+        proxy_method=proxy_method,
+        haar_detail_per_block=haar_detail_per_block,
+        haar_detail_with_negation=haar_detail_with_negation,
+        harp_detail_topk=harp_detail_topk,
         min_decode_kv_len_for_paging=min_decode_kv_len_for_paging,
+        dense_first_n_layers=dense_first_n_layers,
         scoring_method=scoring_method,
         group_agg_method=group_agg_method,
+        score_softmax=score_softmax,
+        qaware_lastq_topbins=qaware_lastq_topbins,
+        qaware_lastq_window=qaware_lastq_window,
         unselected_mode=unselected_mode,
         compressed_token_rope=compressed_token_rope,
         continuous_rope=continuous_rope,
         score_use_quest_minmax=score_use_quest_minmax,
+        score_combine_quest_dct=score_combine_quest_dct,
+        km_quest_split=km_quest_split,
         select_with_oracle_page_scores=select_with_oracle_page_scores,
+        oracle_score_mode=oracle_score_mode,
         use_triton=use_triton,
         weight_compressed_by_population=weight_compressed_by_population,
         max_unselected_compressed=max_unselected_compressed,
         comp_kv_quant=comp_kv_quant,
         comp_kv_quant_granularity=comp_kv_quant_granularity,
+        outlier_budget=outlier_budget,
+        outlier_detector=outlier_detector,
+        cluster_outlier_N=cluster_outlier_N,
+        cluster_outlier_iters=cluster_outlier_iters,
+        cluster_outlier_top_k=cluster_outlier_top_k,
+        cluster_outlier_q_agg=cluster_outlier_q_agg,
+        cluster_outlier_scoring=cluster_outlier_scoring,
+        proxy_basis_path=proxy_basis_path,
+        pca_cs_h=pca_cs_h,
+        fasa_n_tip=fasa_n_tip,
     )
+    if proxy_basis_path:
+        load_proxy_basis(proxy_basis_path)
+        print(f"  Loaded proxy basis from {proxy_basis_path}")
 
     comp_size = max(1, int(page_size * compress_ratio))
     print(f"DCT Page Attention config:")
     print(f"  page_size={page_size}, top_k={top_k}")
     print(f"  num_sink_pages={num_sink_pages}, num_recent_pages={num_recent_pages}")
     print(f"  compress_ratio={compress_ratio} ({page_size} -> {comp_size} tokens)")
-    print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}")
+    print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}, score_softmax={score_softmax}")
     print(f"  unselected_mode={unselected_mode}, compressed_token_rope={compressed_token_rope}")
     print(
         f"  continuous_rope={continuous_rope}, "
@@ -2384,23 +3428,44 @@ def replace_qwen2_attn(
 def replace_qwen3_attn(
     page_size=32,
     top_k=64,
-    num_sink_pages=1,
-    num_recent_pages=5,
+    num_sink_pages=0,
+    num_recent_pages=0,
     compress_ratio=0.03125,
+    proxy_method="dct",
+    haar_detail_per_block=0,
+    haar_detail_with_negation=False,
+    harp_detail_topk=4,
     min_decode_kv_len_for_paging=8192,
+    dense_first_n_layers=0,
     scoring_method="max",
     group_agg_method="mean",
+    score_softmax=False,
+    qaware_lastq_topbins=0,
+    qaware_lastq_window=1,
     unselected_mode="drop",
     compressed_token_rope="mixed",
     continuous_rope=False,
     score_use_quest_minmax=False,
+    score_combine_quest_dct=False,
+    km_quest_split=0,
     select_with_oracle_page_scores=False,
+    oracle_score_mode="max",
     use_triton=True,
     weight_compressed_by_population=False,
     max_unselected_compressed=-1,
     comp_kv_quant="none",
     comp_kv_quant_granularity="per_page",
+    outlier_budget=0,
+    outlier_detector="lastq_mean",
+    cluster_outlier_N=256,
+    cluster_outlier_iters=5,
+    cluster_outlier_top_k=8,
+    cluster_outlier_q_agg="mean",
+    cluster_outlier_scoring="centroid",
     attention_backend="sdpa",
+    proxy_basis_path: str = "",
+    pca_cs_h: int = 0,
+    fasa_n_tip: int = 0,
 ):
     """
     Replace Qwen3Attention.forward with DCT Page Attention.
@@ -2416,27 +3481,51 @@ def replace_qwen3_attn(
         num_sink_pages=num_sink_pages,
         num_recent_pages=num_recent_pages,
         compress_ratio=compress_ratio,
+        proxy_method=proxy_method,
+        haar_detail_per_block=haar_detail_per_block,
+        haar_detail_with_negation=haar_detail_with_negation,
+        harp_detail_topk=harp_detail_topk,
         min_decode_kv_len_for_paging=min_decode_kv_len_for_paging,
+        dense_first_n_layers=dense_first_n_layers,
         scoring_method=scoring_method,
         group_agg_method=group_agg_method,
+        score_softmax=score_softmax,
+        qaware_lastq_topbins=qaware_lastq_topbins,
+        qaware_lastq_window=qaware_lastq_window,
         unselected_mode=unselected_mode,
         compressed_token_rope=compressed_token_rope,
         continuous_rope=continuous_rope,
         score_use_quest_minmax=score_use_quest_minmax,
+        score_combine_quest_dct=score_combine_quest_dct,
+        km_quest_split=km_quest_split,
         select_with_oracle_page_scores=select_with_oracle_page_scores,
+        oracle_score_mode=oracle_score_mode,
         use_triton=use_triton,
         weight_compressed_by_population=weight_compressed_by_population,
         max_unselected_compressed=max_unselected_compressed,
         comp_kv_quant=comp_kv_quant,
         comp_kv_quant_granularity=comp_kv_quant_granularity,
+        outlier_budget=outlier_budget,
+        outlier_detector=outlier_detector,
+        cluster_outlier_N=cluster_outlier_N,
+        cluster_outlier_iters=cluster_outlier_iters,
+        cluster_outlier_top_k=cluster_outlier_top_k,
+        cluster_outlier_q_agg=cluster_outlier_q_agg,
+        cluster_outlier_scoring=cluster_outlier_scoring,
+        proxy_basis_path=proxy_basis_path,
+        pca_cs_h=pca_cs_h,
+        fasa_n_tip=fasa_n_tip,
     )
+    if proxy_basis_path:
+        load_proxy_basis(proxy_basis_path)
+        print(f"  Loaded proxy basis from {proxy_basis_path}")
 
     comp_size = max(1, int(page_size * compress_ratio))
     print(f"DCT Page Attention config (Qwen3):")
     print(f"  page_size={page_size}, top_k={top_k}")
     print(f"  num_sink_pages={num_sink_pages}, num_recent_pages={num_recent_pages}")
     print(f"  compress_ratio={compress_ratio} ({page_size} -> {comp_size} tokens)")
-    print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}")
+    print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}, score_softmax={score_softmax}")
     print(f"  unselected_mode={unselected_mode}, compressed_token_rope={compressed_token_rope}")
     print(
         f"  continuous_rope={continuous_rope}, "
@@ -2456,23 +3545,44 @@ def replace_qwen3_attn(
 def replace_llama_attn(
     page_size=32,
     top_k=64,
-    num_sink_pages=1,
-    num_recent_pages=5,
+    num_sink_pages=0,
+    num_recent_pages=0,
     compress_ratio=0.03125,
+    proxy_method="dct",
+    haar_detail_per_block=0,
+    haar_detail_with_negation=False,
+    harp_detail_topk=4,
     min_decode_kv_len_for_paging=8192,
+    dense_first_n_layers=0,
     scoring_method="max",
     group_agg_method="mean",
+    score_softmax=False,
+    qaware_lastq_topbins=0,
+    qaware_lastq_window=1,
     unselected_mode="drop",
     compressed_token_rope="mixed",
     continuous_rope=False,
     score_use_quest_minmax=False,
+    score_combine_quest_dct=False,
+    km_quest_split=0,
     select_with_oracle_page_scores=False,
+    oracle_score_mode="max",
     use_triton=True,
     weight_compressed_by_population=False,
     max_unselected_compressed=-1,
     comp_kv_quant="none",
     comp_kv_quant_granularity="per_page",
+    outlier_budget=0,
+    outlier_detector="lastq_mean",
+    cluster_outlier_N=256,
+    cluster_outlier_iters=5,
+    cluster_outlier_top_k=8,
+    cluster_outlier_q_agg="mean",
+    cluster_outlier_scoring="centroid",
     attention_backend="sdpa",
+    proxy_basis_path: str = "",
+    pca_cs_h: int = 0,
+    fasa_n_tip: int = 0,
 ):
     """
     Replace LlamaAttention.forward with DCT Page Attention.
@@ -2492,27 +3602,51 @@ def replace_llama_attn(
         num_sink_pages=num_sink_pages,
         num_recent_pages=num_recent_pages,
         compress_ratio=compress_ratio,
+        proxy_method=proxy_method,
+        haar_detail_per_block=haar_detail_per_block,
+        haar_detail_with_negation=haar_detail_with_negation,
+        harp_detail_topk=harp_detail_topk,
         min_decode_kv_len_for_paging=min_decode_kv_len_for_paging,
+        dense_first_n_layers=dense_first_n_layers,
         scoring_method=scoring_method,
         group_agg_method=group_agg_method,
+        score_softmax=score_softmax,
+        qaware_lastq_topbins=qaware_lastq_topbins,
+        qaware_lastq_window=qaware_lastq_window,
         unselected_mode=unselected_mode,
         compressed_token_rope=compressed_token_rope,
         continuous_rope=continuous_rope,
         score_use_quest_minmax=score_use_quest_minmax,
+        score_combine_quest_dct=score_combine_quest_dct,
+        km_quest_split=km_quest_split,
         select_with_oracle_page_scores=select_with_oracle_page_scores,
+        oracle_score_mode=oracle_score_mode,
         use_triton=use_triton,
         weight_compressed_by_population=weight_compressed_by_population,
         max_unselected_compressed=max_unselected_compressed,
         comp_kv_quant=comp_kv_quant,
         comp_kv_quant_granularity=comp_kv_quant_granularity,
+        outlier_budget=outlier_budget,
+        outlier_detector=outlier_detector,
+        cluster_outlier_N=cluster_outlier_N,
+        cluster_outlier_iters=cluster_outlier_iters,
+        cluster_outlier_top_k=cluster_outlier_top_k,
+        cluster_outlier_q_agg=cluster_outlier_q_agg,
+        cluster_outlier_scoring=cluster_outlier_scoring,
+        proxy_basis_path=proxy_basis_path,
+        pca_cs_h=pca_cs_h,
+        fasa_n_tip=fasa_n_tip,
     )
+    if proxy_basis_path:
+        load_proxy_basis(proxy_basis_path)
+        print(f"  Loaded proxy basis from {proxy_basis_path}")
 
     comp_size = max(1, int(page_size * compress_ratio))
     print(f"DCT Page Attention config (Llama):")
     print(f"  page_size={page_size}, top_k={top_k}")
     print(f"  num_sink_pages={num_sink_pages}, num_recent_pages={num_recent_pages}")
     print(f"  compress_ratio={compress_ratio} ({page_size} -> {comp_size} tokens)")
-    print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}")
+    print(f"  scoring_method={scoring_method}, group_agg_method={group_agg_method}, score_softmax={score_softmax}")
     print(f"  unselected_mode={unselected_mode}, compressed_token_rope={compressed_token_rope}")
     print(
         f"  continuous_rope={continuous_rope}, "

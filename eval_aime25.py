@@ -231,8 +231,8 @@ def parse_args():
     parser.add_argument("--top_k", type=int, default=64,
                         help="Total selected page budget (sink + middle + recent). "
                              "DCTPageConfig receives total - sink - recent as its internal top_k.")
-    parser.add_argument("--num_sink_pages", type=int, default=1)
-    parser.add_argument("--num_recent_pages", type=int, default=5)
+    parser.add_argument("--num_sink_pages", type=int, default=0)
+    parser.add_argument("--num_recent_pages", type=int, default=0)
     parser.add_argument("--compress_ratio", type=float, default=0.03125)
     parser.add_argument("--scoring_method", type=str, default="max",
                         choices=["mean", "max"])

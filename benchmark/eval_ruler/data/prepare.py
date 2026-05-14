@@ -26,6 +26,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -125,7 +126,7 @@ def main():
     try:
         script = os.path.join(curr_folder, args.benchmark, f"{config['task']}.py")
         additional_args = " ".join([f"--{k} {v}" for k, v in config["args"].items()])
-        command = f"""python {script} \
+        command = f"""{sys.executable} {script} \
         --save_dir  {args.save_dir} \
         --save_name {args.task} \
         --subset {args.subset} \

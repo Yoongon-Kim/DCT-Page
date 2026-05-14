@@ -175,15 +175,28 @@ def _install_recording_forward(model: torch.nn.Module, family: str) -> None:
                     key_states, value_states, self.layer_idx, cache_kwargs,
                 )
 
-            # ---- Side-effect recorder call (decode only) -------------------
-            if query_states.shape[-2] == 1 and _recording_hook is not None:
-                _recording_hook({
-                    "layer_idx": int(self.layer_idx),
-                    "query_states": query_states,
-                    "key_states_full": key_states,
-                    "value_states_full": value_states,
-                    "num_kv_groups": int(self.num_key_value_groups),
-                })
+            # ---- Side-effect recorder call -------------------------------
+            # Decode steps (q_len=1) get the canonical payload; prefill (q_len>1)
+            # gets a separate payload tagged with phase="prefill" so recorders that
+            # need raw prefill Q+K (e.g. paper-faithful InfLLM r_m) can collect it.
+            # Recorders without a "phase" check ignore prefill calls implicitly.
+            if _recording_hook is not None:
+                if query_states.shape[-2] == 1:
+                    _recording_hook({
+                        "layer_idx": int(self.layer_idx),
+                        "query_states": query_states,
+                        "key_states_full": key_states,
+                        "value_states_full": value_states,
+                        "num_kv_groups": int(self.num_key_value_groups),
+                    })
+                else:
+                    _recording_hook({
+                        "phase": "prefill",
+                        "layer_idx": int(self.layer_idx),
+                        "query_states_prefill": query_states.detach(),
+                        "key_states_prefill": key_states.detach(),
+                        "num_kv_groups": int(self.num_key_value_groups),
+                    })
             # ---------------------------------------------------------------
 
             attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
@@ -413,9 +426,12 @@ def load_model(args: argparse.Namespace):
             },
             "max_position_embeddings": 131072,
         }
+    _dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}[
+        getattr(args, "model_dtype", "bfloat16")
+    ]
     return AutoModelForCausalLM.from_pretrained(
         args.base_model,
-        dtype=torch.bfloat16,
+        dtype=_dtype,
         device_map={"": args.cuda_device},
         attn_implementation="sdpa",
         local_files_only=args.local_files_only,

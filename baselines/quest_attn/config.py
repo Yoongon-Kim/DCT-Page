@@ -18,7 +18,7 @@ Note: Quest supports LLaMA-family models (Llama-2, Llama-3.x, Mistral) and Qwen3
 
 QUEST_ATTN_CONFIG = {
     # Base model (HF Hub ID or local path) — LLaMA-family or Qwen3
-    "base_model": "meta-llama/Llama-3.1-8B-Instruct",
+    "base_model": "Qwen/Qwen3-8B",
 
     # Tokens per KV cache page
     "page_size": 16,
