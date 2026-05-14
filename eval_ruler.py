@@ -243,10 +243,6 @@ def parse_args():
     parser.add_argument("--snapkv_pooling", type=str, default="avgpool",
                         choices=["avgpool", "maxpool"],
                         help="SnapKV: pooling op over attention-mass scores before topk.")
-    parser.add_argument("--inf_llm_exc_block_size", type=int, default=512,
-                        help="InfLLM: prefill query-chunk size for global retrieval "
-                             "(upstream Llama-3 default: 512). Must be <= --inf_llm_n_local "
-                             "(upstream asserts no global token in the input chunk).")
 
     # SeerAttention-R overrides (only used when --mode seer_attention).
     # CLI takes precedence over baselines/seer_attn/config.py (None = fall back).
@@ -821,13 +817,6 @@ def load_model_and_tokenizer(args):
                              if args.inf_llm_exc_block_size is not None
                              else INF_LLM_CONFIG["exc_block_size"])
             INF_LLM_CONFIG["exc_block_size"] = min(requested_exc, args.inf_llm_n_local)
-            if args.inf_llm_exc_block_size > args.inf_llm_n_local:
-                raise ValueError(
-                    f"--inf_llm_exc_block_size ({args.inf_llm_exc_block_size}) must be "
-                    f"<= --inf_llm_n_local ({args.inf_llm_n_local}); upstream InfLLM asserts "
-                    f"this so prefill query chunks contain no global tokens."
-                )
-            INF_LLM_CONFIG["exc_block_size"] = args.inf_llm_exc_block_size
             init_inf_llm(model, INF_LLM_CONFIG)
             args._inf_llm_generator = build_inf_llm_generator(model, tokenizer, INF_LLM_CONFIG)
 
