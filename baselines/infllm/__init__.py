@@ -1,14 +1,20 @@
 """
 InfLLM baseline wrapper for DCT-Page.
 
-Thin shim around the upstream inf_llm package (pip install -e
-/home/yoongonkim/InfLLM/) that:
-  1. Applies inf_llm.patch_hf() to swap in retrieval-based block attention.
-  2. Provides an InfLLMGenerator that mirrors HF generate()'s token-id
-     output shape, built on top of inf_llm.utils.greedy_search.GreedySearch.
+Self-contained — upstream package is vendored under `baselines/infllm/upstream/`.
+Targets transformers 5.2.0 in the DCT_Page conda env. The signature contract is
+documented in `baselines/infllm/upstream/utils/patch.py` (5.2.0
+LlamaAttention.forward / LlamaModel.forward shapes; class-level patching).
 
-Requires transformers==4.37.2 (see config.py for full env setup). Llama 3.x
-only in this wrapper; loosen assert_llama_only to re-enable Qwen2/Mistral.
+What this module does:
+  1. Applies upstream.patch_hf() to swap in retrieval-based block attention.
+  2. Provides an InfLLMGenerator that mirrors HF generate()'s token-id output
+     shape, threading a tuple of ContextManager instances through past_key_values
+     instead of HF's Cache object.
+
+Llama 3.x only on the verification gate; Mistral/Qwen2 patch branches remain in
+patch.py for completeness but are untested on 5.2.0. Qwen3 is not supported
+(upstream Qwen2Attention lacks q_norm/k_norm).
 """
 
 import torch
@@ -18,6 +24,7 @@ _ATTN_KWARGS_KEYS = (
     "block_size",
     "n_init",
     "n_local",
+    "n_recent",
     "topk",
     "repr_topk",
     "max_cached_block",
@@ -46,27 +53,9 @@ def assert_llama_only(base_model: str) -> None:
         )
 
 
-def load_llama_config_stripped_rope(base_model: str):
-    """Load LlamaConfig with rope_scaling stripped.
-
-    InfLLM pins transformers==4.37, which doesn't recognise Llama-3.1's
-    rope_scaling (rope_type='llama3'); loading the config raises
-    ValueError: `rope_scaling` must be a dictionary with ... `type` and `factor`.
-
-    Stripping the key is safe because InfLLM replaces HF's rotary embedding
-    with its own RotaryEmbeddingESM (see inf_llm.utils.patch.patch_hf), so
-    the value is never consulted at runtime.
-    """
-    from transformers import LlamaConfig, PretrainedConfig
-
-    config_dict, _ = PretrainedConfig.get_config_dict(base_model)
-    config_dict.pop("rope_scaling", None)
-    return LlamaConfig(**config_dict)
-
-
 def init_inf_llm(model, cfg: dict):
     """Apply InfLLM's retrieval-block attention patch to a loaded Llama model."""
-    from inf_llm import patch_hf
+    from .upstream import patch_hf
 
     attn_kwargs = {k: cfg[k] for k in _ATTN_KWARGS_KEYS if k in cfg}
     patch_hf(
@@ -76,9 +65,11 @@ def init_inf_llm(model, cfg: dict):
         base=cfg.get("base"),
         distance_scale=cfg.get("distance_scale", 1.0),
     )
+    n_recent_str = (f" n_recent={cfg['n_recent']}"
+                    if cfg.get("n_recent") is not None else "")
     print(
         f"[inf_llm] attn_type={cfg['attn_type']} "
-        f"n_init={cfg['n_init']} n_local={cfg['n_local']} "
+        f"n_init={cfg['n_init']} n_local={cfg['n_local']}{n_recent_str} "
         f"topk={cfg['topk']} block_size={cfg['block_size']} "
         f"repr_topk={cfg['repr_topk']} max_cached_block={cfg['max_cached_block']}"
     )
@@ -186,7 +177,6 @@ def build_inf_llm_generator(model, tokenizer, cfg: dict) -> InfLLMGenerator:
 
 __all__ = [
     "assert_llama_only",
-    "load_llama_config_stripped_rope",
     "init_inf_llm",
     "InfLLMGenerator",
     "build_inf_llm_generator",

@@ -1,8 +1,9 @@
 """
 Unified RULER benchmark evaluation.
 
-Supports four attention modes (baseline, page_attention, seer_attention,
-multipole_attention) with optional data preparation.  Mirrors the mode-based
+Supports many attention modes (baseline, page_attention, seer_attention,
+seer_prefill, multipole_attention, quest_attention, duo_attention, shadowkv,
+inf_llm, snap_kv) with optional data preparation.  Mirrors the mode-based
 dispatch pattern of eval_longbench_v1.py.
 
 Supported models: Llama 3.1 8B Instruct and Qwen3-8B. Chat template and
@@ -101,7 +102,8 @@ def parse_args():
                                  "multipole_attention", "quest_attention",
                                  "duo_attention",
                                  "shadowkv",
-                                 "inf_llm"])
+                                 "inf_llm",
+                                 "snap_kv"])
 
     # Model
     parser.add_argument("--base_model", type=str,
@@ -195,6 +197,13 @@ def parse_args():
                         help="InfLLM: tokens per block (retrieval granularity).")
     parser.add_argument("--inf_llm_n_local", type=int, default=4096,
                         help="InfLLM: sliding-window of always-attended recent tokens.")
+    parser.add_argument("--inf_llm_n_recent", type=int, default=None,
+                        help="InfLLM: output sliding window (defaults to n_local — byte-identical "
+                             "to upstream behavior). Must be <= n_local. When set < n_local, "
+                             "decouples the local-output window from the block-scoring horizon "
+                             "and ATTENUATES the local-attention output (output mass over keys "
+                             "in [n_recent, n_local) is zeroed; softmax is NOT renormalized), "
+                             "which can significantly degrade retrieval at long context.")
     parser.add_argument("--inf_llm_n_init", type=int, default=32,
                         help="InfLLM: sink token count.")
     parser.add_argument("--inf_llm_repr_topk", type=int, default=4,
@@ -203,6 +212,24 @@ def parse_args():
                         help="InfLLM: GPU block cache size (must be >= --inf_llm_topk).")
     parser.add_argument("--inf_llm_chunk_size", type=int, default=8192,
                         help="InfLLM: prefill chunk size for GreedySearch.")
+    parser.add_argument("--inf_llm_exc_block_size", type=int, default=None,
+                        help="InfLLM: per-iteration global-attention block size during prefill. "
+                             "Upstream asserts exc_block_size <= n_local. None => "
+                             "min(INF_LLM_CONFIG['exc_block_size'], n_local).")
+
+    # SnapKV baseline params (only used when --mode snap_kv). Overrides on top
+    # of baselines/snap_kv/config.py SNAPKV_CONFIG. SnapKV compresses the
+    # prefill KV cache to `max_capacity_prompt` tokens per layer.
+    parser.add_argument("--snapkv_window_size", type=int, default=32,
+                        help="SnapKV: query window for attention-mass scoring (last N queries vote).")
+    parser.add_argument("--snapkv_max_capacity_prompt", type=int, default=2048,
+                        help="SnapKV: total kept tokens per layer after compression "
+                             "(includes the trailing window_size tokens).")
+    parser.add_argument("--snapkv_kernel_size", type=int, default=5,
+                        help="SnapKV: 1D pooling kernel size for smoothing attention-mass scores.")
+    parser.add_argument("--snapkv_pooling", type=str, default="avgpool",
+                        choices=["avgpool", "maxpool"],
+                        help="SnapKV: pooling op over attention-mass scores before topk.")
 
     # SeerAttention-R overrides (only used when --mode seer_attention).
     # CLI takes precedence over baselines/seer_attn/config.py (None = fall back).
@@ -268,6 +295,13 @@ def parse_args():
                              f"_nlocal{args.inf_llm_n_local}"
                              f"_nini{args.inf_llm_n_init}"
                              f"_repr{args.inf_llm_repr_topk}")
+            if args.inf_llm_n_recent is not None:
+                args.run_name += f"_nrec{args.inf_llm_n_recent}"
+        elif args.mode == "snap_kv":
+            args.run_name = (f"{tag}_snap_kv_cap{args.snapkv_max_capacity_prompt}"
+                             f"_{args.snapkv_pooling}"
+                             f"_win{args.snapkv_window_size}"
+                             f"_ks{args.snapkv_kernel_size}")
 
     if args.skip_existing:
         summary_path = Path(args.output_dir) / args.run_name / "summary.json"
@@ -401,17 +435,23 @@ def _validate_upstream_fi_args(args):
             f"To sweep both modes, run two passes."
         )
 
-    # 2. Greedy-only hard assert. Eval scripts default to greedy; this is defensive.
-    do_sample = getattr(args, "do_sample", False)
+    # 2. Single-forward-per-decode-step hard assert. The lazy-init paged cache
+    # is built once at the first decode step and assumes batch shape is stable
+    # across steps. do_sample=True is fine — sampling only changes argmax ->
+    # multinomial on the final logits; the forward pass and KV writes are
+    # identical to greedy. What actually breaks the contract is multi-forward
+    # decoding: beam search (num_beams>1) or parallel sampling
+    # (num_return_sequences>1), which would either run N forwards per step or
+    # expand the batch shape mid-generate.
     num_beams = getattr(args, "num_beams", 1)
     num_return_sequences = getattr(args, "num_return_sequences", 1)
-    if do_sample or num_beams > 1 or num_return_sequences > 1:
+    if num_beams > 1 or num_return_sequences > 1:
         raise SystemExit(
-            f"--attention_backend upstream_flashinfer requires greedy decoding "
-            f"(do_sample=False, num_beams=1, num_return_sequences=1). "
-            f"Got do_sample={do_sample}, num_beams={num_beams}, "
-            f"num_return_sequences={num_return_sequences}. "
-            f"The lazy-init cache contract assumes one forward per decode step."
+            f"--attention_backend upstream_flashinfer requires single-sequence "
+            f"decoding (num_beams=1, num_return_sequences=1). "
+            f"Got num_beams={num_beams}, num_return_sequences={num_return_sequences}. "
+            f"The lazy-init cache contract assumes one forward per decode step "
+            f"and a stable batch shape. (do_sample=True is supported.)"
         )
 
     # 3. 64K paged-KV memory preflight. Use approximate dims for known families.
@@ -545,6 +585,8 @@ def apply_monkey_patch(args):
         pass  # ShadowKV uses a custom LLM class; no monkey-patch needed.
     elif args.mode == "inf_llm":
         pass  # InfLLM patches per-instance forwards post-load (see load_model_and_tokenizer)
+    elif args.mode == "snap_kv":
+        pass  # SnapKV patches the attention class post-load (see load_model_and_tokenizer)
     elif args.mode == "baseline":
         print("Baseline mode: full attention (no monkey-patch)")
 
@@ -654,14 +696,13 @@ def load_model_and_tokenizer(args):
         tokenizer = model.tokenizer
         print("ShadowKV LLM ready.")
     else:
-        # DuoAttention's and InfLLM's replacement forwards assume eager-style Q/K/V signatures.
-        attn_impl = "eager" if args.mode in {"duo_attention", "inf_llm"} else "sdpa"
+        # DuoAttention's, InfLLM's, and SnapKV's replacement forwards assume eager-style Q/K/V signatures.
+        attn_impl = "eager" if args.mode in {"duo_attention", "inf_llm", "snap_kv"} else "sdpa"
         print(f"Loading model: {args.base_model} (attn: {attn_impl})")
         tokenizer = AutoTokenizer.from_pretrained(args.base_model)
         yarn_kwargs = {}
         # InfLLM replaces RoPE with its own RotaryEmbeddingESM and is Llama-only,
-        # so the Qwen3-yarn rope_parameters injection is irrelevant (and the old
-        # transformers env it runs in does not accept rope_parameters=).
+        # so the Qwen3-yarn rope_parameters injection is irrelevant for inf_llm.
         if "qwen3" in args.base_model.lower() and args.mode != "inf_llm":
             yarn_kwargs = {
                 "rope_parameters": {
@@ -672,26 +713,19 @@ def load_model_and_tokenizer(args):
                 },
                 "max_position_embeddings": 131072,
             }
-        # Old transformers envs (duo_attention, inf_llm) only accept torch_dtype=;
-        # transformers 5.x (main DCT-Page env) only accepts dtype=.
+        # Old transformers envs (duo_attention) only accept torch_dtype=;
+        # transformers 5.x (main DCT-Page env, including inf_llm) only accepts dtype=.
         dtype_kwarg = (
             {"torch_dtype": torch.bfloat16}
-            if args.mode in {"duo_attention", "inf_llm"}
+            if args.mode == "duo_attention"
             else {"dtype": torch.bfloat16}
         )
-        # InfLLM's transformers 4.37 can't parse Llama-3.1's rope_type='llama3';
-        # strip rope_scaling up front (InfLLM replaces RoPE anyway).
-        inf_llm_config_override = {}
-        if args.mode == "inf_llm":
-            from infllm import load_llama_config_stripped_rope
-            inf_llm_config_override["config"] = load_llama_config_stripped_rope(args.base_model)
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
             **dtype_kwarg,
             device_map="cuda:0",
             attn_implementation=attn_impl,
             **yarn_kwargs,
-            **inf_llm_config_override,
         )
         model.eval()
         print(f"Model loaded. Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
@@ -724,8 +758,25 @@ def load_model_and_tokenizer(args):
             INF_LLM_CONFIG["repr_topk"] = args.inf_llm_repr_topk
             INF_LLM_CONFIG["max_cached_block"] = args.inf_llm_max_cached_block
             INF_LLM_CONFIG["chunk_size"] = args.inf_llm_chunk_size
+            INF_LLM_CONFIG["n_recent"] = args.inf_llm_n_recent
+            requested_exc = (args.inf_llm_exc_block_size
+                             if args.inf_llm_exc_block_size is not None
+                             else INF_LLM_CONFIG["exc_block_size"])
+            INF_LLM_CONFIG["exc_block_size"] = min(requested_exc, args.inf_llm_n_local)
             init_inf_llm(model, INF_LLM_CONFIG)
             args._inf_llm_generator = build_inf_llm_generator(model, tokenizer, INF_LLM_CONFIG)
+
+        if args.mode == "snap_kv":
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "baselines"))
+            from snap_kv import init_snap_kv
+            from snap_kv.config import SNAPKV_CONFIG
+            sys.path.pop(0)
+            SNAPKV_CONFIG["base_model"] = args.base_model
+            SNAPKV_CONFIG["window_size"] = args.snapkv_window_size
+            SNAPKV_CONFIG["max_capacity_prompt"] = args.snapkv_max_capacity_prompt
+            SNAPKV_CONFIG["kernel_size"] = args.snapkv_kernel_size
+            SNAPKV_CONFIG["pooling"] = args.snapkv_pooling
+            init_snap_kv(model, SNAPKV_CONFIG)
 
     # Seed per-attention-module `_upstream_fi_build_kwargs` AFTER from_pretrained.
     # `replace_*_attn` runs BEFORE model load by project convention, so this
@@ -995,6 +1046,14 @@ def _save_summary(args, all_seq_results):
             "page_size": args.quest_page_size,
             "page_budget": args.quest_top_k,
             "token_budget": args.quest_page_size * args.quest_top_k,
+        }
+    elif args.mode == "snap_kv":
+        summary["snap_kv_config"] = {
+            "base_model": args.base_model,
+            "window_size": args.snapkv_window_size,
+            "max_capacity_prompt": args.snapkv_max_capacity_prompt,
+            "kernel_size": args.snapkv_kernel_size,
+            "pooling": args.snapkv_pooling,
         }
 
     summary_path = Path(args.output_dir) / args.run_name / "summary.json"

@@ -30,7 +30,6 @@ Usage:
 import os
 import sys
 import json
-import re
 import csv
 import random
 import argparse
@@ -87,9 +86,9 @@ def _assert_mode_model_compatible(mode: str, base_model: str) -> None:
 # ---------------------------------------------------------------------------
 # Prompt template (CoT, math)
 # ---------------------------------------------------------------------------
-PROMPT_TEMPLATE = """Solve the following problem. Reason step by step, then place your final integer answer (0-999) inside \\boxed{{}}.
-
-Problem: {problem}"""
+# Matches SeerAttention reasoning_tasks/eval_hf.py:184-188 +
+# prompts/qwen-instruct/prompt.py: question first, instruction suffix.
+PROMPT_TEMPLATE = "{problem}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
 
 
 def format_aime25_sample(item):
@@ -125,68 +124,32 @@ def tokenize_prompt(prompt_text, tokenizer, max_input_len, args=None):
 
 
 # ---------------------------------------------------------------------------
-# Answer extraction (innermost \boxed{...} with brace-balance scan)
+# Answer extraction — delegated to math_grader (vendored from SeerAttention).
 # ---------------------------------------------------------------------------
-_LAST_INT_RE = re.compile(r"(-?\d+)(?!.*\d)", re.DOTALL)
-
-
-def _find_innermost_boxed(text: str):
-    """Return the contents of the last well-balanced \\boxed{...}, or None."""
-    last_content = None
-    i = 0
-    while True:
-        idx = text.find("\\boxed{", i)
-        if idx == -1:
-            break
-        depth = 1
-        j = idx + len("\\boxed{")
-        start = j
-        while j < len(text) and depth > 0:
-            ch = text[j]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    last_content = text[start:j]
-                    break
-            j += 1
-        if depth != 0:
-            break
-        i = j + 1
-    return last_content
-
-
-def _normalize_int(s: str):
-    """Strip $, commas, whitespace, leading +; return canonical int string or None."""
-    if s is None:
-        return None
-    s = s.strip().replace(",", "").replace("$", "").replace("\\,", "")
-    s = s.strip("+ ")
-    m = re.fullmatch(r"-?\d+", s)
-    if m:
-        return str(int(m.group(0)))
-    # Try to pluck a trailing integer from the boxed content (e.g. "= 042" -> 42)
-    m = _LAST_INT_RE.search(s)
-    if m:
-        return str(int(m.group(1)))
-    return None
+from math_grader import (
+    extract_answer as _grader_extract_answer,
+    check_is_correct as _grader_check_is_correct,
+)
 
 
 def extract_answer(response: str):
-    """Return canonical integer string or None."""
+    """Return the boxed-content string, or None if extraction yields empty.
+
+    Preserves the existing summary-stat semantics where ``predicted is None``
+    means "no well-formed boxed answer was emitted" (typically truncation
+    mid-thinking).
+    """
     if not response:
         return None
-    boxed = _find_innermost_boxed(response)
-    if boxed is not None:
-        ans = _normalize_int(boxed)
-        if ans is not None:
-            return ans
-    # Fallback: last integer in the response.
-    m = _LAST_INT_RE.search(response)
-    if m:
-        return str(int(m.group(1)))
-    return None
+    pred = _grader_extract_answer(response)
+    return pred if pred else None
+
+
+def is_correct_answer(predicted, gold) -> bool:
+    """SeerAttention-style equivalence: strip_string both sides + math_equal."""
+    if predicted is None:
+        return False
+    return _grader_check_is_correct(predicted, gold)
 
 
 # ---------------------------------------------------------------------------
@@ -219,11 +182,23 @@ def parse_args():
 
     # Generation
     parser.add_argument("--max_input_len", type=int, default=4096)
-    parser.add_argument("--max_new_tokens", type=int, default=16384,
-                        help="AIME solutions can be very long; default 16384 tokens")
+    parser.add_argument("--max_new_tokens", type=int, default=38912,
+                        help="Qwen3 model card recommends 38912 for math/programming "
+                             "competition benchmarks (AIME). Thinking traces routinely "
+                             "exceed 20K tokens; 16384 truncates ~90%% of problems.")
+    # Qwen3 thinking-mode sampling (per official model card).
+    # The card explicitly states: 'DO NOT use greedy decoding, as it can lead to
+    # performance degradation and endless repetitions.'
+    parser.add_argument("--do_sample", action="store_true", default=True,
+                        help="Sampling on by default (Qwen3 thinking mode requirement).")
+    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--top_p", type=float, default=0.95)
+    parser.add_argument("--top_k_sampling", type=int, default=20,
+                        help="Sampling top_k (distinct from DCT-Page --top_k page budget).")
+    parser.add_argument("--min_p", type=float, default=0.0)
 
     # Output
-    parser.add_argument("--output_dir", type=str, default="results_aime25")
+    parser.add_argument("--output_dir", type=str, default="results/results_aime25")
     parser.add_argument("--run_name", type=str, default=None)
 
     # DCT Page Attention params
@@ -232,19 +207,21 @@ def parse_args():
                         help="Total selected page budget (sink + middle + recent). "
                              "DCTPageConfig receives total - sink - recent as its internal top_k.")
     parser.add_argument("--num_sink_pages", type=int, default=1)
-    parser.add_argument("--num_recent_pages", type=int, default=5)
-    parser.add_argument("--compress_ratio", type=float, default=0.03125)
+    parser.add_argument("--num_recent_pages", type=int, default=4)
+    parser.add_argument("--compress_ratio", type=float, default=0.125)
     parser.add_argument("--scoring_method", type=str, default="max",
                         choices=["mean", "max"])
-    parser.add_argument("--group_agg_method", type=str, default="mean",
+    parser.add_argument("--group_agg_method", type=str, default="max",
                         choices=["mean", "max"])
     parser.add_argument("--unselected_mode", type=str, default="drop",
                         choices=["drop", "compressed"])
     parser.add_argument("--compressed_token_rope", type=str, default="mixed",
                         choices=["mixed", "block_center"])
     parser.add_argument("--continuous_rope", action="store_true")
+    parser.add_argument("--score_use_quest_minmax", action="store_true",
+                        help="Use QUEST-style min/max key metadata scoring instead of compressed proxy scoring")
     parser.add_argument("--no_triton", action="store_true")
-    parser.add_argument("--attention_backend", type=str, default="sdpa",
+    parser.add_argument("--attention_backend", type=str, default="upstream_flashinfer",
                         choices=["sdpa", "upstream_flashinfer"],
                         help="Attention backend for page_attention mode. "
                              "'sdpa' (default): assemble + torch.scaled_dot_product_attention "
@@ -256,13 +233,10 @@ def parse_args():
                         help="When --attention_backend upstream_flashinfer, run a per-layer SDPA "
                              "shadow comparison and log the per-step max-abs-diff distribution. "
                              "bf16 noise floor on this hardware is 0.05.")
-    parser.add_argument("--comp_kv_quant", type=str, default="none",
+    parser.add_argument("--comp_kv_quant", type=str, default="fp8_e5m2",
                         choices=["none", "fp8_e4m3", "fp8_e5m2", "int8", "int4"])
     parser.add_argument("--comp_kv_quant_granularity", type=str, default="per_page",
                         choices=["per_page", "per_comp_token"])
-
-    # eval_ruler.py expects these on args even though AIME doesn't loop over seq_lengths.
-    parser.add_argument("--seq_lengths", type=int, nargs="+", default=[32768])
 
     # ShadowKV baseline params (here for argparse parity only)
     parser.add_argument("--shadowkv_cache_mode", type=str, default="shadowkv_cpu",
@@ -406,14 +380,22 @@ def evaluate(model, tokenizer, dataset, args):
                     input_ids,
                     max_new_tokens=args.max_new_tokens,
                     on_post_generate=_harvest_verify_diffs,
-                    do_sample=False,
+                    do_sample=args.do_sample,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    top_k=args.top_k_sampling,
+                    min_p=args.min_p,
                     use_cache=True,
                 )
             else:
                 output_ids = model.generate(
                     input_ids,
                     max_new_tokens=args.max_new_tokens,
-                    do_sample=False,
+                    do_sample=args.do_sample,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    top_k=args.top_k_sampling,
+                    min_p=args.min_p,
                     use_cache=True,
                 )
 
@@ -426,7 +408,7 @@ def evaluate(model, tokenizer, dataset, args):
 
         response = tokenizer.decode(generated_ids, skip_special_tokens=True)
         predicted = extract_answer(response)
-        is_correct = (predicted == gold) if predicted is not None else False
+        is_correct = is_correct_answer(predicted, gold)
 
         result = {
             "_id": sample_id,

@@ -82,7 +82,7 @@ Model support: **Llama 3.x** (`replace_llama_attn`) and **Qwen3** (`replace_qwen
 | Folder | Baseline | Model support | Notes |
 |---|---|---|---|
 | `duo_attn/` | DuoAttention (head streaming + recent window) | Llama 3.x only | Requires dedicated env: `transformers==4.45.2`, `flash-attn==2.6.3`, upstream `duo-attention` installed. Config: `duo_attn/config.py` (`pattern_root`, `pattern_subdir`, `sparsity`, `sink_size`, `recent_size`). |
-| `infllm/` | InfLLM (retrieval-based block attention) | Llama 3.x only | Requires `transformers==4.37.2`, upstream `InfLLM` installed. Config: `infllm/config.py` (`attn_type`, `block_size`, `n_init`, `n_local`, `topk`, `repr_topk`, `max_cached_block`, `chunk_size`). **Note:** directory must not be named `inf_llm` — that collides with the upstream package and breaks the shim's internal `from inf_llm import patch_hf`. Any name without the underscore (e.g. `infllm`) is fine. |
+| `infllm/` | InfLLM (retrieval-based block attention) | Llama 3.x only | Targets **transformers 5.2.0** (the DCT_Page main env). **Self-contained** — upstream `inf_llm` package vendored under `baselines/infllm/upstream/`, no separate `pip install -e /home/yoongonkim/InfLLM/` and no separate `infllm` conda env needed. Config: `infllm/config.py` (`attn_type`, `block_size`, `n_init`, `n_local`, `n_recent`, `topk`, `repr_topk`, `max_cached_block`, `chunk_size`). The `n_recent` knob (default None → uses `n_local`) decouples the local-output sliding window from the block-scoring horizon; only the torch-impl path supports it (fattn=True asserts at construction time). **Note:** wrapper directory must remain named `infllm` (no underscore) to avoid ambiguity with the upstream `inf_llm` import path. |
 | `seer_attn/` | SeerAttention-R (learned gate-based sparsity, decode-only + optional prefill) | Llama 3.x, Qwen2/3 | Has `decode_sparse/`, `prefill_sparse/`, `kernels/`, `modules/`. Configs: `config.py` (decode) and `prefill_config.py`. Loads HF checkpoints like `SeerAttention/SeerAttention-Decode-Qwen3-8B-AttnGates`. |
 | `multipole_attn/` | Multipole Attention (hierarchical k-means clustering) | Llama 3.x, Qwen2/3 | Modules: `attention_forward.py`, `clustering.py`, `kernels.py`, `kernel_wrappers.py`, `kmeans_ops_sequential.py`. Config: `percent_clusters_lst`, `percentiles_lst`, `use_replacement`, `cluster_interval`. |
 | `quest_attn/` | Quest (per-page min/max key metadata) | Llama 2/3.x, Mistral, Qwen3 | Has its own model classes (`models/llama.py`, `models/qwen3.py`) — not monkey-patch based. Custom CUDA kernels under `ops/csrc/` built via `build_kernels.sh`. Config: `page_size`, `max_seq_len`, `token_budget`. |
@@ -138,7 +138,7 @@ Sweep scripts — each invokes `eval_ruler.py` / `eval_longbench_v{1,2}.py` with
 pip install -r requirements.txt
 # Core: torch 2.10.0, transformers 5.2.0, triton 3.6.0
 # DuoAttention requires a separate env pinned to transformers==4.45.2 + flash-attn==2.6.3
-# InfLLM requires a separate env pinned to transformers==4.37.2
+# InfLLM now runs in the main env (transformers 5.2.0); the legacy `infllm` conda env is retired
 # Quest needs baselines/quest_attn/build_kernels.sh for the CUDA extension
 ```
 

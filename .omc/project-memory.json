@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1778376126167,
+  "lastScanned": 1778683697984,
   "projectRoot": "/home/yoongonkim/DCT-Page",
   "techStack": {
     "languages": [
@@ -44,8 +44,8 @@
     "__pycache__": {
       "path": "__pycache__",
       "purpose": null,
-      "fileCount": 29,
-      "lastAccessed": 1778376126163,
+      "fileCount": 32,
+      "lastAccessed": 1778683697982,
       "keyFiles": [
         "analyze_niah_page_ranks.cpython-312.pyc",
         "analyze_selection_oracle_overlap.cpython-312.pyc",
@@ -58,21 +58,21 @@
       "path": "baselines",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1778376126165,
+      "lastAccessed": 1778683697982,
       "keyFiles": []
     },
     "benchmark": {
       "path": "benchmark",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1778376126165,
+      "lastAccessed": 1778683697982,
       "keyFiles": []
     },
     "observations": {
       "path": "observations",
       "purpose": null,
       "fileCount": 1,
-      "lastAccessed": 1778376126165,
+      "lastAccessed": 1778683697982,
       "keyFiles": [
         "dct_page_energy.py"
       ]
@@ -81,7 +81,7 @@
       "path": "oracle",
       "purpose": null,
       "fileCount": 8,
-      "lastAccessed": 1778376126165,
+      "lastAccessed": 1778683697982,
       "keyFiles": [
         "attention_mass_recall_ruler.py",
         "attention_mass_recall_ruler_quest.py",
@@ -93,60 +93,36 @@
     "results": {
       "path": "results",
       "purpose": null,
-      "fileCount": 2,
-      "lastAccessed": 1778376126165,
-      "keyFiles": [
-        "phase2c_nvtx.nsys-rep",
-        "phase2c_nvtx.sqlite"
-      ]
+      "fileCount": 0,
+      "lastAccessed": 1778683697983,
+      "keyFiles": []
     },
     "results_attention_mass_recall": {
       "path": "results_attention_mass_recall",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1778376126165,
+      "lastAccessed": 1778683697983,
       "keyFiles": []
     },
     "results_quest_mass_recall": {
       "path": "results_quest_mass_recall",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1778376126166,
+      "lastAccessed": 1778683697983,
       "keyFiles": []
     },
     "results_ruler": {
       "path": "results_ruler",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1778376126166,
-      "keyFiles": []
-    },
-    "results_ruler_smoke": {
-      "path": "results_ruler_smoke",
-      "purpose": null,
-      "fileCount": 0,
-      "lastAccessed": 1778376126166,
-      "keyFiles": []
-    },
-    "results_ruler_smoke_16": {
-      "path": "results_ruler_smoke_16",
-      "purpose": null,
-      "fileCount": 0,
-      "lastAccessed": 1778376126166,
-      "keyFiles": []
-    },
-    "results_ruler_smoke_32": {
-      "path": "results_ruler_smoke_32",
-      "purpose": null,
-      "fileCount": 0,
-      "lastAccessed": 1778376126166,
+      "lastAccessed": 1778683697983,
       "keyFiles": []
     },
     "speed": {
       "path": "speed",
       "purpose": null,
       "fileCount": 9,
-      "lastAccessed": 1778376126166,
+      "lastAccessed": 1778683697983,
       "keyFiles": [
         "flashinfer_backend.py",
         "profile_decode.py",
@@ -159,7 +135,7 @@
       "path": "benchmark/data",
       "purpose": "Data files",
       "fileCount": 0,
-      "lastAccessed": 1778376126166,
+      "lastAccessed": 1778683697983,
       "keyFiles": []
     }
   },
@@ -172,32 +148,38 @@
     },
     {
       "path": "eval_ruler.py",
-      "accessCount": 82,
-      "lastAccessed": 1778428543884,
+      "accessCount": 122,
+      "lastAccessed": 1778599027758,
       "type": "file"
     },
     {
       "path": "dct_page_attention.py",
-      "accessCount": 75,
-      "lastAccessed": 1778400347426,
+      "accessCount": 96,
+      "lastAccessed": 1778632593750,
       "type": "file"
     },
     {
       "path": "eval_longbench_v1.py",
-      "accessCount": 46,
-      "lastAccessed": 1778428478764,
+      "accessCount": 48,
+      "lastAccessed": 1778505235654,
       "type": "file"
     },
     {
       "path": "eval_longbench_v2.py",
-      "accessCount": 44,
-      "lastAccessed": 1778428512365,
+      "accessCount": 46,
+      "lastAccessed": 1778505243669,
       "type": "file"
     },
     {
       "path": "observations/dct_page_energy.py",
       "accessCount": 40,
       "lastAccessed": 1778225958834,
+      "type": "file"
+    },
+    {
+      "path": "eval_aime25.py",
+      "accessCount": 37,
+      "lastAccessed": 1778734512681,
       "type": "file"
     },
     {
@@ -219,21 +201,27 @@
       "type": "file"
     },
     {
-      "path": "eval_aime25.py",
+      "path": "eval_gpqa.py",
       "accessCount": 21,
-      "lastAccessed": 1778398332160,
+      "lastAccessed": 1778505041118,
       "type": "file"
     },
     {
-      "path": "eval_gpqa.py",
-      "accessCount": 20,
-      "lastAccessed": 1778398338533,
+      "path": "baselines/infllm/__init__.py",
+      "accessCount": 17,
+      "lastAccessed": 1778516219023,
       "type": "file"
     },
     {
       "path": "speed/flashinfer_backend.py",
       "accessCount": 16,
       "lastAccessed": 1778396714787,
+      "type": "file"
+    },
+    {
+      "path": "CLAUDE.md",
+      "accessCount": 10,
+      "lastAccessed": 1778483858671,
       "type": "file"
     },
     {
@@ -255,21 +243,33 @@
       "type": "file"
     },
     {
+      "path": "baselines/infllm/upstream/__init__.py",
+      "accessCount": 6,
+      "lastAccessed": 1778483693577,
+      "type": "file"
+    },
+    {
       "path": "speed/profile_decode.py",
       "accessCount": 5,
       "lastAccessed": 1778385787636,
       "type": "file"
     },
     {
-      "path": "CLAUDE.md",
-      "accessCount": 4,
-      "lastAccessed": 1778395743065,
+      "path": "baselines/quest_attn/models/QuestAttention.py",
+      "accessCount": 5,
+      "lastAccessed": 1778433299911,
       "type": "file"
     },
     {
-      "path": "baselines/quest_attn/models/QuestAttention.py",
-      "accessCount": 4,
-      "lastAccessed": 1778430184036,
+      "path": "baselines/infllm/config.py",
+      "accessCount": 5,
+      "lastAccessed": 1778483614453,
+      "type": "file"
+    },
+    {
+      "path": "config.py",
+      "accessCount": 5,
+      "lastAccessed": 1778632587259,
       "type": "file"
     },
     {
@@ -285,21 +285,21 @@
       "type": "file"
     },
     {
-      "path": "config.py",
-      "accessCount": 3,
-      "lastAccessed": 1778385867737,
-      "type": "file"
-    },
-    {
       "path": "baselines/quest_attn/ops/csrc/page.cu",
       "accessCount": 2,
       "lastAccessed": 1778430071965,
       "type": "file"
     },
     {
-      "path": "baselines/infllm/config.py",
-      "accessCount": 1,
-      "lastAccessed": 1778166706914,
+      "path": "baselines/infllm/upstream/utils/__init__.py",
+      "accessCount": 2,
+      "lastAccessed": 1778481100369,
+      "type": "file"
+    },
+    {
+      "path": "benchmark/eval_ruler/synthetic.yaml",
+      "accessCount": 2,
+      "lastAccessed": 1778515325942,
       "type": "file"
     },
     {
@@ -315,21 +315,9 @@
       "type": "file"
     },
     {
-      "path": "baselines/infllm/__init__.py",
-      "accessCount": 1,
-      "lastAccessed": 1778395297271,
-      "type": "file"
-    },
-    {
       "path": "benchmark/eval_ruler/data/prepare.py",
       "accessCount": 1,
       "lastAccessed": 1778406945844,
-      "type": "file"
-    },
-    {
-      "path": "benchmark/eval_ruler/synthetic.yaml",
-      "accessCount": 1,
-      "lastAccessed": 1778406957981,
       "type": "file"
     },
     {

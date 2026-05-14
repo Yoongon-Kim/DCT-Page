@@ -1050,17 +1050,11 @@ def main():
                 },
                 "max_position_embeddings": 131072,
             }
-        # InfLLM's transformers 4.37 can't parse Llama-3.1's rope_type='llama3';
-        # strip rope_scaling up front (InfLLM replaces RoPE anyway).
-        inf_llm_config_override = {}
-        if args.mode == "inf_llm":
-            from infllm import load_llama_config_stripped_rope
-            inf_llm_config_override["config"] = load_llama_config_stripped_rope(args.base_model)
-        # Old transformers envs (duo_attention, inf_llm) only accept torch_dtype=;
-        # transformers 5.x (main DCT-Page env) only accepts dtype=.
+        # duo_attention is pinned to transformers 4.45 (torch_dtype=); everything else
+        # (including inf_llm post-5.2.0 migration) is on the main DCT-Page env (dtype=).
         dtype_kwarg = (
             {"torch_dtype": torch.bfloat16}
-            if args.mode in {"duo_attention", "inf_llm"}
+            if args.mode == "duo_attention"
             else {"dtype": torch.bfloat16}
         )
         model = AutoModelForCausalLM.from_pretrained(
@@ -1069,7 +1063,6 @@ def main():
             device_map="auto",
             attn_implementation=attn_impl,
             **yarn_kwargs,
-            **inf_llm_config_override,
         )
         model.eval()
         print(f"Model loaded. Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")

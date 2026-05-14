@@ -2,13 +2,15 @@
 # RULER Evaluation — SnapKV
 # Sweeps max_capacity_prompt × pooling.
 #
-# SnapKV requires a dedicated conda env with transformers==4.37.2,
-# flash-attn==2.4.0.post1+, and the vendored baselines/snap_kv/ shim.
-# Set SNAPKV_ENV_NAME (default: snap_kv) to override the env name.
+# Runs in the DCT_Page conda env (transformers==5.2.0). The legacy snap_kv
+# conda env (transformers==4.37.2) is no longer required after the v5 port —
+# `baselines/snap_kv/upstream/` is kept as a historical reference only;
+# `baselines/snap_kv/patch_v5.py` is the live path.
+# Set SNAPKV_ENV_NAME (default: DCT_Page) to override the env name.
 set -euo pipefail
 
 # ---- Conda activation ----
-SNAPKV_ENV_NAME="${SNAPKV_ENV_NAME:-snap_kv}"
+SNAPKV_ENV_NAME="${SNAPKV_ENV_NAME:-DCT_Page}"
 eval "$(conda shell.bash hook)"
 conda activate "$SNAPKV_ENV_NAME"
 
@@ -22,10 +24,10 @@ KERNEL_SIZE="${KERNEL_SIZE:-5}"
 MAX_CAPACITY_PROMPT_LIST="${MAX_CAPACITY_PROMPT_LIST:-1024 2048 4096}"
 POOLING_LIST="${POOLING_LIST:-avgpool maxpool}"
 
-# SnapKV only supports Llama — hard-fail otherwise.
+# SnapKV supports Llama 3.x and Qwen3 (post-port).
 case "${BASE_MODEL,,}" in
-    *llama*) ;;
-    *) echo "snap_kv only supports Llama (got: $BASE_MODEL)"; exit 1 ;;
+    *llama*|*qwen3*) ;;
+    *) echo "snap_kv only supports Llama 3.x and Qwen3 (got: $BASE_MODEL)"; exit 1 ;;
 esac
 
 echo "======================================================================"

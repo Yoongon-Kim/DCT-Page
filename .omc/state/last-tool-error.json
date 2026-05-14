@@ -1,7 +1,7 @@
 {
   "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"CUDA_VISIBLE_DEVICES=1 conda run -n quest python eval_ruler.py --mode quest_attention \\\\\\n  --base_model Qwen/Qwen3-8B \\\\\\n  --seq_lengths 32768 \\\\\\n  --num_samples 1 \\\\\\n  --tasks niah_si...",
-  "error": "Exit code 1\n  File \"/home/yoongonkim/DCT-Page/baselines/quest_attn/utils/controller.py\", line 20, in __init__\n    self.kv_cache = KvCache(\n  File \"/home/yoongonkim/DCT-Page/baselines/quest_attn/utils/kv_cache.py\", line 82, in __init__\n    self._pool = KvPool(\n  File \"/home/yoongonkim/DCT-Page/baselines/quest_attn/utils/kv_cache.py\", line 20, in __init__\n    self._buf = torch.empty(\ntorch.OutOfMemoryError: CUDA out of memory. Tried to allocate 20.25 GiB. GPU 0 has a total capacity of 47.40 GiB of...",
-  "timestamp": "2026-05-10T16:23:53.980Z",
-  "retry_count": 3
+  "tool_input_preview": "{\"command\":\"python -c \\\"import sympy; print('sympy', sympy.__version__)\\\" 2>&1; python -c \\\"import regex; print('regex', regex.__version__)\\\" 2>&1; python -c \\\"import latex2sympy2; print('latex2sympy2...",
+  "error": "Exit code 1\nsympy 1.14.0\nregex 2.5.116\nTraceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nModuleNotFoundError: No module named 'latex2sympy2'\nTraceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nModuleNotFoundError: No module named 'word2number'",
+  "timestamp": "2026-05-14T04:51:00.737Z",
+  "retry_count": 1
 }
