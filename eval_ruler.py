@@ -225,6 +225,28 @@ def parse_args():
                         help="InfLLM: GPU block cache size (must be >= --inf_llm_topk).")
     parser.add_argument("--inf_llm_chunk_size", type=int, default=8192,
                         help="InfLLM: prefill chunk size for GreedySearch.")
+    parser.add_argument("--inf_llm_exc_block_size", type=int, default=None,
+                        help="InfLLM: per-iteration global-attention block size during prefill. "
+                             "Upstream asserts exc_block_size <= n_local. None => "
+                             "min(INF_LLM_CONFIG['exc_block_size'], n_local).")
+
+    # SnapKV baseline params (only used when --mode snap_kv). Overrides on top
+    # of baselines/snap_kv/config.py SNAPKV_CONFIG. SnapKV compresses the
+    # prefill KV cache to `max_capacity_prompt` tokens per layer.
+    parser.add_argument("--snapkv_window_size", type=int, default=32,
+                        help="SnapKV: query window for attention-mass scoring (last N queries vote).")
+    parser.add_argument("--snapkv_max_capacity_prompt", type=int, default=2048,
+                        help="SnapKV: total kept tokens per layer after compression "
+                             "(includes the trailing window_size tokens).")
+    parser.add_argument("--snapkv_kernel_size", type=int, default=5,
+                        help="SnapKV: 1D pooling kernel size for smoothing attention-mass scores.")
+    parser.add_argument("--snapkv_pooling", type=str, default="avgpool",
+                        choices=["avgpool", "maxpool"],
+                        help="SnapKV: pooling op over attention-mass scores before topk.")
+    parser.add_argument("--inf_llm_exc_block_size", type=int, default=512,
+                        help="InfLLM: prefill query-chunk size for global retrieval "
+                             "(upstream Llama-3 default: 512). Must be <= --inf_llm_n_local "
+                             "(upstream asserts no global token in the input chunk).")
 
     # SeerAttention-R overrides (only used when --mode seer_attention).
     # CLI takes precedence over baselines/seer_attn/config.py (None = fall back).
@@ -794,6 +816,18 @@ def load_model_and_tokenizer(args):
             INF_LLM_CONFIG["repr_topk"] = args.inf_llm_repr_topk
             INF_LLM_CONFIG["max_cached_block"] = args.inf_llm_max_cached_block
             INF_LLM_CONFIG["chunk_size"] = args.inf_llm_chunk_size
+            INF_LLM_CONFIG["n_recent"] = args.inf_llm_n_recent
+            requested_exc = (args.inf_llm_exc_block_size
+                             if args.inf_llm_exc_block_size is not None
+                             else INF_LLM_CONFIG["exc_block_size"])
+            INF_LLM_CONFIG["exc_block_size"] = min(requested_exc, args.inf_llm_n_local)
+            if args.inf_llm_exc_block_size > args.inf_llm_n_local:
+                raise ValueError(
+                    f"--inf_llm_exc_block_size ({args.inf_llm_exc_block_size}) must be "
+                    f"<= --inf_llm_n_local ({args.inf_llm_n_local}); upstream InfLLM asserts "
+                    f"this so prefill query chunks contain no global tokens."
+                )
+            INF_LLM_CONFIG["exc_block_size"] = args.inf_llm_exc_block_size
             init_inf_llm(model, INF_LLM_CONFIG)
             args._inf_llm_generator = build_inf_llm_generator(model, tokenizer, INF_LLM_CONFIG)
 
