@@ -89,6 +89,17 @@ def model_name_tag(base_model: str) -> str:
     raise ValueError(f"Unsupported --base_model: {base_model!r}")
 
 
+def _str2bool(v):
+    if isinstance(v, bool):
+        return v
+    s = str(v).lower()
+    if s in ("true", "1", "yes", "y", "t"):
+        return True
+    if s in ("false", "0", "no", "n", "f"):
+        return False
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got {v!r}")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -196,7 +207,9 @@ def parse_args():
     parser.add_argument("--inf_llm_block_size", type=int, default=32,
                         help="InfLLM: tokens per block (retrieval granularity).")
     parser.add_argument("--inf_llm_n_local", type=int, default=4096,
-                        help="InfLLM: sliding-window of always-attended recent tokens.")
+                        help="InfLLM: sliding-window of always-attended recent tokens. "
+                             "Upstream Llama-3 config uses 4096; shrinking this below ~1k "
+                             "tanks RULER multi-key / QA scores.")
     parser.add_argument("--inf_llm_n_recent", type=int, default=None,
                         help="InfLLM: output sliding window (defaults to n_local — byte-identical "
                              "to upstream behavior). Must be <= n_local. When set < n_local, "
@@ -205,31 +218,13 @@ def parse_args():
                              "in [n_recent, n_local) is zeroed; softmax is NOT renormalized), "
                              "which can significantly degrade retrieval at long context.")
     parser.add_argument("--inf_llm_n_init", type=int, default=32,
-                        help="InfLLM: sink token count.")
+                        help="InfLLM: sink token count (upstream Llama-3 default: 128).")
     parser.add_argument("--inf_llm_repr_topk", type=int, default=4,
                         help="InfLLM: representative tokens per block.")
     parser.add_argument("--inf_llm_max_cached_block", type=int, default=128,
                         help="InfLLM: GPU block cache size (must be >= --inf_llm_topk).")
     parser.add_argument("--inf_llm_chunk_size", type=int, default=8192,
                         help="InfLLM: prefill chunk size for GreedySearch.")
-    parser.add_argument("--inf_llm_exc_block_size", type=int, default=None,
-                        help="InfLLM: per-iteration global-attention block size during prefill. "
-                             "Upstream asserts exc_block_size <= n_local. None => "
-                             "min(INF_LLM_CONFIG['exc_block_size'], n_local).")
-
-    # SnapKV baseline params (only used when --mode snap_kv). Overrides on top
-    # of baselines/snap_kv/config.py SNAPKV_CONFIG. SnapKV compresses the
-    # prefill KV cache to `max_capacity_prompt` tokens per layer.
-    parser.add_argument("--snapkv_window_size", type=int, default=32,
-                        help="SnapKV: query window for attention-mass scoring (last N queries vote).")
-    parser.add_argument("--snapkv_max_capacity_prompt", type=int, default=2048,
-                        help="SnapKV: total kept tokens per layer after compression "
-                             "(includes the trailing window_size tokens).")
-    parser.add_argument("--snapkv_kernel_size", type=int, default=5,
-                        help="SnapKV: 1D pooling kernel size for smoothing attention-mass scores.")
-    parser.add_argument("--snapkv_pooling", type=str, default="avgpool",
-                        choices=["avgpool", "maxpool"],
-                        help="SnapKV: pooling op over attention-mass scores before topk.")
 
     # SeerAttention-R overrides (only used when --mode seer_attention).
     # CLI takes precedence over baselines/seer_attn/config.py (None = fall back).
@@ -257,6 +252,27 @@ def parse_args():
                              "reps at a different granularity than it was trained on, so accuracy "
                              "degrades. Useful only as an ablation/sanity sweep.")
 
+    # Multipole Attention overrides (only used when --mode multipole_attention).
+    # CLI takes precedence over baselines/multipole_attn/config.py (None = fall back).
+    # use_centroids is intentionally not exposed: it is always True for this mode.
+    parser.add_argument("--multipole_percent_clusters_lst", type=float, nargs="+", default=[3.125],
+                        help="Multipole: percentage of keys retained as centroids per hierarchy "
+                             "level (one float per level; e.g. '6.25' for single-level, "
+                             "'6.25 25.0' for two-level). Default None → MULTIPOLE_ATTN_CONFIG."
+                             "3.125 => 100/3.125=32 tok/page")
+    parser.add_argument("--multipole_percentiles_lst", type=int, nargs="+", default=[2048],
+                        help="Multipole: token-budget threshold per level "
+                             "(same length as --multipole_percent_clusters_lst). "
+                             "Default None → MULTIPOLE_ATTN_CONFIG."
+                             "=> token budget")
+    parser.add_argument("--multipole_use_replacement", type=_str2bool, default=False,
+                        help="Multipole: if True, unselected tokens contribute via centroid "
+                             "value approximation; if False, dropped. "
+                             "Default None → MULTIPOLE_ATTN_CONFIG.")
+    parser.add_argument("--multipole_cluster_interval", type=int, default=32,
+                        help="Multipole: tokens between re-clusterings during generation. "
+                             "Default None → MULTIPOLE_ATTN_CONFIG.")
+
     parser.add_argument("--skip_existing", action="store_true",
                         help="Skip run if summary.json already exists in output dir")
 
@@ -281,6 +297,16 @@ def parse_args():
             args.run_name = f"{tag}_seer_prefill"
         elif args.mode == "multipole_attention":
             args.run_name = f"{tag}_multipole_attention"
+            if args.multipole_percent_clusters_lst is not None:
+                pct_str = "_".join(str(p) for p in args.multipole_percent_clusters_lst)
+                args.run_name += f"_pct{pct_str}"
+            if args.multipole_percentiles_lst is not None:
+                ptl_str = "_".join(str(p) for p in args.multipole_percentiles_lst)
+                args.run_name += f"_ptl{ptl_str}"
+            if args.multipole_use_replacement is not None:
+                args.run_name += f"_repl{args.multipole_use_replacement}"
+            if args.multipole_cluster_interval is not None:
+                args.run_name += f"_ci{args.multipole_cluster_interval}"
         elif args.mode == "quest_attention":
             args.run_name = f"{tag}_quest_ps{args.quest_page_size}_pb{args.quest_top_k}"
         elif args.mode == "duo_attention":
@@ -575,8 +601,18 @@ def apply_monkey_patch(args):
         from multipole_attn import replace_attn_multipole
         from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
         sys.path.pop(0)
-        MULTIPOLE_ATTN_CONFIG["base_model"] = args.base_model
-        replace_attn_multipole(MULTIPOLE_ATTN_CONFIG)
+        cfg = dict(MULTIPOLE_ATTN_CONFIG)
+        cfg["base_model"] = args.base_model
+        if args.multipole_percent_clusters_lst is not None:
+            cfg["percent_clusters_lst"] = list(args.multipole_percent_clusters_lst)
+        if args.multipole_percentiles_lst is not None:
+            cfg["percentiles_lst"] = list(args.multipole_percentiles_lst)
+        if args.multipole_use_replacement is not None:
+            cfg["use_replacement"] = args.multipole_use_replacement
+        if args.multipole_cluster_interval is not None:
+            cfg["cluster_interval"] = args.multipole_cluster_interval
+        args._multipole_cfg = cfg
+        replace_attn_multipole(cfg)
     elif args.mode == "quest_attention":
         pass  # Quest uses custom model class, no monkey-patch needed
     elif args.mode == "duo_attention":
@@ -758,11 +794,6 @@ def load_model_and_tokenizer(args):
             INF_LLM_CONFIG["repr_topk"] = args.inf_llm_repr_topk
             INF_LLM_CONFIG["max_cached_block"] = args.inf_llm_max_cached_block
             INF_LLM_CONFIG["chunk_size"] = args.inf_llm_chunk_size
-            INF_LLM_CONFIG["n_recent"] = args.inf_llm_n_recent
-            requested_exc = (args.inf_llm_exc_block_size
-                             if args.inf_llm_exc_block_size is not None
-                             else INF_LLM_CONFIG["exc_block_size"])
-            INF_LLM_CONFIG["exc_block_size"] = min(requested_exc, args.inf_llm_n_local)
             init_inf_llm(model, INF_LLM_CONFIG)
             args._inf_llm_generator = build_inf_llm_generator(model, tokenizer, INF_LLM_CONFIG)
 
@@ -1038,8 +1069,7 @@ def _save_summary(args, all_seq_results):
         if args.seerattn_gate_block_size is not None:
             summary["seer_attn_config"]["seerattn_gate_block_size"] = args.seerattn_gate_block_size
     elif args.mode == "multipole_attention":
-        from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
-        summary["multipole_attn_config"] = MULTIPOLE_ATTN_CONFIG
+        summary["multipole_attn_config"] = getattr(args, "_multipole_cfg", None)
     elif args.mode == "quest_attention":
         summary["quest_attn_config"] = {
             "base_model": args.base_model,
