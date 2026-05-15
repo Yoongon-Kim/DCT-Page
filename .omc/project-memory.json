@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1778683697984,
+  "lastScanned": 1778771748043,
   "projectRoot": "/home/yoongonkim/DCT-Page",
   "techStack": {
     "languages": [
@@ -44,35 +44,48 @@
     "__pycache__": {
       "path": "__pycache__",
       "purpose": null,
-      "fileCount": 32,
-      "lastAccessed": 1778683697982,
+      "fileCount": 7,
+      "lastAccessed": 1778771748039,
       "keyFiles": [
-        "analyze_niah_page_ranks.cpython-312.pyc",
-        "analyze_selection_oracle_overlap.cpython-312.pyc",
+        "compare_baseline_dct.cpython-312.pyc",
         "config.cpython-311.pyc",
         "config.cpython-312.pyc",
-        "dct_page_attention.cpython-310.pyc"
+        "dct_page_attention.cpython-311.pyc",
+        "dct_page_attention.cpython-312.pyc"
       ]
     },
     "baselines": {
       "path": "baselines",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1778683697982,
+      "lastAccessed": 1778771748041,
       "keyFiles": []
     },
     "benchmark": {
       "path": "benchmark",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1778683697982,
+      "lastAccessed": 1778771748042,
       "keyFiles": []
+    },
+    "longbench_v1_data": {
+      "path": "longbench_v1_data",
+      "purpose": null,
+      "fileCount": 6,
+      "lastAccessed": 1778771748042,
+      "keyFiles": [
+        "2wikimqa.jsonl",
+        "gov_report.jsonl",
+        "multifieldqa_en.jsonl",
+        "narrativeqa.jsonl",
+        "qasper.jsonl"
+      ]
     },
     "observations": {
       "path": "observations",
       "purpose": null,
       "fileCount": 1,
-      "lastAccessed": 1778683697982,
+      "lastAccessed": 1778771748042,
       "keyFiles": [
         "dct_page_energy.py"
       ]
@@ -81,7 +94,7 @@
       "path": "oracle",
       "purpose": null,
       "fileCount": 8,
-      "lastAccessed": 1778683697982,
+      "lastAccessed": 1778771748042,
       "keyFiles": [
         "attention_mass_recall_ruler.py",
         "attention_mass_recall_ruler_quest.py",
@@ -94,35 +107,21 @@
       "path": "results",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1778683697983,
+      "lastAccessed": 1778771748042,
       "keyFiles": []
     },
     "results_attention_mass_recall": {
       "path": "results_attention_mass_recall",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1778683697983,
-      "keyFiles": []
-    },
-    "results_quest_mass_recall": {
-      "path": "results_quest_mass_recall",
-      "purpose": null,
-      "fileCount": 0,
-      "lastAccessed": 1778683697983,
-      "keyFiles": []
-    },
-    "results_ruler": {
-      "path": "results_ruler",
-      "purpose": null,
-      "fileCount": 0,
-      "lastAccessed": 1778683697983,
+      "lastAccessed": 1778771748042,
       "keyFiles": []
     },
     "speed": {
       "path": "speed",
       "purpose": null,
       "fileCount": 9,
-      "lastAccessed": 1778683697983,
+      "lastAccessed": 1778771748042,
       "keyFiles": [
         "flashinfer_backend.py",
         "profile_decode.py",
@@ -135,7 +134,7 @@
       "path": "benchmark/data",
       "purpose": "Data files",
       "fileCount": 0,
-      "lastAccessed": 1778683697983,
+      "lastAccessed": 1778771748042,
       "keyFiles": []
     }
   },

@@ -1,6 +1,5 @@
 cmake_minimum_required(VERSION 3.26.4)
 
-# Use system default compilers (override with -DCMAKE_C_COMPILER / -DCMAKE_CXX_COMPILER)
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
@@ -10,9 +9,8 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
 endif()
 
 # QUEST_KERNELS_DIR must point to the Quest repo's kernels/ directory.
-# Set via: cmake -DQUEST_KERNELS_DIR=/path/to/Quest/kernels ...
 if(NOT DEFINED QUEST_KERNELS_DIR)
-    message(FATAL_ERROR "QUEST_KERNELS_DIR is not set. Point it to the Quest repo's kernels/ directory.")
+    message(FATAL_ERROR "QUEST_KERNELS_DIR is not set.")
 endif()
 
 # ------------- configure rapids-cmake --------------#
@@ -25,7 +23,12 @@ include(rapids-find)
 
 project(_kernels LANGUAGES CUDA CXX)
 
-# ------------- configure raft -----------------#
+# CUDA 13 removed CUDA::nvToolsExt; create a stub so old RAFT (branch-24.02) builds
+if(NOT TARGET CUDA::nvToolsExt)
+    add_library(CUDA::nvToolsExt INTERFACE IMPORTED GLOBAL)
+endif()
+
+# ------------- configure raft (header-only; COMPILE_LIBRARY=OFF avoids CAGRA kernel build) -#
 rapids_cpm_init()
 include(${CMAKE_SOURCE_DIR}/cmake/get_raft.cmake)
 
@@ -37,7 +40,6 @@ find_package(Torch REQUIRED)
 find_library(TORCH_PYTHON_LIBRARY torch_python PATH "${TORCH_INSTALL_PREFIX}/lib")
 
 # ------------- pybind11 -----------------------#
-# Use the submodule if present, otherwise fetch from GitHub
 set(_PYBIND_DIR "${QUEST_KERNELS_DIR}/3rdparty/pybind")
 if(EXISTS "${_PYBIND_DIR}/CMakeLists.txt")
     add_subdirectory(${_PYBIND_DIR} ${CMAKE_BINARY_DIR}/pybind11)
@@ -55,7 +57,7 @@ endif()
 file(GLOB PYTORCH_SOURCES "csrc/*.cu")
 pybind11_add_module(_kernels MODULE ${PYTORCH_CPP_SOURCES} ${PYTORCH_SOURCES})
 
-target_compile_definitions(_kernels PRIVATE -DBSK_TORCH_CHECK) # Enable Torch Tensor Dimension Check
+target_compile_definitions(_kernels PRIVATE -DBSK_TORCH_CHECK)
 target_include_directories(_kernels PRIVATE ${QUEST_KERNELS_DIR}/include)
 target_include_directories(_kernels PRIVATE ${QUEST_KERNELS_DIR}/3rdparty/flashinfer/include)
 target_compile_options(_kernels PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda --expt-relaxed-constexpr>)

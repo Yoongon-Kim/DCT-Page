@@ -215,10 +215,22 @@ MASS_METRIC_KEYS = [
     # Mass of (sink + selected pages + recent) / full KV — includes always-kept floor.
     "mass_recall_proxy",
     "mass_recall_quest",
+    # Paper-faithful Quest: total mass on Quest's K_paper-page selection over the
+    # full KV (current page + top-(K_paper-1) by Q·minmax). No sink/recent floor —
+    # apples-to-Quest-paper rather than apples-to-DCT.
+    # K_paper is matched to the floor-version's effective budget
+    # (num_sink_pages + num_recent_pages + 1 + top_k) for budget parity.
+    "mass_recall_quest_paper",
     "mass_recall_shadowkv",
     "mass_recall_infllm",
     "mass_recall_oracle_max",
     "mass_recall_mass_topk",
+    # Paper-faithful mass-optimal ceiling — true per-query-head top-(K_paper - 1)
+    # by mass, with the current page always kept. By construction it dominates
+    # every K_paper-budget paper-faithful selector, so it's the common ceiling
+    # for the ratio_with_recall_oracle_mass_max_* derived metrics. Same K_paper
+    # as ``mass_recall_quest_paper`` (sink + recent + 1 + middle top-K).
+    "mass_recall_oracle_mass_max",
     "set_recall",
     # Mass of (selected pages) / (full KV) — absolute fraction of total
     # attention mass that lands on the selector's chosen pages.
@@ -249,6 +261,17 @@ DERIVED_PAGED_KEYS = [
     "paged_mass_ratio_quest",
     "paged_mass_ratio_shadowkv",
     "paged_mass_ratio_infllm",
+    # Ratio of each method's total kept mass to the paper-faithful mass ceiling.
+    # Numerator = mass_recall_X (floor methods include sink+recent+selection;
+    # quest_paper already has no floor). Denominator = mass_recall_oracle_mass_max.
+    # Aggregated ratio-of-means (matches paged_mass_ratio_* convention).
+    "ratio_with_recall_oracle_mass_max_proxy",
+    "ratio_with_recall_oracle_mass_max_quest",
+    "ratio_with_recall_oracle_mass_max_quest_paper",
+    "ratio_with_recall_oracle_mass_max_shadowkv",
+    "ratio_with_recall_oracle_mass_max_infllm",
+    "ratio_with_recall_oracle_mass_max_oracle_max",
+    "ratio_with_recall_oracle_mass_max_mass_topk",
 ]
 
 FIDELITY_METRIC_KEYS = [
@@ -519,6 +542,236 @@ def compute_quest_scores(
         # meaningful for Quest's upper-bound scores, so fall back to mean.
         scores = score_g.mean(dim=2)
     return scores.squeeze(0)                                      # [H_kv, P]
+
+
+def compute_quest_paper_mass(
+    query_states: torch.Tensor,        # [1, H_q, 1, d]
+    sink_k: torch.Tensor,              # [1, H_kv, sink_len, d]
+    paged_k: torch.Tensor,             # [1, H_kv, P_mid, S, d]
+    recent_k: torch.Tensor,            # [1, H_kv, recent_len, d]
+    page_size: int,
+    K_paper: int,
+    num_kv_groups: int,
+    group_agg_method: str,
+) -> torch.Tensor:
+    """Paper-faithful Quest mass (Tang et al., MLSys 2024).
+
+    Vanilla Quest divides the full KV into pages of ``page_size``, always
+    keeps the trailing current page, and picks ``K_paper - 1`` of the
+    remaining pages by sign-aware Q·minmax(K). No sink-pages floor, no
+    recent-window floor — the apples-to-apples comparison the harness's
+    ``mass_recall_quest`` overstates by giving Quest the same sink+recent
+    floor DCT-Page uses.
+
+    The current page is the trailing partial page if one exists (``r > 0``);
+    otherwise the last whole page closest to the open token. ``K_paper`` is
+    the total page budget (current + top-(K_paper-1)).
+
+    Args:
+        query_states: [1, H_q, 1, d] post-RoPE / post-QK-norm.
+        sink_k:       [1, H_kv, sink_len, d] sink tokens (whole pages of S).
+        paged_k:      [1, H_kv, P_mid, page_size, d] middle pages.
+        recent_k:     [1, H_kv, recent_len, d] recent tokens (whole pages
+            + optional trailing partial page).
+        page_size:    Tokens per page (must equal paged_k.shape[3]).
+        K_paper:      Total page budget including the always-kept current page.
+        num_kv_groups: H_q // H_kv.
+        group_agg_method: "mean" | "max" | "topp" (topp → mean).
+
+    Returns:
+        mass_quest_paper: [H_q] float32 — fraction of total softmax mass
+            landing on Quest's chosen pages (current + top-(K_paper-1)).
+            No always-kept floor is added; the score is purely from what
+            Quest itself selects.
+    """
+    bsz, H_q, q_len, d = query_states.shape
+    assert bsz == 1 and q_len == 1, f"decode-step only, got shape {query_states.shape}"
+    H_kv = paged_k.shape[1]
+    P_mid = paged_k.shape[2]
+    S = paged_k.shape[3]
+    assert S == page_size, f"page_size mismatch: arg={page_size}, paged_k S={S}"
+    assert H_q == H_kv * num_kv_groups
+    sink_len = sink_k.shape[2] if sink_k is not None else 0
+    recent_len = recent_k.shape[2] if recent_k is not None else 0
+    scale = 1.0 / math.sqrt(d)
+
+    num_sink_pages = sink_len // page_size
+    assert sink_len == num_sink_pages * page_size, (
+        f"sink_len={sink_len} not a whole multiple of page_size={page_size}"
+    )
+    num_recent_full = recent_len // page_size
+    r = recent_len - num_recent_full * page_size
+    P_whole = num_sink_pages + P_mid + num_recent_full
+    has_partial = r > 0
+
+    if has_partial:
+        excluded_whole_idx = None        # current is the partial; score all whole pages
+    elif P_whole > 0:
+        excluded_whole_idx = P_whole - 1 # last whole page is current
+    else:
+        return query_states.new_zeros(H_q, dtype=torch.float32)
+
+    chunks = []
+    if num_sink_pages > 0:
+        chunks.append(sink_k.view(bsz, H_kv, num_sink_pages, page_size, d))
+    chunks.append(paged_k)
+    if num_recent_full > 0:
+        chunks.append(
+            recent_k[:, :, : num_recent_full * page_size, :]
+            .view(bsz, H_kv, num_recent_full, page_size, d)
+        )
+    all_pages_k = torch.cat(chunks, dim=2)                          # [1, H_kv, P_whole, S, d]
+
+    K_max = all_pages_k.max(dim=3).values                           # [1, H_kv, P_whole, d]
+    K_min = all_pages_k.min(dim=3).values
+    K_max_q = K_max.repeat_interleave(num_kv_groups, dim=1).float()
+    K_min_q = K_min.repeat_interleave(num_kv_groups, dim=1).float()
+    q = query_states.float()
+    channel_best = torch.maximum(q * K_max_q, q * K_min_q)          # [1, H_q, P_whole, d]
+    score_q = channel_best.sum(-1) * scale                          # [1, H_q, P_whole]
+    score_g = score_q.view(bsz, H_kv, num_kv_groups, P_whole)
+    if group_agg_method == "max":
+        quest_scores_all = score_g.max(dim=2).values
+    else:
+        quest_scores_all = score_g.mean(dim=2)
+    quest_scores_all = quest_scores_all.squeeze(0)                  # [H_kv, P_whole]
+
+    if excluded_whole_idx is not None:
+        quest_scores_all = quest_scores_all.clone()
+        quest_scores_all[:, excluded_whole_idx] = float("-inf")
+
+    parts = []
+    if sink_len > 0:
+        parts.append(sink_k)
+    parts.append(paged_k.reshape(bsz, H_kv, P_mid * page_size, d))
+    if recent_len > 0:
+        parts.append(recent_k)
+    k_full = torch.cat(parts, dim=2)                                # [1, H_kv, T, d]
+    k_expanded = k_full.repeat_interleave(num_kv_groups, dim=1)
+    logits = torch.matmul(query_states, k_expanded.transpose(-1, -2)) * scale
+    weights = torch.softmax(logits.float(), dim=-1).squeeze(2)      # [1, H_q, T]
+
+    whole_total_len = P_whole * page_size
+    whole_weights = weights[..., :whole_total_len]                  # [1, H_q, P_whole*S]
+    per_page_mass = whole_weights.view(bsz, H_q, P_whole, page_size).sum(-1)
+    per_page_mass = per_page_mass.squeeze(0)                        # [H_q, P_whole]
+    if has_partial:
+        partial_mass = weights[..., whole_total_len:].sum(-1).squeeze(0)
+    else:
+        partial_mass = per_page_mass.new_zeros(H_q)
+
+    scoreable = P_whole - (0 if excluded_whole_idx is None else 1)
+    K_top = max(0, min(K_paper - 1, scoreable))
+    if K_top > 0:
+        topk_idx_kv = torch.topk(quest_scores_all, K_top, dim=-1).indices    # [H_kv, K_top]
+        topk_idx_q = topk_idx_kv.repeat_interleave(num_kv_groups, dim=0)     # [H_q, K_top]
+        selected_mass = torch.gather(per_page_mass, -1, topk_idx_q).sum(-1)  # [H_q]
+    else:
+        selected_mass = per_page_mass.new_zeros(H_q)
+
+    current_mass = (
+        partial_mass if excluded_whole_idx is None
+        else per_page_mass[:, excluded_whole_idx]
+    )
+    return selected_mass + current_mass
+
+
+def compute_oracle_mass_max_paper_mass(
+    query_states: torch.Tensor,        # [1, H_q, 1, d]
+    sink_k: torch.Tensor,              # [1, H_kv, sink_len, d]
+    paged_k: torch.Tensor,             # [1, H_kv, P_mid, S, d]
+    recent_k: torch.Tensor,            # [1, H_kv, recent_len, d]
+    page_size: int,
+    K_paper: int,
+    num_kv_groups: int,
+) -> torch.Tensor:
+    """Paper-faithful mass-optimal ceiling — the upper bound any K_paper-budget
+    paper-faithful selector with the current-page-kept constraint can achieve.
+
+    Same layout as ``compute_quest_paper_mass``: full KV split into whole pages
+    + an optional trailing partial; the current page (partial if r>0, else last
+    whole page) is always kept; pick top-(K_paper - 1) from the rest. The only
+    difference is that pages are ranked by **true per-query-head softmax mass**
+    (the dense quantity m[p, h]) rather than by Quest's Q·minmax score.
+
+    By construction ``mass_recall_oracle_mass_max ≥ mass_recall_X`` for every
+    K_paper-budget paper-faithful selector ``X`` (including the floor-version
+    selectors, which cover exactly K_paper page slots: num_sink_pages +
+    num_recent_pages + 1 open + middle top-K). So
+    ``mass_recall_X / mass_recall_oracle_mass_max ∈ [0, 1]``.
+
+    Selection happens per query head — matching the ``mass_recall_mass_topk``
+    convention — so the ceiling is tight at per-head granularity.
+
+    Returns:
+        mass_oracle: [H_q] float32 — fraction of total softmax mass landing
+            on the mass-optimal K_paper-page selection under paper rules.
+    """
+    bsz, H_q, q_len, d = query_states.shape
+    assert bsz == 1 and q_len == 1, f"decode-step only, got shape {query_states.shape}"
+    H_kv = paged_k.shape[1]
+    P_mid = paged_k.shape[2]
+    S = paged_k.shape[3]
+    assert S == page_size, f"page_size mismatch: arg={page_size}, paged_k S={S}"
+    assert H_q == H_kv * num_kv_groups
+    sink_len = sink_k.shape[2] if sink_k is not None else 0
+    recent_len = recent_k.shape[2] if recent_k is not None else 0
+    scale = 1.0 / math.sqrt(d)
+
+    num_sink_pages = sink_len // page_size
+    assert sink_len == num_sink_pages * page_size, (
+        f"sink_len={sink_len} not a whole multiple of page_size={page_size}"
+    )
+    num_recent_full = recent_len // page_size
+    r = recent_len - num_recent_full * page_size
+    P_whole = num_sink_pages + P_mid + num_recent_full
+    has_partial = r > 0
+
+    if has_partial:
+        excluded_whole_idx = None
+    elif P_whole > 0:
+        excluded_whole_idx = P_whole - 1
+    else:
+        return query_states.new_zeros(H_q, dtype=torch.float32)
+
+    parts = []
+    if sink_len > 0:
+        parts.append(sink_k)
+    parts.append(paged_k.reshape(bsz, H_kv, P_mid * page_size, d))
+    if recent_len > 0:
+        parts.append(recent_k)
+    k_full = torch.cat(parts, dim=2)                                # [1, H_kv, T, d]
+    k_expanded = k_full.repeat_interleave(num_kv_groups, dim=1)
+    logits = torch.matmul(query_states, k_expanded.transpose(-1, -2)) * scale
+    weights = torch.softmax(logits.float(), dim=-1).squeeze(2)      # [1, H_q, T]
+
+    whole_total_len = P_whole * page_size
+    per_page_mass = weights[..., :whole_total_len].view(
+        bsz, H_q, P_whole, page_size,
+    ).sum(-1).squeeze(0)                                            # [H_q, P_whole]
+    if has_partial:
+        partial_mass = weights[..., whole_total_len:].sum(-1).squeeze(0)
+    else:
+        partial_mass = per_page_mass.new_zeros(H_q)
+
+    # Rank candidates by true per-head mass; exclude the always-kept current page.
+    scoreable_mass = per_page_mass.clone()
+    if excluded_whole_idx is not None:
+        scoreable_mass[:, excluded_whole_idx] = float("-inf")
+
+    scoreable = P_whole - (0 if excluded_whole_idx is None else 1)
+    K_top = max(0, min(K_paper - 1, scoreable))
+    if K_top > 0:
+        topk_idx = torch.topk(scoreable_mass, K_top, dim=-1).indices  # [H_q, K_top]
+        selected_mass = torch.gather(per_page_mass, -1, topk_idx).sum(-1)
+    else:
+        selected_mass = per_page_mass.new_zeros(H_q)
+
+    current_mass = (
+        partial_mass if excluded_whole_idx is None
+        else per_page_mass[:, excluded_whole_idx]
+    )
+    return selected_mass + current_mass
 
 
 def compute_shadowkv_scores(
@@ -893,6 +1146,16 @@ def _derive_paged_metrics(metrics: dict[str, float]) -> dict[str, float]:
     for sel in ("proxy", "quest", "shadowkv", "infllm"):
         sm = float(metrics.get(f"selected_mass_{sel}", 0.0))
         out[f"paged_mass_ratio_{sel}"] = (sm / smm) if smm > 1e-12 else 0.0
+    # Ratio against the paper-faithful mass-optimal ceiling (ratio-of-means).
+    omm = float(metrics.get("mass_recall_oracle_mass_max", 0.0))
+    for sel in (
+        "proxy", "quest", "quest_paper", "shadowkv",
+        "infllm", "oracle_max", "mass_topk",
+    ):
+        mr = float(metrics.get(f"mass_recall_{sel}", 0.0))
+        out[f"ratio_with_recall_oracle_mass_max_{sel}"] = (
+            (mr / omm) if omm > 1e-12 else 0.0
+        )
     return out
 
 
@@ -1041,9 +1304,18 @@ class MassRecallRecorder:
         num_pages = (kv_len - sink_len - recent_min) // self.page_size
         if num_pages < 1:
             return
-        actual_top_k = min(self.top_k, num_pages)
+        # --top_k is total page budget (sink + recent + middle), excluding the
+        # implicit open page. Floor selectors (proxy, quest, shadowkv, infllm,
+        # oracle_max, mass_topk) get sink+recent for free and pick middle_K
+        # from the middle paged region. Paper-faithful selectors (quest_paper,
+        # oracle_mass_max) use K_paper = top_k + 1 over the full KV (current
+        # page kept). Both end up attending to exactly top_k + 1 page slots.
+        middle_k_request = self.top_k - self.num_sink_pages - self.num_recent_pages
+        if middle_k_request < 1:
+            return  # top_k_total too small to leave any middle budget
+        actual_top_k = min(middle_k_request, num_pages)
         if num_pages <= actual_top_k:
-            return  # no sparsification happens when top_k covers every page
+            return  # no sparsification: middle budget covers every middle page
         actual_recent = kv_len - sink_len - num_pages * self.page_size
 
         P = num_pages
@@ -1120,11 +1392,38 @@ class MassRecallRecorder:
 
             selected_indices = proxy_topk_gpu.cpu()                            # [H_kv, K]
 
+            # Paper-faithful Quest: K_paper budget matches the floor version's
+            # effective coverage (sink + recent + open + middle top-K) so the
+            # two metrics differ only in the floor convention, not the budget.
+            quest_paper_K = (
+                self.num_sink_pages + self.num_recent_pages + 1 + actual_top_k
+            )
+            mass_quest_paper_gpu = compute_quest_paper_mass(
+                query_states, sink_k, paged_k, recent_k,
+                page_size=self.page_size,
+                K_paper=quest_paper_K,
+                num_kv_groups=num_kv_groups,
+                group_agg_method=self.group_agg_method,
+            )
+            mass_quest_paper = mass_quest_paper_gpu.float().cpu()              # [H_q]
+
+            # Paper-faithful mass-optimal ceiling. Shares K_paper with quest_paper
+            # so ratios mass_recall_X / mass_recall_oracle_mass_max stay in [0,1].
+            mass_oracle_mass_max_gpu = compute_oracle_mass_max_paper_mass(
+                query_states, sink_k, paged_k, recent_k,
+                page_size=self.page_size,
+                K_paper=quest_paper_K,
+                num_kv_groups=num_kv_groups,
+            )
+            mass_oracle_mass_max = mass_oracle_mass_max_gpu.float().cpu()      # [H_q]
+
         mass_metrics = compute_all_metrics(
             page_mass, sink_mass, recent_mass, selected_indices,
             oracle_scores, quest_scores, shadowkv_scores, infllm_scores,
             num_kv_groups,
         )
+        mass_metrics["mass_recall_quest_paper"] = mass_quest_paper
+        mass_metrics["mass_recall_oracle_mass_max"] = mass_oracle_mass_max
         metrics = {**mass_metrics, **fidelity}
 
         # Invariants: mass_* ∈ [0, 1]; fidelity_* ∈ [-1, 1] (cos sim).
@@ -1268,7 +1567,11 @@ class PagedMassRatioSweepRecorder:
         num_pages = (kv_len - sink_len - recent_min) // self.page_size
         if num_pages < 1:
             return
-        actual_top_k = min(self.top_k, num_pages)
+        # --top_k is total page budget; back-derive middle_K for selectors.
+        middle_k_request = self.top_k - self.num_sink_pages - self.num_recent_pages
+        if middle_k_request < 1:
+            return
+        actual_top_k = min(middle_k_request, num_pages)
         if num_pages <= actual_top_k:
             return
 
@@ -1386,7 +1689,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     # Model
-    p.add_argument("--base_model", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
+    p.add_argument("--base_model", type=str, default="Qwen/Qwen3-8B")
     p.add_argument("--cuda_device", type=int, default=0)
     p.add_argument("--local_files_only", action="store_true")
 
@@ -1398,10 +1701,18 @@ def parse_args() -> argparse.Namespace:
                    default=Path("benchmark/data/ruler_data"))
 
     # Page layout + proxy scoring config (no DCT output path involved).
-    p.add_argument("--page_size", type=int, default=16)
-    p.add_argument("--top_k", type=int, default=128)
+    p.add_argument("--page_size", type=int, default=32)
+    p.add_argument(
+        "--top_k", type=int, default=64,
+        help="Total page budget per decode step (sink + recent + middle); "
+             "excludes the implicit open page. Floor selectors (proxy, quest, "
+             "shadowkv, infllm, oracle_max, mass_topk) auto-derive "
+             "middle_K = top_k - num_sink_pages - num_recent_pages and get "
+             "sink+recent for free. Paper-faithful selectors (quest_paper, "
+             "oracle_mass_max) use K_paper = top_k + 1 over the full KV.",
+    )
     p.add_argument("--num_sink_pages", type=int, default=1)
-    p.add_argument("--num_recent_pages", type=int, default=9)
+    p.add_argument("--num_recent_pages", type=int, default=4)
     p.add_argument("--compress_ratio", type=float, default=0.125,
                    help="Haar proxy compression ratio; comp_size = "
                         "max(1, int(page_size * compress_ratio)).")

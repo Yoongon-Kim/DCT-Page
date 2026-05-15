@@ -164,15 +164,13 @@ class Qwen3PreTrainedModel(PreTrainedModel):
     _supports_quantized_cache = False
 
     def _init_weights(self, module):
-        std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
+        # transformers v5 calls _init_weights AFTER from_pretrained loads weights
+        # (post_init runs once at __init__ AND a second pass happens before tying).
+        # The base PreTrainedModel implementation handles this by tracking
+        # `_is_hf_initialized` on params. Our previous override unconditionally
+        # re-initialized loaded weights to random → broken model.
+        # Delegate to the base class which respects `_is_hf_initialized`.
+        super()._init_weights(module)
 
     def _set_gradient_checkpointing(self, module, value=False):
         if isinstance(module, Qwen3Model):
