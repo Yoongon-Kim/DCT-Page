@@ -1360,6 +1360,37 @@ def compute_mass_topk_selected_mass(
     return torch.gather(page_mass, -1, mass_topk_idx).sum(-1)                  # [H_q]
 
 
+def compute_infllm_selected_mass_sweep(
+    query_states: torch.Tensor,        # [1, H_q, 1, d]
+    paged_k: torch.Tensor,             # [1, H_kv, P, S, d]
+    page_mass: torch.Tensor,           # [H_q, P]
+    top_k: int,
+    repr_topks: list[int],
+    num_kv_groups: int,
+    group_agg_method: str,
+) -> dict[int, torch.Tensor]:
+    """Per-step selected_mass_infllm(r) for each repr_topk r.
+
+    Mirrors compute_selected_mass_sweep, but varies InfLLM's repr_topk knob
+    instead of the DCT lowpass cutoff. Tying r to comp_size lets the plot
+    compare equal-budget block representatives across selectors.
+    """
+    H_q, P = page_mass.shape
+    actual_top_k = min(top_k, P)
+
+    out: dict[int, torch.Tensor] = {}
+    for r in repr_topks:
+        infllm_scores = compute_infllm_scores(
+            query_states, paged_k, num_kv_groups,
+            repr_topk=r,
+            group_agg_method=group_agg_method,
+        )                                                                      # [H_kv, P]
+        infllm_topk = torch.topk(infllm_scores, actual_top_k, dim=-1).indices  # [H_kv, K]
+        infllm_topk_q = infllm_topk.repeat_interleave(num_kv_groups, dim=0)    # [H_q, K]
+        out[r] = torch.gather(page_mass, -1, infllm_topk_q).sum(-1)            # [H_q]
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Recorder: computes mass inline, discards large tensors before returning
 # ---------------------------------------------------------------------------
@@ -1804,6 +1835,17 @@ class PagedMassRatioSweepRecorder:
             )
             quest_selected = quest_sel_gpu.float().cpu().tolist()
 
+            infllm_sel_gpu = compute_infllm_selected_mass_sweep(
+                query_states, paged_k, page_mass_gpu,
+                top_k=actual_top_k,
+                repr_topks=self.comp_sizes,
+                num_kv_groups=num_kv_groups,
+                group_agg_method=self.group_agg_method,
+            )
+            infllm_selected = {
+                c: t.float().cpu().tolist() for c, t in infllm_sel_gpu.items()
+            }
+
             mass_topk_sel_gpu = compute_mass_topk_selected_mass(
                 page_mass_gpu, top_k=actual_top_k,
             )
@@ -1820,6 +1862,7 @@ class PagedMassRatioSweepRecorder:
             "H_q": int(page_mass_gpu.shape[0]),
             "proxy_selected": proxy_selected,    # {comp_size: [H_q] list}
             "quest_selected": quest_selected,    # [H_q] list
+            "infllm_selected": infllm_selected,  # {repr_topk: [H_q] list}
             "mass_topk_selected": mass_topk_selected,  # [H_q] list
             "pages_mass": pages_mass,            # [H_q] list
         })
@@ -2176,12 +2219,18 @@ def _render_comp_size_sweep_plot(
     title: str,
     quest_per_layer_mean: dict[int, float] | None = None,
     quest_overall_mean: float | None = None,
+    infllm_per_layer_mean: dict[int, dict[int, float]] | None = None,
+    infllm_overall_mean: dict[int, float] | None = None,
 ) -> None:
     """One-panel plot: x = comp_size, y = paged_mass_ratio_proxy.
 
     Bold mean line + ±1σ shaded band across layers for each selector. The
     band shows how consistent layers are without the visual clutter of
     plotting all per-layer curves.
+
+    InfLLM (when provided) shares the x-axis: its repr_topk is set equal to
+    comp_size at each point, so equal x = equal per-page representative-token
+    budget across DCT and InfLLM.
     """
     import numpy as np
     import matplotlib
@@ -2208,6 +2257,26 @@ def _render_comp_size_sweep_plot(
     )
     ax.plot(xs, ys_mean, color="C0", linewidth=2.2, marker="o",
             label="DCT proxy (mean over layers)")
+
+    if infllm_per_layer_mean and infllm_overall_mean is not None:
+        infllm_layers = np.array(
+            [[by_c[c] for c in comp_sizes]
+             for _, by_c in sorted(infllm_per_layer_mean.items())],
+            dtype=np.float64,
+        )
+        infllm_std = infllm_layers.std(axis=0)
+        ys_mean_inf = np.array(
+            [infllm_overall_mean[c] for c in comp_sizes], dtype=np.float64,
+        )
+        ax.fill_between(
+            xs,
+            np.clip(ys_mean_inf - infllm_std, 0.0, 1.0),
+            np.clip(ys_mean_inf + infllm_std, 0.0, 1.0),
+            color="C2", alpha=0.15,
+            label="InfLLM ±1σ across layers (repr_topk=comp_size)",
+        )
+        ax.plot(xs, ys_mean_inf, color="C2", linewidth=2.2, marker="s",
+                label="InfLLM (mean over layers)")
 
     if quest_per_layer_mean and quest_overall_mean is not None:
         # Quest has no comp_size knob; band is a horizontal stripe at
@@ -2321,14 +2390,17 @@ def _run_comp_size_sweep(args: argparse.Namespace) -> None:
     # time, NOT averaged from per-step ratios.
     overall_proxy: dict[int, list[float]] = {c: [] for c in comp_sizes}
     overall_quest: list[float] = []
+    overall_infllm: dict[int, list[float]] = {c: [] for c in comp_sizes}
     overall_mass_topk: list[float] = []
     overall_pages_mass: list[float] = []
     per_layer_proxy: dict[int, dict[int, list[float]]] = {}
     per_layer_quest: dict[int, list[float]] = {}
+    per_layer_infllm: dict[int, dict[int, list[float]]] = {}
     per_layer_mass_topk: dict[int, list[float]] = {}
     per_layer_pages_mass: dict[int, list[float]] = {}
     per_task_proxy: dict[str, dict[int, list[float]]] = {}
     per_task_quest: dict[str, list[float]] = {}
+    per_task_infllm: dict[str, dict[int, list[float]]] = {}
     per_task_mass_topk: dict[str, list[float]] = {}
     per_task_pages_mass: dict[str, list[float]] = {}
 
@@ -2354,6 +2426,7 @@ def _run_comp_size_sweep(args: argparse.Namespace) -> None:
 
             task_proxy: dict[int, list[float]] = {c: [] for c in comp_sizes}
             task_quest: list[float] = []
+            task_infllm: dict[int, list[float]] = {c: [] for c in comp_sizes}
             task_mass_topk: list[float] = []
             task_pages_mass: list[float] = []
             sample_fp = (per_sample_dir / f"{task}.jsonl").open(
@@ -2381,18 +2454,27 @@ def _run_comp_size_sweep(args: argparse.Namespace) -> None:
 
                 sample_proxy: dict[int, dict[int, list[float]]] = {}
                 sample_quest_by_layer: dict[int, list[float]] = {}
+                sample_infllm: dict[int, dict[int, list[float]]] = {}
                 sample_mass_topk_by_layer: dict[int, list[float]] = {}
                 sample_pages_mass_by_layer: dict[int, list[float]] = {}
                 for rec in records:
                     layer_idx = rec["layer_idx"]
                     sample_proxy.setdefault(layer_idx, {c: [] for c in comp_sizes})
                     per_layer_proxy.setdefault(layer_idx, {c: [] for c in comp_sizes})
+                    sample_infllm.setdefault(layer_idx, {c: [] for c in comp_sizes})
+                    per_layer_infllm.setdefault(layer_idx, {c: [] for c in comp_sizes})
                     for c in comp_sizes:
                         sm = rec["proxy_selected"][c]
                         sample_proxy[layer_idx][c].extend(sm)
                         per_layer_proxy[layer_idx][c].extend(sm)
                         task_proxy[c].extend(sm)
                         overall_proxy[c].extend(sm)
+
+                        im = rec["infllm_selected"][c]
+                        sample_infllm[layer_idx][c].extend(im)
+                        per_layer_infllm[layer_idx][c].extend(im)
+                        task_infllm[c].extend(im)
+                        overall_infllm[c].extend(im)
 
                     quest_per_head = rec["quest_selected"]
                     sample_quest_by_layer.setdefault(layer_idx, []).extend(quest_per_head)
@@ -2425,6 +2507,9 @@ def _run_comp_size_sweep(args: argparse.Namespace) -> None:
                             str(c): _mean(vs) for c, vs in sample_proxy[lyr].items()
                         },
                         "selected_mass_quest": qm,
+                        "selected_mass_infllm": {
+                            str(c): _mean(vs) for c, vs in sample_infllm[lyr].items()
+                        },
                         "selected_mass_mass_topk": smm,
                         "pages_mass": pm,
                         "paged_mass_ratio_proxy": {
@@ -2432,11 +2517,19 @@ def _run_comp_size_sweep(args: argparse.Namespace) -> None:
                             for c, vs in sample_proxy[lyr].items()
                         },
                         "paged_mass_ratio_quest": (qm / smm) if smm > 1e-12 else 0.0,
+                        "paged_mass_ratio_infllm": {
+                            str(c): (_mean(vs) / smm) if smm > 1e-12 else 0.0
+                            for c, vs in sample_infllm[lyr].items()
+                        },
                         "paged_mass_recall_proxy": {
                             str(c): (_mean(vs) / pm) if pm > 1e-12 else 0.0
                             for c, vs in sample_proxy[lyr].items()
                         },
                         "paged_mass_recall_quest": (qm / pm) if pm > 1e-12 else 0.0,
+                        "paged_mass_recall_infllm": {
+                            str(c): (_mean(vs) / pm) if pm > 1e-12 else 0.0
+                            for c, vs in sample_infllm[lyr].items()
+                        },
                     }
                 sample_record = {
                     "sample_index": int(sample["index"]),
@@ -2460,6 +2553,7 @@ def _run_comp_size_sweep(args: argparse.Namespace) -> None:
             sample_fp.close()
             per_task_proxy[task] = task_proxy
             per_task_quest[task] = task_quest
+            per_task_infllm[task] = task_infllm
             per_task_mass_topk[task] = task_mass_topk
             per_task_pages_mass[task] = task_pages_mass
 
@@ -2468,10 +2562,13 @@ def _run_comp_size_sweep(args: argparse.Namespace) -> None:
             print("  TASK SUMMARY")
             for c in comp_sizes:
                 mp = _mean(task_proxy[c])
-                ratio = mp / smm_task if smm_task > 1e-12 else 0.0
-                recall = mp / pm_task if pm_task > 1e-12 else 0.0
-                print(f"    comp_size={c:3d}  paged_mass_ratio_proxy = "
-                      f"{ratio:.4f}  paged_mass_recall_proxy = {recall:.4f}")
+                mi = _mean(task_infllm[c])
+                pratio = mp / smm_task if smm_task > 1e-12 else 0.0
+                precall = mp / pm_task if pm_task > 1e-12 else 0.0
+                iratio = mi / smm_task if smm_task > 1e-12 else 0.0
+                irecall = mi / pm_task if pm_task > 1e-12 else 0.0
+                print(f"    c={c:3d}  proxy ratio={pratio:.4f} recall={precall:.4f}"
+                      f"  |  infllm ratio={iratio:.4f} recall={irecall:.4f}")
             mq = _mean(task_quest)
             qratio = mq / smm_task if smm_task > 1e-12 else 0.0
             qrecall = mq / pm_task if pm_task > 1e-12 else 0.0
@@ -2505,6 +2602,24 @@ def _run_comp_size_sweep(args: argparse.Namespace) -> None:
             c: _safe_div(_mean(vs), pm_overall) for c, vs in overall_proxy.items()
         }
 
+        infllm_ratio_per_layer: dict[int, dict[int, float]] = {}
+        infllm_recall_per_layer: dict[int, dict[int, float]] = {}
+        for lyr, by_c in sorted(per_layer_infllm.items()):
+            smm = _mean(per_layer_mass_topk.get(lyr, []))
+            pm = _mean(per_layer_pages_mass.get(lyr, []))
+            infllm_ratio_per_layer[lyr] = {
+                c: _safe_div(_mean(vs), smm) for c, vs in by_c.items()
+            }
+            infllm_recall_per_layer[lyr] = {
+                c: _safe_div(_mean(vs), pm) for c, vs in by_c.items()
+            }
+        infllm_ratio_overall: dict[int, float] = {
+            c: _safe_div(_mean(vs), smm_overall) for c, vs in overall_infllm.items()
+        }
+        infllm_recall_overall: dict[int, float] = {
+            c: _safe_div(_mean(vs), pm_overall) for c, vs in overall_infllm.items()
+        }
+
         quest_ratio_per_layer: dict[int, float] = {
             lyr: _safe_div(_mean(vs), _mean(per_layer_mass_topk.get(lyr, [])))
             for lyr, vs in sorted(per_layer_quest.items())
@@ -2521,20 +2636,30 @@ def _run_comp_size_sweep(args: argparse.Namespace) -> None:
             smm_task = _mean(per_task_mass_topk[task])
             pm_task = _mean(per_task_pages_mass[task])
             mq_task = _mean(per_task_quest[task])
+            inf_by_c = per_task_infllm.get(task, {})
             per_task_summary[task] = {
                 "num_samples": min(args.num_samples, len(samples)) if args.num_samples > 0 else len(samples),
                 "selected_mass_proxy": {str(c): _mean(vs) for c, vs in by_c.items()},
                 "selected_mass_quest": mq_task,
+                "selected_mass_infllm": {
+                    str(c): _mean(vs) for c, vs in inf_by_c.items()
+                },
                 "selected_mass_mass_topk": smm_task,
                 "pages_mass": pm_task,
                 "paged_mass_ratio_proxy": {
                     str(c): _safe_div(_mean(vs), smm_task) for c, vs in by_c.items()
                 },
                 "paged_mass_ratio_quest": _safe_div(mq_task, smm_task),
+                "paged_mass_ratio_infllm": {
+                    str(c): _safe_div(_mean(vs), smm_task) for c, vs in inf_by_c.items()
+                },
                 "paged_mass_recall_proxy": {
                     str(c): _safe_div(_mean(vs), pm_task) for c, vs in by_c.items()
                 },
                 "paged_mass_recall_quest": _safe_div(mq_task, pm_task),
+                "paged_mass_recall_infllm": {
+                    str(c): _safe_div(_mean(vs), pm_task) for c, vs in inf_by_c.items()
+                },
             }
 
         summary = {
@@ -2546,12 +2671,17 @@ def _run_comp_size_sweep(args: argparse.Namespace) -> None:
                     str(c): _mean(vs) for c, vs in overall_proxy.items()
                 },
                 "selected_mass_quest": _mean(overall_quest),
+                "selected_mass_infllm": {
+                    str(c): _mean(vs) for c, vs in overall_infllm.items()
+                },
                 "selected_mass_mass_topk": smm_overall,
                 "pages_mass": pm_overall,
                 "paged_mass_ratio_proxy": {str(c): m for c, m in ratio_overall.items()},
                 "paged_mass_ratio_quest": quest_ratio_overall,
+                "paged_mass_ratio_infllm": {str(c): m for c, m in infllm_ratio_overall.items()},
                 "paged_mass_recall_proxy": {str(c): m for c, m in recall_overall.items()},
                 "paged_mass_recall_quest": quest_recall_overall,
+                "paged_mass_recall_infllm": {str(c): m for c, m in infllm_recall_overall.items()},
             },
             "per_layer": {
                 str(lyr): {
@@ -2559,6 +2689,12 @@ def _run_comp_size_sweep(args: argparse.Namespace) -> None:
                     "paged_mass_recall_proxy": {str(c): m for c, m in recall_per_layer[lyr].items()},
                     "paged_mass_ratio_quest": quest_ratio_per_layer.get(lyr, 0.0),
                     "paged_mass_recall_quest": quest_recall_per_layer.get(lyr, 0.0),
+                    "paged_mass_ratio_infllm": {
+                        str(c): m for c, m in infllm_ratio_per_layer.get(lyr, {}).items()
+                    },
+                    "paged_mass_recall_infllm": {
+                        str(c): m for c, m in infllm_recall_per_layer.get(lyr, {}).items()
+                    },
                 }
                 for lyr in sorted(per_layer_proxy.keys())
             },
@@ -2574,13 +2710,17 @@ def _run_comp_size_sweep(args: argparse.Namespace) -> None:
             comp_sizes, args.page_size, title,
             quest_per_layer_mean=quest_ratio_per_layer,
             quest_overall_mean=quest_ratio_overall,
+            infllm_per_layer_mean=infllm_ratio_per_layer,
+            infllm_overall_mean=infllm_ratio_overall,
         )
 
         elapsed = (time.time() - start_time) / 60
         print(f"\n{'=' * 60}\nOVERALL RESULTS\n{'=' * 60}")
         for c in comp_sizes:
-            print(f"  comp_size={c:3d}  paged_mass_ratio_proxy = {ratio_overall[c]:.4f}"
-                  f"  paged_mass_recall_proxy = {recall_overall[c]:.4f}")
+            print(f"  c={c:3d}"
+                  f"  proxy ratio={ratio_overall[c]:.4f} recall={recall_overall[c]:.4f}"
+                  f"  |  infllm ratio={infllm_ratio_overall[c]:.4f}"
+                  f" recall={infllm_recall_overall[c]:.4f}")
         print(f"  quest          paged_mass_ratio_quest = {quest_ratio_overall:.4f}"
               f"  paged_mass_recall_quest = {quest_recall_overall:.4f}")
         print(f"\n  Results: {run_dir}")
