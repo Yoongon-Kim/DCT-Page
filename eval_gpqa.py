@@ -12,18 +12,18 @@ to main or extended. Prompting is chain-of-thought; answers are extracted as
 A/B/C/D via regex, scored with exact match.
 
 Outputs:
-    {output_dir}/{run_name}.jsonl              per-sample records
-    {output_dir}/{run_name}_summary.json       aggregate accuracy + config
-    {output_dir}/{run_name}_summary.csv        tabular summary
+    {output_dir}/{run_name}/results.jsonl       per-sample records
+    {output_dir}/{run_name}/summary.json        aggregate accuracy + config
+    {output_dir}/{run_name}/summary.csv         tabular summary
 
 Usage:
     python eval_gpqa.py --mode baseline \
         --gpqa_subset diamond --num_samples 5 \
-        --output_dir results_gpqa --run_name smoke_baseline
+        --output_dir result/gpqa --run_name smoke_baseline
 
     python eval_gpqa.py --mode page_attention \
         --page_size 32 --top_k 64 --unselected_mode drop \
-        --output_dir results_gpqa --run_name qwen_page_topk64
+        --output_dir result/gpqa --run_name qwen_page_topk64
 """
 
 import os
@@ -184,7 +184,7 @@ def parse_args():
                         help="Reasoning chains can be long; default 8192 tokens")
 
     # Output
-    parser.add_argument("--output_dir", type=str, default="results_gpqa")
+    parser.add_argument("--output_dir", type=str, default="result/gpqa")
     parser.add_argument("--run_name", type=str, default=None,
                         help="Name for this run (auto-generated if not given)")
 
@@ -257,7 +257,7 @@ def parse_args():
             args.run_name = f"{tag}_multipole_attention_{suffix}"
 
     if args.skip_existing:
-        summary_path = os.path.join(args.output_dir, f"{args.run_name}_summary.json")
+        summary_path = os.path.join(args.output_dir, args.run_name, "summary.json")
         if os.path.exists(summary_path):
             print(f"SKIP (already exists): {summary_path}")
             sys.exit(0)
@@ -271,8 +271,9 @@ def parse_args():
 def evaluate(model, tokenizer, dataset, args):
     model.eval()
 
-    output_path = os.path.join(args.output_dir, f"{args.run_name}.jsonl")
-    os.makedirs(args.output_dir, exist_ok=True)
+    run_dir = os.path.join(args.output_dir, args.run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    output_path = os.path.join(run_dir, "results.jsonl")
 
     completed_ids = set()
     if os.path.exists(output_path):
@@ -468,11 +469,13 @@ def build_summary(results, args):
 
 def write_summary_files(results, args):
     summary = build_summary(results, args)
-    summary_path = os.path.join(args.output_dir, f"{args.run_name}_summary.json")
+    run_dir = os.path.join(args.output_dir, args.run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    summary_path = os.path.join(run_dir, "summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
 
-    csv_path = os.path.join(args.output_dir, f"{args.run_name}_summary.csv")
+    csv_path = os.path.join(run_dir, "summary.csv")
     rows = [{
         "group": "overall",
         "label": "overall",

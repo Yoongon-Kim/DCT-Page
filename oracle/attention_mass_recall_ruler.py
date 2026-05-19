@@ -98,18 +98,34 @@ ShadowKV's outlier-page bypass and SVD V-reconstruction are omitted (they are
 orthogonal to page ranking and would change the effective K budget).
 
 InfLLM scoring (Xiao et al., 2024) represents each block by the mean of its
-``repr_topk`` representative tokens, scored at decode against current Q:
-    qk[h, p, s]    = (q[h] · K[p, s, :]) / √d
-    repr_idx       = top-repr_topk(qk[h, p, :])
-    block_repr[h,p]= mean_{s ∈ repr_idx} K[p, s, :]
-    score[h, p]    = (q[h] · block_repr[h, p]) / √d
-Upstream InfLLM picks the representative tokens by an accumulated local-
-attention score that this dense-trajectory diagnostic does not maintain;
-we substitute the natural Q-aware analogue (per-block top-``repr_topk``
-tokens by current Q·K) so InfLLM's *block-representative* scoring rule is
-isolated from its stateful prefill bookkeeping. Block layout is the
-script's page grid (n_init↔sink_size, n_local↔recent_size, block_size↔
-page_size), so the only InfLLM-specific knob is ``--infllm_repr_topk``.
+``repr_topk`` representative tokens, scored at decode against current Q.
+**Faithful** to upstream
+``baselines/infllm/upstream/attention/context_manager.py``: representative
+tokens within a block are picked by the **accumulated local-attention column
+score** computed during prefill, not by current Q·K.
+
+    Prefill (per layer, once, via the prefill recording hook):
+        for q ∈ [0, L):  # post-RoPE prefill queries
+            attn[q, k] = softmax_k( q · K[k] / √d ),
+                         masked to k ∈ [q - infllm_n_local + 1, q]
+            for k in that local window:
+                local_score[h_q, k] += attn[q, k]
+
+    Decode step (per layer, per page):
+        repr_idx       = top-repr_topk(local_score[h_q, page_range])
+        block_repr[h,p]= mean_{s ∈ repr_idx} K[p, s, :]
+        score[h, p]    = (q[h] · block_repr[h, p]) / √d
+
+Mirrors ``ContextManager._append`` + ``append_global`` (local-pass with
+``sliding_window=n_local`` accumulating into ``global_remainder_local_score``)
+and ``ContextManager.get_block_k`` (``score.topk(repr_topk)``). The one
+deviation from upstream is that its flash-attention implementation re-uses
+the row-max ``m`` from the combined local + global-complement passes (a
+state that depends on InfLLM's selected-top-k context which this
+dense-trajectory diagnostic does not maintain); we use the local-window-only
+softmax so the column sum is a well-defined ranking statistic over prefill.
+The block layout reuses the script's page grid (block_size↔page_size); the
+InfLLM knobs are ``--infllm_repr_topk`` and ``--infllm_n_local``.
 
 All selectors share the same sink/recent configuration as DCT; only the
 page-ranking rule differs.
@@ -134,7 +150,7 @@ Usage:
         --base_model meta-llama/Llama-3.1-8B-Instruct \\
         --tasks niah_single_1 --num_samples 2 --seq_len 32768 \\
         --page_size 16 --top_k 128 --num_decode_steps 2 \\
-        --output_dir results_attention_mass_recall --run_name smoke
+        --output_dir result/attention_mass_recall --run_name smoke
 """
 
 from __future__ import annotations
@@ -835,36 +851,143 @@ def compute_shadowkv_scores(
     return scores.squeeze(0)                                      # [H_kv, P]
 
 
+def compute_infllm_local_attn_scores(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    num_kv_groups: int,
+    n_local: int,
+    q_chunk_size: int = 512,
+) -> torch.Tensor:
+    """Accumulated local-attention column scores, faithful to InfLLM upstream.
+
+    Mirrors ``_score_kernel`` in
+    ``baselines/infllm/upstream/attention/dot_production_attention/triton_impl.py``
+    composed with the local-pass ``attn.append(... sliding_window=n_local ...)``
+    in ``ContextManager._append`` (context_manager.py L499-503): per (query
+    head, kv position), accumulate the row-softmax weight that each query
+    inside the causal sliding window of size ``n_local`` placed on that key.
+
+        for each query position q ∈ [0, L) (post-RoPE, per query head h):
+            lo = max(0, q - n_local + 1)
+            attn[h, q, k] = softmax_k( q_h · K[k] / √d ) for k ∈ [lo, q]
+                            (logits outside the window are masked to -inf,
+                             so softmax is taken over the local window)
+            for k ∈ [lo, q]:
+                local_score[h, k] += attn[h, q, k]
+
+    Upstream's flash-attention shares the row-max ``m`` across BOTH the local
+    pass and the global-complement pass; ``_score_kernel`` re-uses that final
+    ``m`` so its emitted weights are ``exp(qk - m_full)`` without dividing by
+    the local row-sum. The global complement is InfLLM-specific state (the
+    selected-top-k blocks at each prefill chunk) that this dense-trajectory
+    diagnostic does not maintain. We use the local-window-only softmax
+    column sum instead: it is the natural, well-defined ranking statistic
+    that the algorithm's representative-token selection
+    (``ContextManager.get_block_k``, context_manager.py L277-286) intends to
+    capture, and within any single block the ordering induced on K positions
+    is dominated by the same set of (queries × local mask), so the only
+    factor lost is the global-complement contribution to ``m_full[q]``.
+
+    Args:
+        query_states: [bsz=1, H_q, L, d] — prefill queries, post-RoPE.
+        key_states:   [bsz=1, H_kv, L, d] — prefill keys, post-RoPE.
+        num_kv_groups: H_q // H_kv (GQA expansion factor).
+        n_local: Sliding-window size; matches InfLLM's ``n_local``.
+        q_chunk_size: Query-chunk size used to bound peak memory; the
+            attention matrix materialized per chunk is shape
+            ``[1, H_q, q_chunk_size, q_chunk_size + n_local - 1]``.
+
+    Returns:
+        local_score: [H_q, L] float32 — column-sum of softmax weights per
+            (query head, kv position).
+    """
+    bsz, H_q, L, d = query_states.shape
+    _, H_kv, _, _ = key_states.shape
+    assert bsz == 1 and key_states.shape[2] == L
+    assert H_q == H_kv * num_kv_groups
+    scale = 1.0 / math.sqrt(d)
+    device = query_states.device
+
+    out = torch.zeros((H_q, L), dtype=torch.float32, device=device)
+
+    for q_start in range(0, L, q_chunk_size):
+        q_end = min(q_start + q_chunk_size, L)
+        # Queries in [q_start, q_end) attend to keys in
+        # [max(0, q_start - n_local + 1), q_end). Restrict to that union to
+        # avoid materializing logits over keys none of these queries can see.
+        k_start = max(0, q_start - n_local + 1)
+        k_end = q_end
+
+        q_chunk = query_states[:, :, q_start:q_end, :].float()              # [1, H_q, qc, d]
+        k_chunk = key_states[:, :, k_start:k_end, :].float()                # [1, H_kv, kc, d]
+        k_chunk = k_chunk.repeat_interleave(num_kv_groups, dim=1)            # [1, H_q, kc, d]
+
+        logits = torch.matmul(q_chunk, k_chunk.transpose(-1, -2)) * scale   # [1, H_q, qc, kc]
+        del k_chunk
+
+        # Sliding-window-causal mask: q (global pos) attends to k (global pos)
+        # iff 0 <= q - k < n_local. Matches upstream ``_score_kernel``'s
+        # ``mask = (dist >= 0) & (dist < sliding_window_size)`` with
+        # ``dist = q_global - k_global``.
+        q_global = torch.arange(q_start, q_end, device=device).view(1, 1, -1, 1)
+        k_global = torch.arange(k_start, k_end, device=device).view(1, 1, 1, -1)
+        dist = q_global - k_global
+        mask = (dist >= 0) & (dist < n_local)
+
+        logits = logits.masked_fill(~mask, float("-inf"))
+        attn = torch.softmax(logits, dim=-1)                                # [1, H_q, qc, kc]
+        # Rows of all-masked logits softmax to NaN; clamp to 0. Every q has at
+        # least itself in-window, so this only fires on rows where some
+        # earlier numerical issue made all logits non-finite — defensive.
+        attn = torch.nan_to_num(attn, nan=0.0)
+
+        col_sum = attn.sum(dim=-2).squeeze(0)                               # [H_q, kc]
+        out[:, k_start:k_end] += col_sum
+        del logits, attn, col_sum
+
+    return out
+
+
 def compute_infllm_scores(
     query_states: torch.Tensor,
     paged_k: torch.Tensor,
+    paged_local_score: torch.Tensor,
     num_kv_groups: int,
     repr_topk: int,
     group_agg_method: str,
 ) -> torch.Tensor:
     """InfLLM block-representative page scoring (Xiao et al., 2024).
 
-    InfLLM splits KV into fixed-size blocks; each block is represented by
-    the mean of its ``repr_topk`` "representative" tokens. Upstream picks
-    representatives by an accumulated local-attention score that this
-    dense-trajectory diagnostic does not maintain, so we substitute the
-    natural Q-aware analogue: per (query head, page), pick the top-
-    ``repr_topk`` tokens by current Q·K (apples-to-apples with Quest's own
-    use of current Q for its upper bound).
+    Faithful to upstream
+    ``baselines/infllm/upstream/attention/context_manager.py``: each block's
+    representative is the mean of its ``repr_topk`` tokens selected by the
+    accumulated local-attention column score
+    (``ContextManager.get_block_k``, L277-286), and the page score is
+    ``q · block_repr / √d`` (``calc_block_topk`` / ``get_batched_topk``,
+    L375-625).
 
         for each (h, p):
-            qk[h, p, s]    = (q[h] · K[p, s, :]) / √d
-            repr_idx       = top-repr_topk(qk[h, p, :])
-            block_repr[h,p]= mean_{s ∈ repr_idx} K[p, s, :]
+            r_score[h,p,s] = paged_local_score[h, p, s]        # precomputed
+            repr_idx       = top-repr_topk(r_score[h, p, :])   # per query head
+            block_repr[h,p]= mean_{s ∈ repr_idx} K[p, s, :]    # [d]
             score[h, p]    = (q[h] · block_repr[h, p]) / √d
 
-    Reduce across the GQA group via ``group_agg_method``; ``mean`` matches
-    InfLLM's ``.mean(dim=1)`` over unit_size in
-    ``ContextManager.get_batched_topk`` (context_manager.py L597-602).
+    Upstream concatenates ``block_repr`` across all H_q heads into a single
+    H_q·d vector per block and averages the per-block score across heads
+    (``.mean(dim=1)`` over ``unit_size`` in ``get_batched_topk`` L596-617),
+    so the final InfLLM top-k is shared across all heads. We keep per-kv-head
+    granularity to plug into the diagnostic's [H_kv, P] selector
+    infrastructure; ``group_agg_method`` controls the H_q → H_kv reduction
+    (``mean`` reproduces upstream's head-averaged behavior within a GQA
+    group; ``max`` is a stronger per-kv-head approximation).
 
     Args:
-        query_states: [bsz=1, H_q, 1, d] — post-RoPE / post-QK-norm.
-        paged_k:      [bsz=1, H_kv, P, S, d] — post-RoPE, baked in from cache.
+        query_states:      [bsz=1, H_q, 1, d] — decode-step Q, post-RoPE.
+        paged_k:           [bsz=1, H_kv, P, S, d] — page-shaped K cache.
+        paged_local_score: [H_q, P, S] — precomputed by
+            ``compute_infllm_local_attn_scores`` on the prefill (Q, K) for the
+            corresponding KV positions; indexed in the same global KV order
+            used to slice paged_k.
         num_kv_groups: H_q // H_kv.
         repr_topk:    Representative tokens per page (clamped to S).
         group_agg_method: "mean" | "max" | "topp" (topp falls back to mean).
@@ -876,14 +999,21 @@ def compute_infllm_scores(
     assert bsz == 1 and q_len == 1, f"decode-step only, got shape {query_states.shape}"
     _, H_kv, P, S, _ = paged_k.shape
     assert H_q == H_kv * num_kv_groups
+    assert paged_local_score.shape == (H_q, P, S), (
+        f"paged_local_score shape {tuple(paged_local_score.shape)} != "
+        f"({H_q}, {P}, {S})"
+    )
     scale = 1.0 / math.sqrt(d)
     actual_repr = min(repr_topk, S)
 
     k_q = paged_k.repeat_interleave(num_kv_groups, dim=1).float()    # [1, H_q, P, S, d]
     q = query_states.float()                                         # [1, H_q, 1, d]
 
-    qk = torch.einsum("bhqd,bhpsd->bhps", q, k_q) * scale            # [1, H_q, P, S]
-    repr_idx = qk.topk(actual_repr, dim=-1).indices                  # [1, H_q, P, R]
+    # Representative tokens: per (head, page) top-repr_topk by accumulated
+    # local-attention score. Faithful to ``get_block_k`` (L277-286).
+    r_score = paged_local_score.to(q.device).float()                 # [H_q, P, S]
+    repr_idx = r_score.topk(actual_repr, dim=-1).indices             # [H_q, P, R]
+    repr_idx = repr_idx.unsqueeze(0)                                 # [1, H_q, P, R]
     repr_idx_exp = repr_idx[..., None].expand(*repr_idx.shape, d)
     repr_k = torch.gather(k_q, 3, repr_idx_exp)                      # [1, H_q, P, R, d]
     block_repr = repr_k.mean(dim=-2)                                 # [1, H_q, P, d]
@@ -1260,6 +1390,8 @@ class MassRecallRecorder:
         scoring_method: str,
         group_agg_method: str,
         infllm_repr_topk: int,
+        infllm_n_local: int,
+        infllm_local_chunk_size: int,
         comp_kv_quant: str = "none",
         comp_kv_quant_granularity: str = "per_page",
     ):
@@ -1272,10 +1404,43 @@ class MassRecallRecorder:
         self.scoring_method = scoring_method
         self.group_agg_method = group_agg_method
         self.infllm_repr_topk = infllm_repr_topk
+        self.infllm_n_local = infllm_n_local
+        self.infllm_local_chunk_size = infllm_local_chunk_size
         self.comp_kv_quant = comp_kv_quant
         self.comp_kv_quant_granularity = comp_kv_quant_granularity
         self.records: list[dict[str, Any]] = []
         self._step_by_layer: dict[int, int] = {}
+        # InfLLM faithful state: per-layer accumulated local-attention column
+        # scores [H_q, prefill_len], populated by ``on_prefill`` and consumed
+        # by the decode-step path. Indexed in the same global KV order as the
+        # cache (cache_position == kv_index for prefill).
+        self._infllm_local_score: dict[int, torch.Tensor] = {}
+
+    def on_prefill(self, payload: dict[str, Any]) -> None:
+        """Compute InfLLM's accumulated local-attention column scores once
+        per layer during prefill. Faithful to ``ContextManager._append`` /
+        ``append_global``: each KV position's score is the sum, over all
+        prefill queries within its sliding window of size ``infllm_n_local``,
+        of the softmax weight that query placed on it. Used downstream as
+        the per-token ranking statistic for representative-token selection.
+        """
+        layer_idx = int(payload["layer_idx"])
+        if layer_idx in self._infllm_local_score:
+            return  # already computed (defensive against re-prefill)
+        with torch.no_grad():
+            local_score = compute_infllm_local_attn_scores(
+                payload["query_states"],
+                payload["key_states_full"],
+                num_kv_groups=int(payload["num_kv_groups"]),
+                n_local=self.infllm_n_local,
+                q_chunk_size=self.infllm_local_chunk_size,
+            )
+        # Cache on CPU in fp16 to keep memory bounded (≈ H_q · L · 2 bytes per
+        # layer); we slice to the paged region per decode step and move that
+        # slice back to GPU for the small ``compute_infllm_scores`` op.
+        self._infllm_local_score[layer_idx] = local_score.to(
+            device="cpu", dtype=torch.float16,
+        )
 
     def __call__(self, payload: dict[str, Any]) -> None:
         layer_idx = int(payload["layer_idx"])
@@ -1355,8 +1520,28 @@ class MassRecallRecorder:
             )
             shadowkv_scores = shadowkv_scores_gpu.float().cpu()
 
+            # Slice the precomputed prefill local-attention score to the
+            # paged region. Decode-appended positions live in ``recent`` (well
+            # inside n_local of any later query), so they never appear in the
+            # paged region and don't need scores. If the layer's prefill score
+            # wasn't captured (e.g. when the prefill hook wasn't installed),
+            # fall back to zero scores so the downstream selection degenerates
+            # to "pick first repr_topk tokens" rather than crashing.
+            cached_local_score = self._infllm_local_score.get(layer_idx)
+            if cached_local_score is None or cached_local_score.shape[-1] < paged_end:
+                paged_local_score_gpu = torch.zeros(
+                    H_q, P, S,
+                    dtype=torch.float32, device=query_states.device,
+                )
+            else:
+                paged_local_score_gpu = (
+                    cached_local_score[:, sink_len:paged_end]
+                    .to(device=query_states.device, dtype=torch.float32)
+                    .view(H_q, P, S)
+                )
             infllm_scores_gpu = compute_infllm_scores(
-                query_states, paged_k, num_kv_groups,
+                query_states, paged_k, paged_local_score_gpu,
+                num_kv_groups,
                 self.infllm_repr_topk, self.group_agg_method,
             )
             infllm_scores = infllm_scores_gpu.float().cpu()
@@ -1465,11 +1650,16 @@ def generate_with_mass_traces(
     scoring_method: str,
     group_agg_method: str,
     infllm_repr_topk: int,
+    infllm_n_local: int,
+    infllm_local_chunk_size: int,
     comp_kv_quant: str,
     comp_kv_quant_granularity: str,
 ) -> tuple[list[dict[str, Any]], int]:
     """Run generate() with a fresh dense-trajectory recording hook installed."""
-    from oracle.attention_mass_recall_ruler_quest import set_recording_hook
+    from oracle.attention_mass_recall_ruler_quest import (
+        set_prefill_recording_hook,
+        set_recording_hook,
+    )
 
     device = next(model.parameters()).device
     encoded = tokenizer(sample["input"], return_tensors="pt")
@@ -1486,10 +1676,16 @@ def generate_with_mass_traces(
         scoring_method=scoring_method,
         group_agg_method=group_agg_method,
         infllm_repr_topk=infllm_repr_topk,
+        infllm_n_local=infllm_n_local,
+        infllm_local_chunk_size=infllm_local_chunk_size,
         comp_kv_quant=comp_kv_quant,
         comp_kv_quant_granularity=comp_kv_quant_granularity,
     )
     set_recording_hook(recorder)
+    # InfLLM's faithful representative-token selection needs the prefill-time
+    # accumulated local-attention column scores; the prefill hook computes
+    # them once per layer before any decode step fires.
+    set_prefill_recording_hook(recorder.on_prefill)
     try:
         with torch.no_grad():
             model.generate(
@@ -1502,6 +1698,7 @@ def generate_with_mass_traces(
             )
     finally:
         set_recording_hook(None)
+        set_prefill_recording_hook(None)
 
     return recorder.records, int(input_ids.shape[1])
 
@@ -1689,7 +1886,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     # Model
-    p.add_argument("--base_model", type=str, default="Qwen/Qwen3-8B")
+    p.add_argument("--base_model", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
     p.add_argument("--cuda_device", type=int, default=0)
     p.add_argument("--local_files_only", action="store_true")
 
@@ -1721,16 +1918,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--group_agg_method", type=str, default="max",
                    choices=["mean", "max"])
 
-    # InfLLM block-representative scoring (current Q·K substitutes for the
-    # stateful local-score history that the diagnostic does not maintain).
+    # InfLLM block-representative scoring (paper-faithful: representative
+    # tokens are picked per block by the accumulated local-attention column
+    # score from prefill, then block_repr = mean of those K tokens, scored
+    # against decode-step Q). Defaults match baselines/infllm/config.py.
     p.add_argument("--infllm_repr_topk", type=int, default=4,
                    help="InfLLM: representative tokens per page used to build "
-                        "the block representative. The diagnostic substitutes "
-                        "upstream InfLLM's stateful local-score with current Q·K.")
+                        "the block representative. Matches upstream "
+                        "ContextManager.repr_topk (default 4).")
+    p.add_argument("--infllm_n_local", type=int, default=4096,
+                   help="InfLLM: sliding-window size used for accumulated "
+                        "local-attention scoring during prefill (matches "
+                        "ContextManager.n_local; default 4096). Each prefill "
+                        "query q contributes softmax(q·K)[k] to the local "
+                        "score of every K position k in [q - n_local + 1, q].")
+    p.add_argument("--infllm_local_chunk_size", type=int, default=512,
+                   help="Query-chunk size for the prefill local-attention "
+                        "score computation. Bounds peak memory: the "
+                        "materialized attention block is "
+                        "[1, H_q, chunk, chunk + n_local - 1]. Smaller is "
+                        "slower but uses less VRAM.")
 
     # Fake-quantize the compressed K proxy (simulates low-precision comp-KV
     # storage). Applied AFTER the DCT projection, BEFORE scoring.
-    p.add_argument("--comp_kv_quant", type=str, default="fp8_e4m3",
+    p.add_argument("--comp_kv_quant", type=str, default="fp8_e5m2",
                    choices=["none", "fp8_e4m3", "fp8_e5m2", "int8", "int4"])
     p.add_argument("--comp_kv_quant_granularity", type=str, default="per_page",
                    choices=["per_page", "per_comp_token"])
@@ -1754,7 +1965,7 @@ def parse_args() -> argparse.Namespace:
 
     # Output
     p.add_argument("--output_dir", type=Path,
-                   default=Path("results_attention_mass_recall"))
+                   default=Path("result/attention_mass_recall"))
     p.add_argument("--run_name", type=str, default=None)
     return p.parse_args()
 
@@ -1770,6 +1981,187 @@ def _aggregate_metric_dicts(dicts: list[dict[str, float]]) -> dict[str, float]:
     if not dicts:
         return {k: 0.0 for k in METRIC_KEYS}
     return {k: _mean([d[k] for d in dicts if k in d]) for k in METRIC_KEYS}
+
+
+# ---------------------------------------------------------------------------
+# Per-run summary figure (written next to summary.json on every dense run)
+# ---------------------------------------------------------------------------
+_PLOT_SELECTORS = [
+    ("proxy",      "DCT proxy",  "C0"),
+    ("quest",      "Quest",      "C1"),
+    ("shadowkv",   "ShadowKV",   "C2"),
+    ("infllm",     "InfLLM",     "C3"),
+    ("oracle_max", "oracle_max", "C4"),
+    ("mass_topk",  "mass-topk",  "0.4"),
+]
+
+
+def _render_run_summary_plot(run_dir: Path, summary: dict) -> Path | None:
+    """Draw a per-run figure summarising every selector for this run.
+
+    Two-panel layout:
+      (0,0) Overall bar chart: mass_recall / paged_mass_ratio / output_fidelity
+            for each selector. paged_mass_ratio is only defined for
+            proxy / quest / shadowkv / infllm.
+      (0,1) Per-layer line plot of paged_mass_ratio_{selector} across layers.
+            Reads `summary['per_task'][task]['per_layer']` for the single task
+            present (or averages across tasks if multiple).
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("[plot] matplotlib not available; skipping run summary plot")
+        return None
+
+    overall = summary.get("overall", {})
+    cfg = summary.get("config", {})
+    per_task = summary.get("per_task", {})
+
+    def _safe(key: str) -> float:
+        v = overall.get(key)
+        return float("nan") if v is None else float(v)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # ----- left panel: grouped bars per selector -----
+    ax = axes[0]
+    metrics = [
+        ("mass_recall",      "mass_recall_{key}"),
+        ("paged_mass_ratio", "paged_mass_ratio_{key}"),
+        ("output_fidelity",  "output_fidelity_{key}"),
+    ]
+    n_metric = len(metrics)
+    n_sel = len(_PLOT_SELECTORS)
+    bar_w = 0.8 / n_metric
+    x = np.arange(n_sel)
+    metric_hatches = ["", "//", "xx"]
+    for m_idx, (m_name, tmpl) in enumerate(metrics):
+        vals = []
+        for key, _, _ in _PLOT_SELECTORS:
+            if m_name == "paged_mass_ratio" and key in {"oracle_max", "mass_topk"}:
+                vals.append(float("nan"))
+                continue
+            if m_name == "output_fidelity" and key == "mass_topk":
+                vals.append(float("nan"))
+                continue
+            vals.append(_safe(tmpl.format(key=key)))
+        offset = (m_idx - (n_metric - 1) / 2.0) * bar_w
+        bars = ax.bar(
+            x + offset, vals, width=bar_w * 0.95,
+            color=[s[2] for s in _PLOT_SELECTORS],
+            edgecolor="black", linewidth=0.6,
+            hatch=metric_hatches[m_idx],
+            label=m_name,
+            alpha=0.85 if m_idx == 0 else 0.6,
+        )
+        for xi, v in zip(x + offset, vals):
+            if not np.isnan(v):
+                ax.text(xi, v + 0.01, f"{v:.2f}",
+                        ha="center", va="bottom", fontsize=7)
+    ax.set_xticks(x)
+    ax.set_xticklabels([s[1] for s in _PLOT_SELECTORS], rotation=15)
+    ax.set_ylim(0.0, 1.08)
+    ax.set_title("Per-selector overall metrics", fontsize=11)
+    ax.grid(True, axis="y", alpha=0.3)
+
+    # Custom legend explaining hatches (the bar colour already encodes selector).
+    from matplotlib.patches import Patch
+    legend_handles = [
+        Patch(facecolor="0.8", edgecolor="black", hatch=h, label=name)
+        for (name, _), h in zip(metrics, metric_hatches)
+    ]
+    ax.legend(handles=legend_handles, loc="lower right", fontsize=8)
+
+    floor = _safe("mass_recall_sink") + _safe("mass_recall_recent")
+    ax.axhline(floor, color="red", alpha=0.4, linestyle="--", linewidth=1)
+    ax.text(
+        n_sel - 0.5, floor + 0.005,
+        f"sink+recent floor = {floor:.3f}",
+        ha="right", va="bottom", fontsize=7, color="red", alpha=0.8,
+    )
+
+    # ----- right panel: x = comp_size (# representative tokens), y = paged_mass_ratio -----
+    # Only DCT proxy actually depends on comp_size (the lowpass cutoff of the
+    # DCT proxy). Quest / ShadowKV / InfLLM are drawn as horizontal reference
+    # lines since their selection is independent of comp_size.
+    ax = axes[1]
+    page_size = cfg.get("page_size")
+    comp_size = cfg.get("comp_size")
+    proxy_ratio = overall.get("paged_mass_ratio_proxy")
+
+    # Choose an x-range that surrounds the single proxy point so the
+    # horizontal references read clearly.
+    if isinstance(comp_size, (int, float)) and comp_size > 0 \
+            and isinstance(page_size, (int, float)) and page_size > 0:
+        x_lo = max(1, comp_size // 2)
+        x_hi = min(page_size, max(comp_size * 2, comp_size + 2))
+        if x_hi <= x_lo:
+            x_hi = x_lo + 1
+        ax.set_xlim(x_lo - 0.5, x_hi + 0.5)
+
+        # Other selectors: horizontal reference lines (constant in comp_size).
+        for key, name, color in [s for s in _PLOT_SELECTORS
+                                 if s[0] in {"quest", "shadowkv", "infllm"}]:
+            v = overall.get(f"paged_mass_ratio_{key}")
+            if v is None:
+                continue
+            ax.axhline(float(v), color=color, linestyle="--",
+                       linewidth=1.4, alpha=0.85,
+                       label=f"{name} = {float(v):.3f}")
+
+        # DCT proxy: single marker at this run's comp_size.
+        if proxy_ratio is not None:
+            ax.scatter(
+                [comp_size], [float(proxy_ratio)],
+                color="C0", s=110, edgecolor="black", zorder=4,
+                label=f"DCT proxy @ comp_size={comp_size} = {float(proxy_ratio):.3f}",
+            )
+            ax.annotate(
+                f"{float(proxy_ratio):.3f}",
+                xy=(comp_size, float(proxy_ratio)),
+                xytext=(4, 4), textcoords="offset points",
+                fontsize=8, color="C0",
+            )
+
+        ax.axhline(1.0, color="red", linestyle=":", alpha=0.4,
+                   label="paged-mass ceiling")
+    else:
+        ax.text(0.5, 0.5, "comp_size missing in config",
+                transform=ax.transAxes, ha="center", va="center", color="0.4")
+
+    ax.set_xlabel(f"comp_size (# representative tokens, page_size={page_size})")
+    ax.set_ylabel("paged_mass_ratio")
+    ax.set_title("paged_mass_ratio vs comp_size", fontsize=11)
+    ax.set_ylim(0.0, 1.05)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="lower right", fontsize=8)
+
+    suptitle_bits = [
+        cfg.get("base_model", "?"),
+        f"seq_len={cfg.get('seq_len', '?')}",
+        f"ps={cfg.get('page_size', '?')}",
+        f"K={cfg.get('top_k', '?')}",
+        f"c={cfg.get('comp_size', '?')}",
+        f"q={cfg.get('comp_kv_quant', '?')}",
+    ]
+    task_names = list(per_task.keys())
+    if task_names:
+        suptitle_bits.append(
+            "tasks=" + (task_names[0] if len(task_names) == 1
+                        else f"{len(task_names)} tasks")
+        )
+    fig.suptitle("attention_mass_recall_ruler — " + " | ".join(suptitle_bits),
+                 fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+
+    out = run_dir / "run_summary.png"
+    fig.savefig(out, dpi=130)
+    plt.close(fig)
+    print(f"[plot] {out}")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2288,6 +2680,8 @@ def main() -> None:
                     scoring_method=args.scoring_method,
                     group_agg_method=args.group_agg_method,
                     infllm_repr_topk=args.infllm_repr_topk,
+                    infllm_n_local=args.infllm_n_local,
+                    infllm_local_chunk_size=args.infllm_local_chunk_size,
                     comp_kv_quant=args.comp_kv_quant,
                     comp_kv_quant_granularity=args.comp_kv_quant_granularity,
                 )
@@ -2438,6 +2832,8 @@ def main() -> None:
                 "scoring_method": args.scoring_method,
                 "group_agg_method": args.group_agg_method,
                 "infllm_repr_topk": args.infllm_repr_topk,
+                "infllm_n_local": args.infllm_n_local,
+                "infllm_local_chunk_size": args.infllm_local_chunk_size,
                 "comp_kv_quant": args.comp_kv_quant,
                 "comp_kv_quant_granularity": args.comp_kv_quant_granularity,
             },
@@ -2448,6 +2844,8 @@ def main() -> None:
             json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+
+        _render_run_summary_plot(run_dir, summary)
 
         elapsed = (time.time() - start_time) / 60
         print(f"\n{'=' * 60}\nOVERALL RESULTS\n{'=' * 60}")

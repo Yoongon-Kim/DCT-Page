@@ -9,7 +9,7 @@ MAX_INPUT_LEN="${MAX_INPUT_LEN:-127500}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
 PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-2048}"
-OUTPUT_DIR="${OUTPUT_DIR:-results/results_longbench_v2/page_attention}"
+OUTPUT_DIR="${OUTPUT_DIR:-result/longbench_v2}"
 
 # DCT Page Attention defaults
 NUM_SINK_PAGES=1
@@ -28,7 +28,7 @@ MODE="drop"
 #     --max_input_len "$MAX_INPUT_LEN" \
 #     --max_new_tokens "$MAX_NEW_TOKENS" \
 #     --num_samples "$NUM_SAMPLES" \
-#     --output_dir "results/results_longbench_v2" \
+#     --output_dir "result/longbench_v2" \
 #     --run_name llama3_baseline
 
 # ---- Step 2: Sweep compress_ratio x top_k x group_agg_method (page attention) ----

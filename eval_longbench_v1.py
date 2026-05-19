@@ -447,7 +447,7 @@ def parse_args():
                         help="Max samples per task (-1 = all)")
 
     # Output
-    parser.add_argument("--output_dir", type=str, default="results_longbench_v1/page_attention")
+    parser.add_argument("--output_dir", type=str, default="result/longbench_v1")
     parser.add_argument("--run_name", type=str, default=None)
 
     # Quest baseline (--mode quest_attention) — separate from DCT's --page_size/--top_k.

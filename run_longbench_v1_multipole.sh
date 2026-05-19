@@ -9,7 +9,7 @@ BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 MODEL_FAMILY="${MODEL_FAMILY:-llama3}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-127500}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
-OUTPUT_DIR="${OUTPUT_DIR:-results/results_longbench_v1/multipole_attention}"
+OUTPUT_DIR="${OUTPUT_DIR:-result/longbench_v1}"
 
 # Same tasks as run_longbench_v1.sh
 TASKS="${TASKS:-narrativeqa qasper gov_report 2wikimqa multifieldqa_en triviaqa}"

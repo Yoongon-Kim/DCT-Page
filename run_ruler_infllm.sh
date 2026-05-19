@@ -50,7 +50,7 @@ case "$(echo "$BASE_MODEL" | tr '[:upper:]' '[:lower:]')" in
     *) echo "InfLLM baseline supports Llama only (got: $BASE_MODEL)"; exit 1 ;;
 esac
 
-OUTPUT_DIR="${OUTPUT_DIR:-results_ruler/inf_llm/${MODEL_TAG}}"
+OUTPUT_DIR="${OUTPUT_DIR:-result/ruler}"
 
 # Sequence lengths to evaluate
 SEQ_LENGTHS="${SEQ_LENGTHS:-32768}"

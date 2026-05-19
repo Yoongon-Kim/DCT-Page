@@ -30,7 +30,7 @@ case "$(echo "$BASE_MODEL" | tr '[:upper:]' '[:lower:]')" in
     *) echo "Unsupported BASE_MODEL: $BASE_MODEL (only Llama 3.x / Qwen3)"; exit 1 ;;
 esac
 
-OUTPUT_DIR="${OUTPUT_DIR:-results_ruler/seer_attention/${MODEL_TAG}}"
+OUTPUT_DIR="${OUTPUT_DIR:-result/ruler}"
 
 # Sequence lengths to evaluate
 SEQ_LENGTHS="${SEQ_LENGTHS:-32768}" # "${SEQ_LENGTHS:-4096 8192 16384 32768 65536 131072}"

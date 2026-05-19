@@ -21,7 +21,7 @@ Usage
 
   # Compare two prior runs in one plot
   python observations/dct_page_energy.py --compare_runs \
-      observations/results/dct_page_energy/qwen3_8b_32k_ps32,observations/results/dct_page_energy/llama31_8b_32k_ps32
+      result/energy/qwen3_8b_32k_ps32,result/energy/llama31_8b_32k_ps32
 """
 
 from __future__ import annotations
@@ -935,7 +935,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_sink_pages", type=int, default=1)
     p.add_argument("--num_recent_pages", type=int, default=4)
     p.add_argument("--data_root", type=Path, default=_REPO_ROOT / "benchmark" / "data" / "ruler_data")
-    p.add_argument("--output_dir", type=Path, default=_REPO_ROOT / "observations" / "results" / "dct_page_energy")
+    p.add_argument("--output_dir", type=Path, default=_REPO_ROOT / "result" / "energy")
     p.add_argument("--run_name", default=None)
     p.add_argument("--cuda_device", type=int, default=0)
     p.add_argument("--plot", action=argparse.BooleanOptionalAction, default=True)

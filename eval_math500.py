@@ -14,17 +14,17 @@ Gold answers are NOT coerced to integers (MATH-500 contains fractions,
 latex tuples like '(3,\\frac{\\pi}{2})', symbolic expressions like 'p - q').
 
 Outputs:
-    {output_dir}/{run_name}.jsonl              per-sample records
-    {output_dir}/{run_name}_summary.json       overall + per-level + per-subject
-    {output_dir}/{run_name}_summary.csv        tabular summary
+    {output_dir}/{run_name}/results.jsonl       per-sample records
+    {output_dir}/{run_name}/summary.json        overall + per-level + per-subject
+    {output_dir}/{run_name}/summary.csv         tabular summary
 
 Usage:
     python eval_math500.py --mode baseline \
-        --num_samples 25 --output_dir results/results_math500 --run_name smoke
+        --num_samples 25 --output_dir result/math500 --run_name smoke
 
     python eval_math500.py --mode page_attention \
         --page_size 32 --top_k 64 --unselected_mode drop \
-        --output_dir results/results_math500 --run_name page_topk64
+        --output_dir result/math500 --run_name page_topk64
 """
 
 import os
@@ -185,7 +185,7 @@ def parse_args():
     parser.add_argument("--min_p", type=float, default=0.0)
 
     # Output
-    parser.add_argument("--output_dir", type=str, default="results/results_math500")
+    parser.add_argument("--output_dir", type=str, default="result/math500")
     parser.add_argument("--run_name", type=str, default=None)
 
     # DCT Page Attention params (mirror eval_aime25)
@@ -254,7 +254,7 @@ def parse_args():
                              f"_repr{args.inf_llm_repr_topk}_{suffix}")
 
     if args.skip_existing:
-        summary_path = os.path.join(args.output_dir, f"{args.run_name}_summary.json")
+        summary_path = os.path.join(args.output_dir, args.run_name, "summary.json")
         if os.path.exists(summary_path):
             print(f"SKIP (already exists): {summary_path}")
             sys.exit(0)
@@ -272,8 +272,9 @@ def parse_args():
 def evaluate(model, tokenizer, dataset, args):
     model.eval()
 
-    output_path = os.path.join(args.output_dir, f"{args.run_name}.jsonl")
-    os.makedirs(args.output_dir, exist_ok=True)
+    run_dir = os.path.join(args.output_dir, args.run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    output_path = os.path.join(run_dir, "results.jsonl")
 
     completed_ids = set()
     if os.path.exists(output_path):
@@ -489,11 +490,13 @@ def build_summary(results, args):
 
 def write_summary_files(results, args):
     summary = build_summary(results, args)
-    summary_path = os.path.join(args.output_dir, f"{args.run_name}_summary.json")
+    run_dir = os.path.join(args.output_dir, args.run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    summary_path = os.path.join(run_dir, "summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
 
-    csv_path = os.path.join(args.output_dir, f"{args.run_name}_summary.csv")
+    csv_path = os.path.join(run_dir, "summary.csv")
     rows = [{
         "group": "overall",
         "label": "overall",

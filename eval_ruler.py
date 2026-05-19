@@ -14,12 +14,12 @@ Usage examples:
     python eval_ruler.py --mode baseline \
         --base_model meta-llama/Llama-3.1-8B-Instruct \
         --prepare \
-        --output_dir results_ruler --run_name baseline
+        --output_dir result/ruler --run_name baseline
 
     # Run seer attention (data already prepared)
     python eval_ruler.py --mode seer_attention \
         --base_model meta-llama/Llama-3.1-8B-Instruct \
-        --output_dir results_ruler --run_name seer_budget1024
+        --output_dir result/ruler --run_name seer_budget1024
 """
 
 import argparse
@@ -131,7 +131,7 @@ def parse_args():
     parser.add_argument("--num_samples", type=int, default=25)
 
     # Output
-    parser.add_argument("--output_dir", type=str, default="results/results_ruler")
+    parser.add_argument("--output_dir", type=str, default="result/ruler")
     parser.add_argument("--run_name", type=str, default=None)
 
     # DCT Page Attention params

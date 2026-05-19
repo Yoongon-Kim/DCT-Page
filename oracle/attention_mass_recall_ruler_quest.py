@@ -94,11 +94,23 @@ METRIC_KEYS = MASS_METRIC_KEYS + FIDELITY_METRIC_KEYS
 # without altering the decode path.
 # ---------------------------------------------------------------------------
 _recording_hook: Optional[Callable[[dict], None]] = None
+_prefill_recording_hook: Optional[Callable[[dict], None]] = None
 
 
 def set_recording_hook(hook: Optional[Callable[[dict], None]]) -> None:
     global _recording_hook
     _recording_hook = hook
+
+
+def set_prefill_recording_hook(hook: Optional[Callable[[dict], None]]) -> None:
+    """Install a side-effect callback fired on prefill (q_len > 1).
+
+    Decoupled from the decode-step hook so callers that only care about
+    decode (e.g. Quest mass recall) stay unaffected. Used by InfLLM's
+    faithful local-attention scoring to capture (post-RoPE) prefill Q and K.
+    """
+    global _prefill_recording_hook
+    _prefill_recording_hook = hook
 
 
 def _install_recording_forward(model: torch.nn.Module, family: str) -> None:
@@ -175,13 +187,23 @@ def _install_recording_forward(model: torch.nn.Module, family: str) -> None:
                     key_states, value_states, self.layer_idx, cache_kwargs,
                 )
 
-            # ---- Side-effect recorder call (decode only) -------------------
+            # ---- Side-effect recorder calls --------------------------------
+            # Decode steps (q_len == 1) fire the decode hook; prefill (q_len > 1)
+            # fires the prefill hook if installed. Both hooks are optional and
+            # observe-only — decoding output is unchanged either way.
             if query_states.shape[-2] == 1 and _recording_hook is not None:
                 _recording_hook({
                     "layer_idx": int(self.layer_idx),
                     "query_states": query_states,
                     "key_states_full": key_states,
                     "value_states_full": value_states,
+                    "num_kv_groups": int(self.num_key_value_groups),
+                })
+            elif query_states.shape[-2] > 1 and _prefill_recording_hook is not None:
+                _prefill_recording_hook({
+                    "layer_idx": int(self.layer_idx),
+                    "query_states": query_states,      # [1, H_q, L, d] post-RoPE
+                    "key_states_full": key_states,     # [1, H_kv, L, d] post-RoPE
                     "num_kv_groups": int(self.num_key_value_groups),
                 })
             # ---------------------------------------------------------------

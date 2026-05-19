@@ -70,7 +70,7 @@ def parse_args():
                         help="Max samples to evaluate (-1 = all 503)")
 
     # Output
-    parser.add_argument("--output_dir", type=str, default="results_longbench_v2/page_attention")
+    parser.add_argument("--output_dir", type=str, default="result/longbench_v2")
     parser.add_argument("--run_name", type=str, default=None,
                         help="Name for this run (auto-generated if not given)")
 
@@ -268,7 +268,9 @@ def extract_answer(response):
 def evaluate(model, tokenizer, dataset, args):
     model.eval()
 
-    output_path = os.path.join(args.output_dir, f"{args.run_name}.jsonl")
+    run_dir = os.path.join(args.output_dir, args.run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    output_path = os.path.join(run_dir, "results.jsonl")
 
     # Resume support: skip already-completed samples
     completed_ids = set()
@@ -283,7 +285,6 @@ def evaluate(model, tokenizer, dataset, args):
     if args.num_samples > 0:
         samples = samples[: args.num_samples]
 
-    os.makedirs(args.output_dir, exist_ok=True)
     out_f = open(output_path, "a")
 
     correct = 0
@@ -520,11 +521,13 @@ def build_summary(results, args):
 
 def write_summary_files(results, args):
     summary = build_summary(results, args)
-    summary_path = os.path.join(args.output_dir, f"{args.run_name}_summary.json")
+    run_dir = os.path.join(args.output_dir, args.run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    summary_path = os.path.join(run_dir, "summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
 
-    csv_path = os.path.join(args.output_dir, f"{args.run_name}_summary.csv")
+    csv_path = os.path.join(run_dir, "summary.csv")
     rows = [
         {
             "group": "overall",
@@ -874,7 +877,7 @@ def main():
 
     summary_path, csv_path = write_summary_files(results, args)
 
-    print(f"\nResults saved to: {os.path.join(args.output_dir, args.run_name + '.jsonl')}")
+    print(f"\nResults saved to: {os.path.join(args.output_dir, args.run_name, 'results.jsonl')}")
     print(f"Summary saved to: {summary_path}")
     print(f"Summary CSV saved to: {csv_path}")
 

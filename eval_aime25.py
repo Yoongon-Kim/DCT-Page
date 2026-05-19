@@ -14,17 +14,17 @@ answer is extracted from the innermost \\boxed{...} expression and compared
 to the gold integer with exact match.
 
 Outputs:
-    {output_dir}/{run_name}.jsonl              per-sample records
-    {output_dir}/{run_name}_summary.json       aggregate accuracy + config
-    {output_dir}/{run_name}_summary.csv        tabular summary
+    {output_dir}/{run_name}/results.jsonl       per-sample records
+    {output_dir}/{run_name}/summary.json        aggregate accuracy + config
+    {output_dir}/{run_name}/summary.csv         tabular summary
 
 Usage:
     python eval_aime25.py --mode baseline \
-        --num_samples 5 --output_dir results_aime25 --run_name smoke_baseline
+        --num_samples 5 --output_dir result/aime25 --run_name smoke_baseline
 
     python eval_aime25.py --mode page_attention \
         --page_size 32 --top_k 64 --unselected_mode drop \
-        --output_dir results_aime25 --run_name qwen_page_topk64
+        --output_dir result/aime25 --run_name qwen_page_topk64
 """
 
 import os
@@ -198,7 +198,7 @@ def parse_args():
     parser.add_argument("--min_p", type=float, default=0.0)
 
     # Output
-    parser.add_argument("--output_dir", type=str, default="results/results_aime25")
+    parser.add_argument("--output_dir", type=str, default="result/aime25")
     parser.add_argument("--run_name", type=str, default=None)
 
     # DCT Page Attention params
@@ -284,7 +284,7 @@ def parse_args():
                              f"_repr{args.inf_llm_repr_topk}_{suffix}")
 
     if args.skip_existing:
-        summary_path = os.path.join(args.output_dir, f"{args.run_name}_summary.json")
+        summary_path = os.path.join(args.output_dir, args.run_name, "summary.json")
         if os.path.exists(summary_path):
             print(f"SKIP (already exists): {summary_path}")
             sys.exit(0)
@@ -305,8 +305,9 @@ def parse_args():
 def evaluate(model, tokenizer, dataset, args):
     model.eval()
 
-    output_path = os.path.join(args.output_dir, f"{args.run_name}.jsonl")
-    os.makedirs(args.output_dir, exist_ok=True)
+    run_dir = os.path.join(args.output_dir, args.run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    output_path = os.path.join(run_dir, "results.jsonl")
 
     completed_ids = set()
     if os.path.exists(output_path):
@@ -423,7 +424,7 @@ def evaluate(model, tokenizer, dataset, args):
         out_f.flush()
 
         if total == 0:
-            sample_path = os.path.join(args.output_dir, f"{args.run_name}_sample0.txt")
+            sample_path = os.path.join(run_dir, "sample0.txt")
             with open(sample_path, "w", encoding="utf-8") as sf:
                 sf.write(response[:200])
 
@@ -507,11 +508,13 @@ def build_summary(results, args):
 
 def write_summary_files(results, args):
     summary = build_summary(results, args)
-    summary_path = os.path.join(args.output_dir, f"{args.run_name}_summary.json")
+    run_dir = os.path.join(args.output_dir, args.run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    summary_path = os.path.join(run_dir, "summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
 
-    csv_path = os.path.join(args.output_dir, f"{args.run_name}_summary.csv")
+    csv_path = os.path.join(run_dir, "summary.csv")
     rows = [{
         "group": "overall",
         "label": "overall",

@@ -6,7 +6,7 @@ set -e
 # ---- Configuration (env defaults, overridable via CLI flags below) ----
 BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 NUM_SAMPLES="${NUM_SAMPLES:-25}"
-OUTPUT_DIR="${OUTPUT_DIR:-results/results_ruler/page_attention}"
+OUTPUT_DIR="${OUTPUT_DIR:-result/ruler}"
 PREPARE_FLAG=""
 
 # ---- Parse CLI flags ----
