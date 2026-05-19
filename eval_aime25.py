@@ -238,6 +238,17 @@ def parse_args():
     parser.add_argument("--comp_kv_quant_granularity", type=str, default="per_page",
                         choices=["per_page", "per_comp_token"])
 
+    # SeerAttention-R overrides (only used when --mode seer_attention).
+    # Mirror eval_ruler.py defaults so load_model_and_tokenizer's attribute
+    # lookups (args.seer_model, args.seerattn_*) resolve.
+    parser.add_argument("--seer_model", type=str,
+                        default="SeerAttention/SeerAttention-Decode-Qwen3-8B-AttnGates")
+    parser.add_argument("--seerattn_sparsity_method", type=str, default="token_budget",
+                        choices=["token_budget", "threshold"])
+    parser.add_argument("--seerattn_token_budget", type=int, default=2048)
+    parser.add_argument("--seerattn_gate_block_size", type=int, default=64,
+                        choices=[16, 32, 64])
+
     # ShadowKV baseline params (here for argparse parity only)
     parser.add_argument("--shadowkv_cache_mode", type=str, default="shadowkv_cpu",
                         choices=["shadowkv", "shadowkv_cpu"])

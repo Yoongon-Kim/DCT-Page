@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1778771748043,
+  "lastScanned": 1779026870552,
   "projectRoot": "/home/yoongonkim/DCT-Page",
   "techStack": {
     "languages": [
@@ -44,48 +44,35 @@
     "__pycache__": {
       "path": "__pycache__",
       "purpose": null,
-      "fileCount": 7,
-      "lastAccessed": 1778771748039,
+      "fileCount": 35,
+      "lastAccessed": 1779026870547,
       "keyFiles": [
-        "compare_baseline_dct.cpython-312.pyc",
+        "analyze_niah_page_ranks.cpython-312.pyc",
+        "analyze_selection_oracle_overlap.cpython-312.pyc",
         "config.cpython-311.pyc",
         "config.cpython-312.pyc",
-        "dct_page_attention.cpython-311.pyc",
-        "dct_page_attention.cpython-312.pyc"
+        "dct_page_attention.cpython-310.pyc"
       ]
     },
     "baselines": {
       "path": "baselines",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1778771748041,
+      "lastAccessed": 1779026870549,
       "keyFiles": []
     },
     "benchmark": {
       "path": "benchmark",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1778771748042,
+      "lastAccessed": 1779026870549,
       "keyFiles": []
-    },
-    "longbench_v1_data": {
-      "path": "longbench_v1_data",
-      "purpose": null,
-      "fileCount": 6,
-      "lastAccessed": 1778771748042,
-      "keyFiles": [
-        "2wikimqa.jsonl",
-        "gov_report.jsonl",
-        "multifieldqa_en.jsonl",
-        "narrativeqa.jsonl",
-        "qasper.jsonl"
-      ]
     },
     "observations": {
       "path": "observations",
       "purpose": null,
       "fileCount": 1,
-      "lastAccessed": 1778771748042,
+      "lastAccessed": 1779026870550,
       "keyFiles": [
         "dct_page_energy.py"
       ]
@@ -93,35 +80,49 @@
     "oracle": {
       "path": "oracle",
       "purpose": null,
-      "fileCount": 8,
-      "lastAccessed": 1778771748042,
+      "fileCount": 11,
+      "lastAccessed": 1779026870550,
       "keyFiles": [
         "attention_mass_recall_ruler.py",
         "attention_mass_recall_ruler_quest.py",
         "dc_ac_ruler.py",
-        "diagnose_scoring_methods.py",
-        "hybridmulti_ruler.py"
+        "diagnose_haar_mass_correlation.py",
+        "diagnose_qk_channel_spectrum.py"
       ]
     },
     "results": {
       "path": "results",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1778771748042,
+      "lastAccessed": 1779026870550,
       "keyFiles": []
     },
     "results_attention_mass_recall": {
       "path": "results_attention_mass_recall",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1778771748042,
+      "lastAccessed": 1779026870550,
+      "keyFiles": []
+    },
+    "results_quest_mass_recall": {
+      "path": "results_quest_mass_recall",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1779026870550,
+      "keyFiles": []
+    },
+    "results_ruler": {
+      "path": "results_ruler",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1779026870550,
       "keyFiles": []
     },
     "speed": {
       "path": "speed",
       "purpose": null,
       "fileCount": 9,
-      "lastAccessed": 1778771748042,
+      "lastAccessed": 1779026870550,
       "keyFiles": [
         "flashinfer_backend.py",
         "profile_decode.py",
@@ -134,309 +135,39 @@
       "path": "benchmark/data",
       "purpose": "Data files",
       "fileCount": 0,
-      "lastAccessed": 1778771748042,
+      "lastAccessed": 1779026870551,
       "keyFiles": []
     }
   },
   "hotPaths": [
     {
-      "path": "speed/profile_decode_upstream_flash_infer.py",
-      "accessCount": 151,
-      "lastAccessed": 1778400745229,
-      "type": "file"
-    },
-    {
       "path": "eval_ruler.py",
-      "accessCount": 132,
-      "lastAccessed": 1778735958317,
-      "type": "file"
-    },
-    {
-      "path": "dct_page_attention.py",
-      "accessCount": 96,
-      "lastAccessed": 1778632593750,
-      "type": "file"
-    },
-    {
-      "path": "eval_longbench_v1.py",
-      "accessCount": 48,
-      "lastAccessed": 1778505235654,
-      "type": "file"
-    },
-    {
-      "path": "eval_longbench_v2.py",
-      "accessCount": 46,
-      "lastAccessed": 1778505243669,
-      "type": "file"
-    },
-    {
-      "path": "observations/dct_page_energy.py",
-      "accessCount": 40,
-      "lastAccessed": 1778225958834,
+      "accessCount": 2,
+      "lastAccessed": 1779027269617,
       "type": "file"
     },
     {
       "path": "eval_aime25.py",
-      "accessCount": 37,
-      "lastAccessed": 1778734512681,
-      "type": "file"
-    },
-    {
-      "path": "speed/upstream_flashinfer_backend.py",
-      "accessCount": 36,
-      "lastAccessed": 1778398097749,
-      "type": "file"
-    },
-    {
-      "path": "triton_kernels.py",
-      "accessCount": 28,
-      "lastAccessed": 1778405015514,
-      "type": "file"
-    },
-    {
-      "path": "speed/profile_decode_flash_infer.py",
-      "accessCount": 22,
-      "lastAccessed": 1778396772942,
-      "type": "file"
-    },
-    {
-      "path": "eval_gpqa.py",
-      "accessCount": 21,
-      "lastAccessed": 1778505041118,
-      "type": "file"
-    },
-    {
-      "path": "baselines/infllm/__init__.py",
-      "accessCount": 17,
-      "lastAccessed": 1778516219023,
-      "type": "file"
-    },
-    {
-      "path": "speed/flashinfer_backend.py",
-      "accessCount": 16,
-      "lastAccessed": 1778396714787,
-      "type": "file"
-    },
-    {
-      "path": "CLAUDE.md",
-      "accessCount": 10,
-      "lastAccessed": 1778483858671,
-      "type": "file"
-    },
-    {
-      "path": "baselines/quest_attn/models/llama.py",
-      "accessCount": 8,
-      "lastAccessed": 1778429838127,
-      "type": "file"
-    },
-    {
-      "path": "run_ruler_infllm.sh",
-      "accessCount": 7,
-      "lastAccessed": 1778224661477,
-      "type": "file"
-    },
-    {
-      "path": "baselines/quest_attn/models/qwen3.py",
-      "accessCount": 7,
-      "lastAccessed": 1778429843678,
-      "type": "file"
-    },
-    {
-      "path": "baselines/infllm/upstream/__init__.py",
-      "accessCount": 6,
-      "lastAccessed": 1778483693577,
-      "type": "file"
-    },
-    {
-      "path": "speed/profile_decode.py",
-      "accessCount": 5,
-      "lastAccessed": 1778385787636,
-      "type": "file"
-    },
-    {
-      "path": "baselines/quest_attn/models/QuestAttention.py",
-      "accessCount": 5,
-      "lastAccessed": 1778433299911,
-      "type": "file"
-    },
-    {
-      "path": "baselines/infllm/config.py",
-      "accessCount": 5,
-      "lastAccessed": 1778483614453,
-      "type": "file"
-    },
-    {
-      "path": "config.py",
-      "accessCount": 5,
-      "lastAccessed": 1778632587259,
-      "type": "file"
-    },
-    {
-      "path": "oracle/diagnose_scoring_methods.py",
-      "accessCount": 3,
-      "lastAccessed": 1778385711412,
-      "type": "file"
-    },
-    {
-      "path": "oracle/attention_mass_recall_ruler.py",
-      "accessCount": 3,
-      "lastAccessed": 1778385712432,
-      "type": "file"
-    },
-    {
-      "path": "baselines/quest_attn/ops/csrc/page.cu",
       "accessCount": 2,
-      "lastAccessed": 1778430071965,
-      "type": "file"
-    },
-    {
-      "path": "baselines/infllm/upstream/utils/__init__.py",
-      "accessCount": 2,
-      "lastAccessed": 1778481100369,
-      "type": "file"
-    },
-    {
-      "path": "benchmark/eval_ruler/synthetic.yaml",
-      "accessCount": 2,
-      "lastAccessed": 1778515325942,
-      "type": "file"
-    },
-    {
-      "path": "observations/results/dct_page_energy/qwen3_8b_32k_ps32/summary.json",
-      "accessCount": 1,
-      "lastAccessed": 1778208291838,
-      "type": "file"
-    },
-    {
-      "path": "verify_kernels.py",
-      "accessCount": 1,
-      "lastAccessed": 1778382469663,
-      "type": "file"
-    },
-    {
-      "path": "benchmark/eval_ruler/data/prepare.py",
-      "accessCount": 1,
-      "lastAccessed": 1778406945844,
-      "type": "file"
-    },
-    {
-      "path": "benchmark/eval_ruler/data/synthetic/qa.py",
-      "accessCount": 1,
-      "lastAccessed": 1778406962555,
+      "lastAccessed": 1779027280954,
       "type": "file"
     },
     {
       "path": "baselines/seer_attn/config.py",
       "accessCount": 1,
-      "lastAccessed": 1778408204931,
+      "lastAccessed": 1779026932361,
       "type": "file"
     },
     {
-      "path": "baselines/seer_attn/__init__.py",
+      "path": "observations/results/dct_page_energy/llama-31-8b-instruct_32768_ps32_niah_multikey_3_ghead/energy_curve.png",
       "accessCount": 1,
-      "lastAccessed": 1778408205321,
+      "lastAccessed": 1779078600808,
       "type": "file"
     },
     {
-      "path": "baselines/seer_attn/prefill_config.py",
+      "path": "dct_page_attention.py",
       "accessCount": 1,
-      "lastAccessed": 1778408206140,
-      "type": "file"
-    },
-    {
-      "path": "baselines/seer_attn/decode_sparse/cache_utils.py",
-      "accessCount": 1,
-      "lastAccessed": 1778408660207,
-      "type": "file"
-    },
-    {
-      "path": "baselines/seer_attn/decode_sparse/qwen3/configuration_qwen3_seerattn.py",
-      "accessCount": 1,
-      "lastAccessed": 1778408749416,
-      "type": "file"
-    },
-    {
-      "path": "baselines/seer_attn/prefill_sparse/llama/configuration_llama_seerattn.py",
-      "accessCount": 1,
-      "lastAccessed": 1778408750232,
-      "type": "file"
-    },
-    {
-      "path": "baselines/seer_attn/decode_sparse/attn_gate_inf.py",
-      "accessCount": 1,
-      "lastAccessed": 1778413801214,
-      "type": "file"
-    },
-    {
-      "path": "baselines/seer_attn/decode_sparse/qwen3/modeling_qwen3_seerattn_inference.py",
-      "accessCount": 1,
-      "lastAccessed": 1778413802381,
-      "type": "file"
-    },
-    {
-      "path": "baselines/seer_attn/decode_sparse/attention_forward_sparse.py",
-      "accessCount": 1,
-      "lastAccessed": 1778413802671,
-      "type": "file"
-    },
-    {
-      "path": "baselines/seer_attn/decode_sparse/attention_forward_dense.py",
-      "accessCount": 1,
-      "lastAccessed": 1778413803077,
-      "type": "file"
-    },
-    {
-      "path": "baselines/quest_attn/models/__init__.py",
-      "accessCount": 1,
-      "lastAccessed": 1778423368528,
-      "type": "file"
-    },
-    {
-      "path": "baselines/quest_attn/utils/__init__.py",
-      "accessCount": 1,
-      "lastAccessed": 1778423379440,
-      "type": "file"
-    },
-    {
-      "path": "baselines/quest_attn/utils/controller.py",
-      "accessCount": 1,
-      "lastAccessed": 1778423385996,
-      "type": "file"
-    },
-    {
-      "path": "baselines/quest_attn/utils/decode_wrapper.py",
-      "accessCount": 1,
-      "lastAccessed": 1778423386871,
-      "type": "file"
-    },
-    {
-      "path": "baselines/quest_attn/utils/kv_cache.py",
-      "accessCount": 1,
-      "lastAccessed": 1778423388032,
-      "type": "file"
-    },
-    {
-      "path": "baselines/quest_attn/utils/utils.py",
-      "accessCount": 1,
-      "lastAccessed": 1778423388491,
-      "type": "file"
-    },
-    {
-      "path": "baselines/quest_attn/config.py",
-      "accessCount": 1,
-      "lastAccessed": 1778428055450,
-      "type": "file"
-    },
-    {
-      "path": "baselines/quest_attn/ops/csrc/estimate.cu",
-      "accessCount": 1,
-      "lastAccessed": 1778429715542,
-      "type": "file"
-    },
-    {
-      "path": "baselines/quest_attn/ops/csrc/rms_norm.cu",
-      "accessCount": 1,
-      "lastAccessed": 1778430148731,
+      "lastAccessed": 1779084257668,
       "type": "file"
     }
   ],
