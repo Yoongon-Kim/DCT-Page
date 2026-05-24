@@ -453,9 +453,9 @@ def parse_args():
 
     # Quest baseline (--mode quest_attention) — separate from DCT's --page_size/--top_k.
     # token_budget = quest_page_size * quest_top_k.
-    parser.add_argument("--quest_page_size", type=int, default=16,
+    parser.add_argument("--quest_page_size", type=int, default=32,
                         help="Quest baseline: tokens per KV page (Quest paper default: 16)")
-    parser.add_argument("--quest_top_k", type=int, default=128,
+    parser.add_argument("--quest_top_k", type=int, default=64,
                         help="Quest baseline: page budget (=token_budget/page_size). "
                              "Default 128 → token_budget=2048 with quest_page_size=16")
 
@@ -465,11 +465,11 @@ def parse_args():
                         help="Total selected page budget (sink + middle + recent). "
                              "DCTPageConfig receives total - sink - recent as its internal top_k.")
     parser.add_argument("--num_sink_pages", type=int, default=1)
-    parser.add_argument("--num_recent_pages", type=int, default=5)
-    parser.add_argument("--compress_ratio", type=float, default=0.03125)
+    parser.add_argument("--num_recent_pages", type=int, default=4)
+    parser.add_argument("--compress_ratio", type=float, default=0.125)
     parser.add_argument("--scoring_method", type=str, default="max",
                         choices=["mean", "max"])
-    parser.add_argument("--group_agg_method", type=str, default="mean",
+    parser.add_argument("--group_agg_method", type=str, default="max",
                         choices=["mean", "max"],
                         help="How to aggregate per-head scores within a GQA group")
     parser.add_argument("--unselected_mode", type=str, default="drop",
@@ -484,7 +484,7 @@ def parse_args():
     parser.add_argument(
         "--attention_backend",
         type=str,
-        default="sdpa",
+        default="upstream_flashinfer",
         choices=["sdpa", "upstream_flashinfer"],
         help=(
             "Attention backend for page_attention mode. "
@@ -505,7 +505,7 @@ def parse_args():
             "project_upstream_fi_multibatch.md."
         ),
     )
-    parser.add_argument("--comp_kv_quant", type=str, default="none",
+    parser.add_argument("--comp_kv_quant", type=str, default="fp8_e5m2",
                         choices=["none", "fp8_e4m3", "fp8_e5m2", "int8", "int4"],
                         help="Fake-quantization of compressed K/V at write time "
                              "(precision study; no real byte-level storage change)")
