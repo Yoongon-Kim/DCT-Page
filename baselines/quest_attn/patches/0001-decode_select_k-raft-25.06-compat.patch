@@ -1,0 +1,41 @@
+diff --git a/kernels/include/topk/decode_select_k.cuh b/kernels/include/topk/decode_select_k.cuh
+index 2a2562a..181e89f 100644
+--- a/kernels/include/topk/decode_select_k.cuh
++++ b/kernels/include/topk/decode_select_k.cuh
+@@ -35,7 +35,10 @@ void decode_select_k(const T* in,
+    // Parameters from kRadix8Bits
+    constexpr int BitsPerPass = 8;
+    constexpr int BlockSize = 512;
+-   auto kernel = radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize>;
++   // RAFT >= 25.06: kernel signature gained `len_or_indptr` template param plus
++   // `len_i` / `offset` runtime args; pass len_or_indptr=true and len_i=nullptr to
++   // keep the original len-based semantics.
++   auto kernel = radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, true>;
+ 
+    int sm_cnt;
+    {
+@@ -45,18 +48,18 @@ void decode_select_k(const T* in,
+    }
+ 
+    const size_t max_chunk_size = calc_chunk_size<T, IdxT, BlockSize>(batch_size, len, sm_cnt, kernel, true);
+-   // const size_t buf_size = max_chunk_size * buf_len * 2 * (sizeof(T) + sizeof(IdxT));
+-   // const IdxT buf_len = calc_buf_len<T, IdxT, unsigned>(len);
+ 
+    for (size_t offset = 0; offset < static_cast<size_t>(batch_size); offset += max_chunk_size) {
+       int chunk_size = std::min(max_chunk_size, batch_size - offset);
+-      kernel<<<chunk_size, BlockSize, 0, nullptr>>>(in + offset * len,
+-                                                   in_idx ? (in_idx + offset * len) : nullptr,
++      kernel<<<chunk_size, BlockSize, 0, nullptr>>>(in,
++                                                   in_idx,
+                                                    len,
++                                                   /*len_i=*/static_cast<const IdxT*>(nullptr),
+                                                    k,
+                                                    out + offset * k,
+                                                    out_idx + offset * k,
+                                                    !greater,
+-                                                   bufs);
++                                                   bufs,
++                                                   offset);
+    }
+ }
+\ No newline at end of file

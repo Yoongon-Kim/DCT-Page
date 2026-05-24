@@ -12,7 +12,7 @@
 # the License.
 
 # Use this variable to update RAPIDS and RAFT versions
-set(RAPIDS_VERSION "24.02")
+set(RAPIDS_VERSION "25.06")
 
 if(NOT EXISTS ${CMAKE_CURRENT_BINARY_DIR}/RAFT_RAPIDS.cmake)
     file(DOWNLOAD https://raw.githubusercontent.com/rapidsai/rapids-cmake/branch-${RAPIDS_VERSION}/RAPIDS.cmake
@@ -30,4 +30,5 @@ if(NOT EXISTS ${CMAKE_CURRENT_BINARY_DIR}/RAFT_RAPIDS.cmake)
         endif()
     endif()
 endif()
+set(rapids-cmake-version "${RAPIDS_VERSION}")
 include(${CMAKE_CURRENT_BINARY_DIR}/RAFT_RAPIDS.cmake)

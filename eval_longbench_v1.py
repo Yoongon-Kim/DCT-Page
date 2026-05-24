@@ -38,11 +38,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # ---------------------------------------------------------------------------
 ENGLISH_TASKS = [
     "narrativeqa", "qasper", "multifieldqa_en",
-    "hotpotqa", "2wikimqa", "musique",
-    "gov_report", "qmsum", "multi_news",
-    "trec", "triviaqa", "samsum",
-    "passage_count", "passage_retrieval_en",
-    "lcc", "repobench-p",
+    "hotpotqa", "2wikimqa", #"musique",
+    "gov_report", #"qmsum", "multi_news",
+    "triviaqa",
+    #"trec", "triviaqa", "samsum",
+    #"passage_count", "passage_retrieval_en",
+    #"lcc", "repobench-p",
 ]
 
 REPO_DIR = Path(__file__).resolve().parent
@@ -512,15 +513,37 @@ def parse_args():
                         choices=["per_page", "per_comp_token"],
                         help="Scale granularity for comp_kv_quant")
 
-    # InfLLM baseline params (only used when --mode inf_llm).
-    parser.add_argument("--inf_llm_n_init", type=int, default=128,
-                        help="InfLLM: sink token count.")
+    # InfLLM baseline params (only used when --mode inf_llm). All accuracy-relevant
+    # knobs (topk, block_size, n_local, n_init, repr_topk) plus max_cached_block /
+    # chunk_size / n_recent / exc_block_size are exposed as CLI overrides on top of
+    # baselines/infllm/config.py. Mirrors eval_ruler.py.
+    parser.add_argument("--inf_llm_topk", type=int, default=64,
+                        help="InfLLM: blocks attended per decode step (main sparsity dial).")
+    parser.add_argument("--inf_llm_block_size", type=int, default=32,
+                        help="InfLLM: tokens per block (retrieval granularity).")
+    parser.add_argument("--inf_llm_n_local", type=int, default=4096,
+                        help="InfLLM: sliding-window of always-attended recent tokens. "
+                             "Upstream Llama-3 config uses 4096; shrinking this below ~1k "
+                             "tanks LongBench multi-key / QA scores.")
+    parser.add_argument("--inf_llm_n_recent", type=int, default=None,
+                        help="InfLLM: output sliding window (defaults to n_local — byte-identical "
+                             "to upstream behavior). Must be <= n_local. When set < n_local, "
+                             "decouples the local-output window from the block-scoring horizon "
+                             "and ATTENUATES the local-attention output (output mass over keys "
+                             "in [n_recent, n_local) is zeroed; softmax is NOT renormalized), "
+                             "which can significantly degrade retrieval at long context.")
+    parser.add_argument("--inf_llm_n_init", type=int, default=32,
+                        help="InfLLM: sink token count (upstream Llama-3 default: 128).")
     parser.add_argument("--inf_llm_repr_topk", type=int, default=4,
                         help="InfLLM: representative tokens per block.")
-    parser.add_argument("--inf_llm_max_cached_block", type=int, default=32,
-                        help="InfLLM: GPU block cache size.")
+    parser.add_argument("--inf_llm_max_cached_block", type=int, default=128,
+                        help="InfLLM: GPU block cache size (must be >= --inf_llm_topk).")
     parser.add_argument("--inf_llm_chunk_size", type=int, default=8192,
                         help="InfLLM: prefill chunk size for GreedySearch.")
+    parser.add_argument("--inf_llm_exc_block_size", type=int, default=None,
+                        help="InfLLM: per-iteration global-attention block size during prefill. "
+                             "Upstream asserts exc_block_size <= n_local. None => "
+                             "min(INF_LLM_CONFIG['exc_block_size'], n_local).")
 
     args = parser.parse_args()
 
@@ -540,8 +563,13 @@ def parse_args():
         elif args.mode == "duo_attention":
             args.run_name = f"{tag}_duo_attention"
         elif args.mode == "inf_llm":
-            args.run_name = (f"{tag}_inf_llm_nini{args.inf_llm_n_init}"
+            args.run_name = (f"{tag}_inf_llm_topk{args.inf_llm_topk}"
+                             f"_bs{args.inf_llm_block_size}"
+                             f"_nlocal{args.inf_llm_n_local}"
+                             f"_nini{args.inf_llm_n_init}"
                              f"_repr{args.inf_llm_repr_topk}")
+            if args.inf_llm_n_recent is not None:
+                args.run_name += f"_nrec{args.inf_llm_n_recent}"
         else:
             args.run_name = f"{tag}_page_attn_topk{args.top_k}T_{args.comp_kv_quant}"
 
@@ -1088,10 +1116,18 @@ def main():
             from infllm.config import INF_LLM_CONFIG
             assert_llama_only(args.base_model)
             INF_LLM_CONFIG["base_model"] = args.base_model
+            INF_LLM_CONFIG["topk"] = args.inf_llm_topk
+            INF_LLM_CONFIG["block_size"] = args.inf_llm_block_size
+            INF_LLM_CONFIG["n_local"] = args.inf_llm_n_local
             INF_LLM_CONFIG["n_init"] = args.inf_llm_n_init
             INF_LLM_CONFIG["repr_topk"] = args.inf_llm_repr_topk
             INF_LLM_CONFIG["max_cached_block"] = args.inf_llm_max_cached_block
             INF_LLM_CONFIG["chunk_size"] = args.inf_llm_chunk_size
+            INF_LLM_CONFIG["n_recent"] = args.inf_llm_n_recent
+            requested_exc = (args.inf_llm_exc_block_size
+                             if args.inf_llm_exc_block_size is not None
+                             else INF_LLM_CONFIG["exc_block_size"])
+            INF_LLM_CONFIG["exc_block_size"] = min(requested_exc, args.inf_llm_n_local)
             init_inf_llm(model, INF_LLM_CONFIG)
             args._inf_llm_generator = build_inf_llm_generator(model, tokenizer, INF_LLM_CONFIG)
 

@@ -26,7 +26,7 @@ from tqdm import tqdm
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from eval_ruler import model_name_tag, _resolve_middle_top_k
+from eval_ruler import model_name_tag, _resolve_middle_top_k, _str2bool
 
 
 # ---------------------------------------------------------------------------
@@ -146,15 +146,82 @@ def parse_args():
     parser.add_argument("--prefill_chunk_size", type=int, default=0,
                         help="Chunk size for prefill (0 = no chunking)")
 
-    # InfLLM baseline params (only used when --mode inf_llm).
-    parser.add_argument("--inf_llm_n_init", type=int, default=128,
-                        help="InfLLM: sink token count.")
+    # InfLLM baseline params (only used when --mode inf_llm). All accuracy-relevant
+    # knobs (topk, block_size, n_local, n_init, repr_topk) plus max_cached_block /
+    # chunk_size / exc_block_size are exposed as CLI overrides on top of
+    # baselines/infllm/config.py.
+    parser.add_argument("--inf_llm_topk", type=int, default=64,
+                        help="InfLLM: blocks attended per decode step (main sparsity dial).")
+    parser.add_argument("--inf_llm_block_size", type=int, default=32,
+                        help="InfLLM: tokens per block (retrieval granularity).")
+    parser.add_argument("--inf_llm_n_local", type=int, default=128,
+                        help="InfLLM: sliding-window of always-attended recent tokens. "
+                             "Upstream Llama-3 config uses 4096; shrinking this below ~1k "
+                             "tanks retrieval scores.")
+    parser.add_argument("--inf_llm_n_recent", type=int, default=None,
+                        help="InfLLM: output sliding window (defaults to n_local — byte-identical "
+                             "to upstream behavior). Must be <= n_local. When set < n_local, "
+                             "decouples the local-output window from the block-scoring horizon "
+                             "and ATTENUATES the local-attention output (output mass over keys "
+                             "in [n_recent, n_local) is zeroed; softmax is NOT renormalized), "
+                             "which can significantly degrade retrieval at long context.")
+    parser.add_argument("--inf_llm_n_init", type=int, default=32,
+                        help="InfLLM: sink token count (upstream Llama-3 default: 128).")
     parser.add_argument("--inf_llm_repr_topk", type=int, default=4,
                         help="InfLLM: representative tokens per block.")
-    parser.add_argument("--inf_llm_max_cached_block", type=int, default=32,
-                        help="InfLLM: GPU block cache size.")
+    parser.add_argument("--inf_llm_max_cached_block", type=int, default=64,
+                        help="InfLLM: GPU block cache size (must be >= --inf_llm_topk).")
     parser.add_argument("--inf_llm_chunk_size", type=int, default=8192,
                         help="InfLLM: prefill chunk size for GreedySearch.")
+    parser.add_argument("--inf_llm_exc_block_size", type=int, default=None,
+                        help="InfLLM: per-iteration global-attention block size during prefill. "
+                             "Upstream asserts exc_block_size <= n_local. None => "
+                             "min(INF_LLM_CONFIG['exc_block_size'], n_local).")
+
+    # SeerAttention-R overrides (only used when --mode seer_attention).
+    # NOTE: "seer_attention" in this script refers to the DECODE-time SeerAttention-R
+    # (AttnGates) baseline, not the prefill-sparse variant. CLI takes precedence
+    # over baselines/seer_attn/config.py.
+    parser.add_argument("--seer_model", type=str,
+                        default="SeerAttention/SeerAttention-Decode-Qwen3-8B-AttnGates",
+                        help="SeerAttention-R AttnGates checkpoint (HF Hub ID or local path).")
+    parser.add_argument("--seerattn_sparsity_method", type=str, default="token_budget",
+                        choices=["token_budget", "threshold"],
+                        help="Decode sparsity method. "
+                             "'token_budget' selects top-k blocks per step (k = "
+                             "token_budget // gate_block_size). 'threshold' keeps blocks whose "
+                             "gate softmax score exceeds SEER_ATTN_CONFIG['threshold']. "
+                             "Note: 'nz_ratio' is prefill-only and rejected here.")
+    parser.add_argument("--seerattn_token_budget", type=int, default=2048,
+                        help="Active tokens per decode step (only used when "
+                             "sparsity_method='token_budget'). Internally rounded to "
+                             "block_budget = token_budget // gate_block_size; pass a multiple "
+                             "of gate_block_size (default 64) to avoid truncation.")
+    parser.add_argument("--seerattn_gate_block_size", type=int, default=64,
+                        choices=[16, 32, 64],
+                        help="SeerAttention-R gate block size (= sparse-decode tile size). "
+                             "Default 64 matches the released SeerAttention/SeerAttention-Decode-* "
+                             "AttnGates checkpoints. Overriding to 16 or 32 feeds the gate K-pool "
+                             "reps at a different granularity than it was trained on, so accuracy "
+                             "degrades. Useful only as an ablation/sanity sweep.")
+
+    # Multipole Attention overrides (only used when --mode multipole_attention).
+    # CLI takes precedence over baselines/multipole_attn/config.py.
+    # use_centroids is intentionally not exposed: it is always True for this mode.
+    parser.add_argument("--multipole_percent_clusters_lst", type=float, nargs="+", default=[3.125],
+                        help="Multipole: percentage of keys retained as centroids per hierarchy "
+                             "level (one float per level; e.g. '6.25' for single-level, "
+                             "'6.25 25.0' for two-level). "
+                             "3.125 => 100/3.125=32 tok/page.")
+    parser.add_argument("--multipole_percentiles_lst", type=int, nargs="+", default=[2048],
+                        help="Multipole: token-budget threshold per level "
+                             "(same length as --multipole_percent_clusters_lst). "
+                             "=> token budget.")
+    parser.add_argument("--multipole_use_replacement", type=_str2bool, default=False,
+                        help="Multipole: if True, unselected tokens contribute via centroid "
+                             "value approximation; if False, dropped.")
+    parser.add_argument("--multipole_cluster_interval", type=int, default=32,
+                        help="Multipole: tokens between re-clusterings during generation.")
 
     args = parser.parse_args()
 
@@ -166,15 +233,36 @@ def parse_args():
             args.run_name = f"{tag}_rope_gap_{args.num_gaps}x{args.gap_size}"
         elif args.mode == "seer_attention":
             args.run_name = f"{tag}_seer_attention"
+            if args.seerattn_sparsity_method is not None:
+                args.run_name += f"_{args.seerattn_sparsity_method}"
+            if args.seerattn_token_budget is not None:
+                args.run_name += f"_b{args.seerattn_token_budget}"
+            if args.seerattn_gate_block_size != 64:
+                args.run_name += f"_bs{args.seerattn_gate_block_size}"
         elif args.mode == "multipole_attention":
             args.run_name = f"{tag}_multipole_attention"
+            if args.multipole_percent_clusters_lst is not None:
+                pct_str = "_".join(str(p) for p in args.multipole_percent_clusters_lst)
+                args.run_name += f"_pct{pct_str}"
+            if args.multipole_percentiles_lst is not None:
+                ptl_str = "_".join(str(p) for p in args.multipole_percentiles_lst)
+                args.run_name += f"_ptl{ptl_str}"
+            if args.multipole_use_replacement is not None:
+                args.run_name += f"_repl{args.multipole_use_replacement}"
+            if args.multipole_cluster_interval is not None:
+                args.run_name += f"_ci{args.multipole_cluster_interval}"
         elif args.mode == "quest_attention":
             args.run_name = f"{tag}_quest_ps{args.quest_page_size}_pb{args.quest_top_k}"
         elif args.mode == "duo_attention":
             args.run_name = f"{tag}_duo_attention"
         elif args.mode == "inf_llm":
-            args.run_name = (f"{tag}_inf_llm_nini{args.inf_llm_n_init}"
+            args.run_name = (f"{tag}_inf_llm_topk{args.inf_llm_topk}"
+                             f"_bs{args.inf_llm_block_size}"
+                             f"_nlocal{args.inf_llm_n_local}"
+                             f"_nini{args.inf_llm_n_init}"
                              f"_repr{args.inf_llm_repr_topk}")
+            if args.inf_llm_n_recent is not None:
+                args.run_name += f"_nrec{args.inf_llm_n_recent}"
         else:
             args.run_name = f"{tag}_page_attn_topk{args.top_k}T_{args.comp_kv_quant}"
 
@@ -497,10 +585,17 @@ def build_summary(results, args):
         summary["unselected_mode"] = args.unselected_mode
     elif args.mode == "seer_attention":
         from seer_attn.config import SEER_ATTN_CONFIG
-        summary["seer_attn_config"] = SEER_ATTN_CONFIG
+        summary["seer_attn_config"] = dict(SEER_ATTN_CONFIG)
+        if args.seer_model is not None:
+            summary["seer_attn_config"]["seer_model"] = args.seer_model
+        if args.seerattn_sparsity_method is not None:
+            summary["seer_attn_config"]["sparsity_method"] = args.seerattn_sparsity_method
+        if args.seerattn_token_budget is not None:
+            summary["seer_attn_config"]["token_budget"] = args.seerattn_token_budget
+        if args.seerattn_gate_block_size is not None:
+            summary["seer_attn_config"]["seerattn_gate_block_size"] = args.seerattn_gate_block_size
     elif args.mode == "multipole_attention":
-        from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
-        summary["multipole_attn_config"] = MULTIPOLE_ATTN_CONFIG
+        summary["multipole_attn_config"] = getattr(args, "_multipole_cfg", None)
     elif args.mode == "quest_attention":
         from quest_attn.config import QUEST_ATTN_CONFIG
         summary["quest_attn_config"] = {
@@ -730,8 +825,18 @@ def main():
     elif args.mode == "multipole_attention":
         from multipole_attn import replace_attn_multipole
         from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
-        MULTIPOLE_ATTN_CONFIG["base_model"] = args.base_model
-        replace_attn_multipole(MULTIPOLE_ATTN_CONFIG)
+        cfg = dict(MULTIPOLE_ATTN_CONFIG)
+        cfg["base_model"] = args.base_model
+        if args.multipole_percent_clusters_lst is not None:
+            cfg["percent_clusters_lst"] = list(args.multipole_percent_clusters_lst)
+        if args.multipole_percentiles_lst is not None:
+            cfg["percentiles_lst"] = list(args.multipole_percentiles_lst)
+        if args.multipole_use_replacement is not None:
+            cfg["use_replacement"] = args.multipole_use_replacement
+        if args.multipole_cluster_interval is not None:
+            cfg["cluster_interval"] = args.multipole_cluster_interval
+        args._multipole_cfg = cfg
+        replace_attn_multipole(cfg)
     elif args.mode == "duo_attention":
         pass  # DuoAttention patches per-instance forwards post-load
     elif args.mode == "inf_llm":
@@ -744,15 +849,29 @@ def main():
         from seer_attn.config import SEER_ATTN_CONFIG
         from seer_attn import SeerDecodingQwen3ForCausalLM
 
-        seer_model = SEER_ATTN_CONFIG["seer_model"]
+        seer_model = args.seer_model or SEER_ATTN_CONFIG["seer_model"]
+        sparsity_method = args.seerattn_sparsity_method or SEER_ATTN_CONFIG["sparsity_method"]
+        token_budget = (args.seerattn_token_budget
+                        if args.seerattn_token_budget is not None
+                        else SEER_ATTN_CONFIG["token_budget"])
         print(f"Loading SeerAttention-R model: {seer_model}")
+        if args.seer_model is not None:
+            print(f"  Override: seer_model={args.seer_model}")
+        if args.seerattn_sparsity_method is not None:
+            print(f"  Override: seerattn_sparsity_method={args.seerattn_sparsity_method}")
+        if args.seerattn_token_budget is not None:
+            print(f"  Override: seerattn_token_budget={args.seerattn_token_budget}")
+        if args.seerattn_gate_block_size != 64:
+            print(f"  Override: seerattn_gate_block_size={args.seerattn_gate_block_size} "
+                  f"(checkpoint default is 64; ablation only)")
         model = SeerDecodingQwen3ForCausalLM.from_pretrained(
             seer_model,
             torch_dtype=torch.bfloat16,
-            seerattn_sparsity_method=SEER_ATTN_CONFIG["sparsity_method"],
-            seerattn_token_budget=SEER_ATTN_CONFIG["token_budget"],
+            seerattn_sparsity_method=sparsity_method,
+            seerattn_token_budget=token_budget,
             seerattn_threshold=SEER_ATTN_CONFIG["threshold"],
             seerattn_start_layer=SEER_ATTN_CONFIG["start_layer"],
+            seerattn_gate_block_size=args.seerattn_gate_block_size,
             rope_scaling={
                 "rope_type": "yarn",
                 "factor": 4.0,
@@ -855,10 +974,18 @@ def main():
             from infllm.config import INF_LLM_CONFIG
             assert_llama_only(args.base_model)
             INF_LLM_CONFIG["base_model"] = args.base_model
+            INF_LLM_CONFIG["topk"] = args.inf_llm_topk
+            INF_LLM_CONFIG["block_size"] = args.inf_llm_block_size
+            INF_LLM_CONFIG["n_local"] = args.inf_llm_n_local
             INF_LLM_CONFIG["n_init"] = args.inf_llm_n_init
             INF_LLM_CONFIG["repr_topk"] = args.inf_llm_repr_topk
             INF_LLM_CONFIG["max_cached_block"] = args.inf_llm_max_cached_block
             INF_LLM_CONFIG["chunk_size"] = args.inf_llm_chunk_size
+            INF_LLM_CONFIG["n_recent"] = args.inf_llm_n_recent
+            requested_exc = (args.inf_llm_exc_block_size
+                             if args.inf_llm_exc_block_size is not None
+                             else INF_LLM_CONFIG["exc_block_size"])
+            INF_LLM_CONFIG["exc_block_size"] = min(requested_exc, args.inf_llm_n_local)
             init_inf_llm(model, INF_LLM_CONFIG)
             args._inf_llm_generator = build_inf_llm_generator(model, tokenizer, INF_LLM_CONFIG)
 

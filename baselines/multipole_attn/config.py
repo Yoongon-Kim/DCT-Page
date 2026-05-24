@@ -19,16 +19,16 @@ MULTIPOLE_ATTN_CONFIG = {
     "use_centroids": True,
 
     # Percentage of keys to retain per hierarchy level (list, one per level)
-    "percent_clusters_lst": [6.25],
+    "percent_clusters_lst": [3.125],
 
     # Importance threshold per level (token budget for centroid selection)
-    "percentiles_lst": [1156],
+    "percentiles_lst": [2048],
 
     # Use centroid value approximation for non-selected tokens
-    "use_replacement": True,
+    "use_replacement": False,
 
     # Number of new tokens between re-clustering during generation
-    "cluster_interval": 128,
+    "cluster_interval": 32,
 
     # Tensor parallelism degree (1 = single GPU)
     "inference_tp": 1,

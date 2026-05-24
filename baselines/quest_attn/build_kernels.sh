@@ -31,6 +31,22 @@ if [ ! -f "$QUEST_KERNELS_DIR/3rdparty/flashinfer/CMakeLists.txt" ] || \
     git -C "$QUEST_REPO_DIR" submodule update --init --recursive kernels/3rdparty/flashinfer kernels/3rdparty/pybind
 fi
 
+# Apply local patches against upstream Quest (e.g. RAFT 25.06 API compat).
+# `git apply --check` is idempotent: if the patch is already applied it returns non-zero,
+# so we skip silently. Run from QUEST_REPO_DIR because patch paths are kernels/include/...
+for patch_file in "$SCRIPT_DIR"/patches/*.patch; do
+    [ -e "$patch_file" ] || continue
+    if git -C "$QUEST_REPO_DIR" apply --reverse --check "$patch_file" 2>/dev/null; then
+        echo "Patch already applied: $(basename "$patch_file")"
+    elif git -C "$QUEST_REPO_DIR" apply --check "$patch_file" 2>/dev/null; then
+        echo "Applying patch: $(basename "$patch_file")"
+        git -C "$QUEST_REPO_DIR" apply "$patch_file"
+    else
+        echo "ERROR: Patch does not apply cleanly to $QUEST_REPO_DIR: $(basename "$patch_file")"
+        exit 1
+    fi
+done
+
 cd "$SCRIPT_DIR/ops"
 
 # Clean previous build to avoid stale CMake cache issues

@@ -323,22 +323,45 @@ class Qwen3DecoderLayer(nn.Module):
 
 
 class Qwen3RotaryEmbedding(nn.Module):
+    inv_freq: torch.Tensor  # fix linting for `register_buffer`
+
     def __init__(self, config: SeerAttnQwen3Config, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type", "default"))
         else:
             self.rope_type = "default"
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        # transformers >=5.x removed "default" from ROPE_INIT_FUNCTIONS; fall back to the
+        # built-in default computation for it.
+        if self.rope_type == "default":
+            self.rope_init_fn = self.compute_default_rope_parameters
+        else:
+            self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        # Register BOTH buffers so `to_empty()` materializes them, and so the parent
+        # `PreTrainedModel._init_weights` RotaryEmbedding branch can `copy_` into them
+        # after meta-init materialization.
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
+        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+
+    @staticmethod
+    def compute_default_rope_parameters(
+        config=None,
+        device=None,
+        seq_len=None,
+    ):
+        base = config.rope_parameters["rope_theta"] if getattr(config, "rope_parameters", None) else config.rope_theta
+        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+        )
+        return inv_freq, 1.0
 
     def _dynamic_frequency_update(self, position_ids, device):
         """
@@ -414,6 +437,21 @@ class Qwen3PreTrainedModel(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, Qwen3RMSNorm):
             module.weight.data.fill_(1.0)
+        elif "RotaryEmbedding" in module.__class__.__name__ and hasattr(module, "original_inv_freq"):
+            # transformers 5.x initializes models inside `with torch.device("meta")`, so
+            # non-persistent buffers like `inv_freq` are materialized as empty memory by
+            # `to_empty()`. Recompute and copy the correct values in here. Mirrors the
+            # logic in `PreTrainedModel._init_weights` (modeling_utils.py).
+            rope_fn = (
+                module.compute_default_rope_parameters
+                if module.rope_type == "default"
+                else ROPE_INIT_FUNCTIONS[module.rope_type]
+            )
+            buffer_value, _ = rope_fn(module.config)
+            buffer_value = buffer_value.to(module.inv_freq.device)
+            with torch.no_grad():
+                module.inv_freq.copy_(buffer_value)
+                module.original_inv_freq.copy_(buffer_value)
 
 
 class Qwen3Model(Qwen3PreTrainedModel):
