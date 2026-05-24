@@ -8,7 +8,8 @@ class InferenceController:
     def __init__(
         self,
         num_layers,
-        num_heads,
+        num_qo_heads,
+        num_kv_heads,
         head_dim,
         page_size,
         page_budget, # Real page budget including the last page
@@ -17,9 +18,12 @@ class InferenceController:
         device,
     ):
         max_kv_pages_num = (max_seq_len + page_size - 1) // page_size
+        # KV pool and per-page min/max metadata are stored at num_kv_heads.
+        # GQA mapping (q_head -> kv_head = q_head // num_kv_groups) is handled
+        # inside FlashInfer's MaxPossibleSample / BatchPrefill / BatchDecode kernels.
         self.kv_cache = KvCache(
             num_layers=num_layers,
-            num_heads=num_heads,
+            num_heads=num_kv_heads,
             head_dim=head_dim,
             max_seq_len=max_seq_len,
             page_size=page_size,
@@ -28,7 +32,7 @@ class InferenceController:
         )
         self.metadata_cache = KvCache(
             num_layers=num_layers,
-            num_heads=num_heads,
+            num_heads=num_kv_heads,
             head_dim=head_dim,
             max_seq_len=max_kv_pages_num,
             page_size=page_size,
@@ -39,7 +43,10 @@ class InferenceController:
         self.device = device
         self.dtype = dtype
 
-        self.num_heads = num_heads
+        self.num_qo_heads = num_qo_heads
+        self.num_kv_heads = num_kv_heads
+        # Estimate/topk/sparse-decode are keyed by qo head (per-query top-k page selection).
+        self.num_heads = num_qo_heads  # backward-compat alias used by decode_estimate wrapper
         self.head_dim = head_dim
         self.page_size = page_size
 
@@ -121,8 +128,8 @@ class InferenceController:
 
             self._decode_handler.begin_forward(
                 self.kv_indptr_for_approx_decode,
-                self.num_heads,
-                self.num_heads,
+                self.num_qo_heads,
+                self.num_kv_heads,
                 self.head_dim,
                 self.page_size,
                 self.dtype

@@ -28,33 +28,38 @@ void estimate_attn_score(torch::Tensor q,
 	CHECK_EQ(metadata_indices.scalar_type(), torch::kInt32);
 	#endif
 
-	size_t num_heads = q.size(1);
+	size_t num_qo_heads = q.size(1);
 	size_t head_dim = q.size(2);
+	size_t num_kv_heads;
 	size_t page_size;
 
 	QKVLayout kv_layout = static_cast<QKVLayout>(layout);
 	if(kv_layout == QKVLayout::kHND) {
+		num_kv_heads = metadata_data.size(2);
 		page_size = metadata_data.size(3);
 		#ifdef BSK_TORCH_CHECK
-		CHECK_EQ(metadata_data.size(2), num_heads);
 		CHECK_EQ(metadata_data.size(4), head_dim);
 		#endif
 	} else {
 		page_size = metadata_data.size(2);
+		num_kv_heads = metadata_data.size(3);
 		#ifdef BSK_TORCH_CHECK
-		CHECK_EQ(metadata_data.size(3), num_heads);
 		CHECK_EQ(metadata_data.size(4), head_dim);
 		#endif
 	}
 
-	// size_t output_len = (metadata_indices.size(0) - 1) * page_size + metadata_last_page_len - 1;
-	// torch::Tensor o = torch::empty(
-		// {static_cast<signed long>(num_heads), static_cast<signed long>(output_len)}, q.options());
-		
+	#ifdef BSK_TORCH_CHECK
+	TORCH_CHECK(num_qo_heads % num_kv_heads == 0,
+				"num_qo_heads (", num_qo_heads, ") must be a multiple of num_kv_heads (",
+				num_kv_heads, ")");
+	#endif
+
+	// MaxPossibleSampleWithPagedKVCache is GQA-aware: grid is (batch, num_kv_heads)
+	// and each block unrolls num_qo_heads / num_kv_heads query heads per kv head.
 	bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
 		SWITCH_LAYOUT(kv_layout, KV_LAYOUT, {
 			paged_kv_t<PageStorage::kIndices, KV_LAYOUT, c_type, int32_t> paged_kv(
-				num_heads,
+				num_kv_heads,
 				page_size,
 				head_dim,
 				batch_size,
@@ -72,7 +77,7 @@ void estimate_attn_score(torch::Tensor q,
 												  int32_t>(static_cast<c_type*>(q.data_ptr()),
 														   paged_kv,
 														   static_cast<c_type*>(o.data_ptr()),
-														   num_heads,
+														   num_qo_heads,
 														   /*rotary_mode*/ RotaryMode::kNone);
 			TORCH_CHECK(status == cudaSuccess,
 						"Estimate_attn_score failed with error code ",

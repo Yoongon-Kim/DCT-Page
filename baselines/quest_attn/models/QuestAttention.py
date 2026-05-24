@@ -150,14 +150,11 @@ class QuestAttention(nn.Module):
         key_states = key_states.view(q_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(q_len, self.num_key_value_heads, self.head_dim)
 
-        # Quest's CUDA kernels (estimate, append_kv, RoPE) assume num_kv_heads == num_qo_heads.
-        # For GQA models (Llama-3.1, Qwen3) the metadata-vs-pool head-count check fails because
-        # estimate.cu reads num_heads from q (qo=32) while page.cu reads from k (kv=8).
-        # Replicate K/V to qo-heads before RoPE/append — same approach upstream's simulated
-        # path uses. Costs num_kv_groups× extra KV memory; algorithmically equivalent.
-        if self.num_key_value_groups > 1:
-            key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
-            value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
+        # GQA support: KV pool and metadata cache are allocated at num_kv_heads.
+        # FlashInfer's MaxPossibleSampleWithPagedKVCache / BatchPrefill / BatchDecode kernels
+        # take num_qo_heads and num_kv_heads separately and dispatch via SWITCH_GQA_GROUP_SIZE.
+        # Quest's CUDA wrappers (estimate.cu, page.cu, approx_attn.cu) read both head counts
+        # from tensor shapes, so K/V are appended at native kv-head granularity (no replication).
 
         # Optional QK-norm (Qwen3 applies norm BEFORE RoPE)
         if self.q_norm is not None:

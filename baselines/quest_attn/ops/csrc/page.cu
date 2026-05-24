@@ -216,19 +216,19 @@ void apply_rope_in_place(torch::Tensor q,
 						 float rope_theta) {
 #ifdef BSK_TORCH_CHECK
 	// Note: input layout is always NHD. Not Paged.
-	CHECK_INPUT(q); // [seq_len, num_heads, head_dim]
-	CHECK_INPUT(k); // [seq_len, num_heads, head_dim]
+	CHECK_INPUT(q); // [seq_len, num_qo_heads, head_dim]
+	CHECK_INPUT(k); // [seq_len, num_kv_heads, head_dim]
 
 	CHECK_DIM(3, q);
 	CHECK_DIM(3, k);
 
 	CHECK_EQ(q.size(0), k.size(0));
-	CHECK_EQ(q.size(1), k.size(1));
 	CHECK_EQ(q.size(2), k.size(2));
 #endif
 
 	size_t seq_len = q.size(0);
-	size_t num_heads = q.size(1);
+	size_t num_qo_heads = q.size(1);
+	size_t num_kv_heads = k.size(1);
 	size_t head_dim = q.size(2);
 
 	bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
@@ -236,8 +236,8 @@ void apply_rope_in_place(torch::Tensor q,
 														  static_cast<c_type*>(k.data_ptr()),
 														  seq_len,
 														  past_kv_len,
-														  num_heads,
-														  num_heads,
+														  num_qo_heads,
+														  num_kv_heads,
 														  head_dim,
 														  rope_scale,
 														  rope_theta,
