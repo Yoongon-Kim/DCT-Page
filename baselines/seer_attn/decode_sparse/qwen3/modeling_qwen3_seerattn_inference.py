@@ -25,6 +25,7 @@ from transformers.generation import GenerationMixin
 
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
+from transformers import initialization as hf_init
 # from transformers.processing_utils import Unpack
 from transformers.utils import (
     logging,
@@ -426,17 +427,24 @@ class Qwen3PreTrainedModel(PreTrainedModel):
     _supports_attention_backend = True
 
     def _init_weights(self, module):
+        # transformers 5.x calls `_init_weights` on EVERY module during
+        # `_initialize_missing_keys`, not only on missing-key modules as 4.x did.
+        # Using raw `.data.normal_()`/`.fill_()` here would clobber checkpoint
+        # weights that were just loaded. The `hf_init.*` helpers respect the
+        # per-parameter `_is_hf_initialized` flag (set by the loader on loaded
+        # tensors), so they no-op on loaded params and only initialize fresh ones.
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
+            hf_init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
-                module.bias.data.zero_()
+                hf_init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, Qwen3RMSNorm):
-            module.weight.data.fill_(1.0)
+            hf_init.normal_(module.weight, mean=0.0, std=std)
+            if module.padding_idx is not None and not getattr(module.weight, "_is_hf_initialized", False):
+                hf_init.zeros_(module.weight[module.padding_idx])
+        elif "RMSNorm" in module.__class__.__name__:
+            if getattr(module, "weight", None) is not None:
+                hf_init.ones_(module.weight)
         elif "RotaryEmbedding" in module.__class__.__name__ and hasattr(module, "original_inv_freq"):
             # transformers 5.x initializes models inside `with torch.device("meta")`, so
             # non-persistent buffers like `inv_freq` are materialized as empty memory by
@@ -449,9 +457,8 @@ class Qwen3PreTrainedModel(PreTrainedModel):
             )
             buffer_value, _ = rope_fn(module.config)
             buffer_value = buffer_value.to(module.inv_freq.device)
-            with torch.no_grad():
-                module.inv_freq.copy_(buffer_value)
-                module.original_inv_freq.copy_(buffer_value)
+            hf_init.copy_(module.inv_freq, buffer_value)
+            hf_init.copy_(module.original_inv_freq, buffer_value)
 
 
 class Qwen3Model(Qwen3PreTrainedModel):

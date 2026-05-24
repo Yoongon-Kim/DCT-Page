@@ -39,6 +39,7 @@ from transformers.modeling_outputs import (
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
+from transformers import initialization as hf_init
 # from transformers.processing_utils import Unpack
 from transformers.utils import (
     # LossKwargs,
@@ -410,17 +411,24 @@ class SeerAttnQwen2PreTrainedModel(PreTrainedModel):
     _supports_attention_backend = True
 
     def _init_weights(self, module):
+        # transformers 5.x calls `_init_weights` on every module after loading;
+        # use the flag-aware helpers so checkpoint values aren't clobbered.
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
+            hf_init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
-                module.bias.data.zero_()
+                hf_init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
+            hf_init.normal_(module.weight, mean=0.0, std=std)
+            if module.padding_idx is not None and not getattr(module.weight, "_is_hf_initialized", False):
+                hf_init.zeros_(module.weight[module.padding_idx])
         elif isinstance(module, MultiHeadLinear):
-            module.weight.data.normal_(mean=0.0, std=std)
+            hf_init.normal_(module.weight, mean=0.0, std=std)
+        elif "RMSNorm" in module.__class__.__name__ or "LayerNorm" in module.__class__.__name__:
+            if getattr(module, "weight", None) is not None:
+                hf_init.ones_(module.weight)
+            if getattr(module, "bias", None) is not None:
+                hf_init.zeros_(module.bias)
         elif "RotaryEmbedding" in module.__class__.__name__ and hasattr(module, "original_inv_freq"):
             # transformers 5.x initializes models inside `with torch.device("meta")`, so
             # non-persistent buffers like `inv_freq` are materialized as empty memory by
@@ -433,9 +441,8 @@ class SeerAttnQwen2PreTrainedModel(PreTrainedModel):
             )
             buffer_value, _ = rope_fn(module.config)
             buffer_value = buffer_value.to(module.inv_freq.device)
-            with torch.no_grad():
-                module.inv_freq.copy_(buffer_value)
-                module.original_inv_freq.copy_(buffer_value)
+            hf_init.copy_(module.inv_freq, buffer_value)
+            hf_init.copy_(module.original_inv_freq, buffer_value)
 
 
 class SeerAttnQwen2Model(SeerAttnQwen2PreTrainedModel):
