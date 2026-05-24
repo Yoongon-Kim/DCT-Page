@@ -8,3 +8,4 @@ baselines/quest_attn/ops/build/
 baselines/quest_attn/_kernels*.so
 A_*/
 result*/
+.omc/
