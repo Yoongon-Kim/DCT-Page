@@ -448,7 +448,7 @@ def parse_args():
                         help="Max samples per task (-1 = all)")
 
     # Output
-    parser.add_argument("--output_dir", type=str, default="result/longbench_v1")
+    parser.add_argument("--output_dir", type=str, default="results/longbench_v1")
     parser.add_argument("--run_name", type=str, default=None)
 
     # Quest baseline (--mode quest_attention) — separate from DCT's --page_size/--top_k.
@@ -579,33 +579,24 @@ def parse_args():
 # ---------------------------------------------------------------------------
 # Per-task evaluation
 # ---------------------------------------------------------------------------
-def evaluate_task(model, tokenizer, task, dataset, args):
-    """Evaluate a single LongBench task. Returns list of result dicts."""
-    run_dir = os.path.join(args.output_dir, args.run_name)
-    os.makedirs(run_dir, exist_ok=True)
-    output_path = os.path.join(run_dir, f"{task}.jsonl")
-
+def evaluate_task(model, tokenizer, task, dataset, args, out_f, completed_pairs):
+    """Evaluate a single LongBench task. Appends to shared out_f. Returns list of NEW result dicts."""
     max_gen = (args.max_new_tokens_override
                if args.max_new_tokens_override > 0
                else TASK_MAX_NEW_TOKENS.get(task, 64))
 
-    # Resume support
-    completed_ids = set()
-    if os.path.exists(output_path):
-        with open(output_path, "r") as f:
-            for line in f:
-                r = json.loads(line)
-                completed_ids.add(r["_id"])
-        print(f"  Resuming {task}: {len(completed_ids)} already done")
+    n_existing = sum(1 for p in completed_pairs if p[0] == task)
+    if n_existing:
+        print(f"  Resuming {task}: {n_existing} already done")
 
     samples = list(dataset)
     if args.num_samples > 0:
         samples = samples[:args.num_samples]
 
-    out_f = open(output_path, "a")
+    new_results = []
 
     for item in tqdm(samples, desc=f"  {task}"):
-        if item["_id"] in completed_ids:
+        if (task, item["_id"]) in completed_pairs:
             continue
 
         prompt_text = build_prompt(item["context"], item["input"], task)
@@ -705,16 +696,9 @@ def evaluate_task(model, tokenizer, task, dataset, args):
         }
         out_f.write(json.dumps(result, ensure_ascii=False) + "\n")
         out_f.flush()
+        new_results.append(result)
 
-    out_f.close()
-
-    # Reload all results (including previously completed) for final stats
-    all_results = []
-    with open(output_path, "r") as f:
-        for line in f:
-            all_results.append(json.loads(line))
-
-    return all_results
+    return new_results
 
 
 # ---------------------------------------------------------------------------
@@ -1138,8 +1122,26 @@ def main():
         from dct_page_attention import _init_upstream_fi_build_kwargs
         _init_upstream_fi_build_kwargs(model)
 
-    # Evaluate each task
-    all_task_results = {}
+    # Evaluate each task — single shared results.jsonl across all tasks (v2-style).
+    run_dir = os.path.join(args.output_dir, args.run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    output_path = os.path.join(run_dir, "results.jsonl")
+
+    all_task_results = {task: [] for task in args.tasks}
+    completed_pairs = set()
+    if os.path.exists(output_path):
+        with open(output_path, "r") as f:
+            for line in f:
+                r = json.loads(line)
+                completed_pairs.add((r["task"], r["_id"]))
+                if r["task"] in all_task_results:
+                    all_task_results[r["task"]].append(r)
+        print(f"Resuming: {len(completed_pairs)} samples already done")
+
+    out_f = open(output_path, "a")
+
+    task_scores = {}
+    summary_csv_path = os.path.join(run_dir, "summary.csv")
     for task in args.tasks:
         print(f"\n--- Loading task: {task} ---")
         local_candidates = [
@@ -1153,14 +1155,17 @@ def main():
         else:
             ds = load_dataset("THUDM/LongBench", task, split="test")
         print(f"  {len(ds)} samples")
-        all_task_results[task] = evaluate_task(model, tokenizer, task, ds, args)
+        new_results = evaluate_task(
+            model, tokenizer, task, ds, args, out_f, completed_pairs
+        )
+        all_task_results[task].extend(new_results)
 
-        run_dir = os.path.join(args.output_dir, args.run_name)
-        os.makedirs(run_dir, exist_ok=True)
         task_scores, summary_path, summary_csv_path = write_run_summary(
             run_dir, args.run_name, args.mode, args.base_model, all_task_results, args
         )
         print(f"  Partial summary updated: {summary_csv_path}")
+
+    out_f.close()
 
     run_dir = os.path.join(args.output_dir, args.run_name)
     os.makedirs(run_dir, exist_ok=True)

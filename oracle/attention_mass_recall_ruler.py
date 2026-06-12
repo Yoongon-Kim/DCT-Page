@@ -1835,16 +1835,12 @@ class PagedMassRatioSweepRecorder:
             )
             quest_selected = quest_sel_gpu.float().cpu().tolist()
 
-            infllm_sel_gpu = compute_infllm_selected_mass_sweep(
-                query_states, paged_k, page_mass_gpu,
-                top_k=actual_top_k,
-                repr_topks=self.comp_sizes,
-                num_kv_groups=num_kv_groups,
-                group_agg_method=self.group_agg_method,
-            )
-            infllm_selected = {
-                c: t.float().cpu().tolist() for c, t in infllm_sel_gpu.items()
-            }
+            # InfLLM block-rep scoring needs accumulated local-attention column
+            # scores collected during prefill, which this sweep recorder does
+            # not channel through. Emit a zero placeholder so aggregation and
+            # summary.json keep their shape; the plot path is given None and
+            # omits the InfLLM curve entirely.
+            infllm_selected = {c: [0.0] * H_q for c in self.comp_sizes}
 
             mass_topk_sel_gpu = compute_mass_topk_selected_mass(
                 page_mass_gpu, top_k=actual_top_k,
@@ -2030,13 +2026,55 @@ def _aggregate_metric_dicts(dicts: list[dict[str, float]]) -> dict[str, float]:
 # Per-run summary figure (written next to summary.json on every dense run)
 # ---------------------------------------------------------------------------
 _PLOT_SELECTORS = [
-    ("proxy",      "DCT proxy",  "C0"),
-    ("quest",      "Quest",      "C1"),
-    ("shadowkv",   "ShadowKV",   "C2"),
-    ("infllm",     "InfLLM",     "C3"),
-    ("oracle_max", "oracle_max", "C4"),
-    ("mass_topk",  "mass-topk",  "0.4"),
+    ("proxy",      "DCT proxy",   "C0"),
+    ("quest",      "Quest",       "C1"),
+    ("shadowkv",   "ShadowKV",    "C2"),
+    ("infllm",     "InfLLM",      "C3"),
+    ("oracle_max", "Oracle max",  "C4"),
+    ("mass_topk",  "Mass top-K",  "0.4"),
 ]
+
+
+_MODEL_FAMILY_PRETTY = {"qwen3": "Qwen3", "qwen2": "Qwen2", "llama": "Llama"}
+_TASK_PRETTY = {
+    "niah_single_1": "NIAH Single 1",
+    "niah_single_2": "NIAH Single 2",
+    "niah_single_3": "NIAH Single 3",
+    "niah_multikey_1": "NIAH MultiKey 1",
+    "niah_multikey_2": "NIAH MultiKey 2",
+    "niah_multikey_3": "NIAH MultiKey 3",
+    "niah_multivalue": "NIAH MultiValue",
+    "niah_multiquery": "NIAH MultiQuery",
+    "vt": "VT",
+    "cwe": "CWE",
+    "fwe": "FWE",
+    "qa_1": "QA 1",
+    "qa_2": "QA 2",
+}
+
+
+def _pretty_model_family(name: str) -> str:
+    return _MODEL_FAMILY_PRETTY.get(name.lower(), name.capitalize())
+
+
+def _pretty_task(name: str) -> str:
+    return _TASK_PRETTY.get(name, name.replace("_", " ").title())
+
+
+def _pretty_tasks(task_names: list[str]) -> str:
+    if not task_names:
+        return ""
+    if len(task_names) == 1:
+        return _pretty_task(task_names[0])
+    return f"{len(task_names)} tasks"
+
+
+def _format_plot_title(model_family: str, seq_len, task_names: list[str]) -> str:
+    base = f"{_pretty_model_family(model_family)} @ {seq_len} tokens"
+    tasks_label = _pretty_tasks(task_names)
+    if tasks_label:
+        base += f" — {tasks_label}"
+    return base
 
 
 def _render_run_summary_plot(run_dir: Path, summary: dict) -> Path | None:
@@ -2072,22 +2110,22 @@ def _render_run_summary_plot(run_dir: Path, summary: dict) -> Path | None:
     # ----- left panel: grouped bars per selector -----
     ax = axes[0]
     metrics = [
-        ("mass_recall",      "mass_recall_{key}"),
-        ("paged_mass_ratio", "paged_mass_ratio_{key}"),
-        ("output_fidelity",  "output_fidelity_{key}"),
+        ("Mass recall",       "mass_recall_{key}",      "mass_recall"),
+        ("Paged mass ratio",  "paged_mass_ratio_{key}", "paged_mass_ratio"),
+        ("Output fidelity",   "output_fidelity_{key}",  "output_fidelity"),
     ]
     n_metric = len(metrics)
     n_sel = len(_PLOT_SELECTORS)
     bar_w = 0.8 / n_metric
     x = np.arange(n_sel)
     metric_hatches = ["", "//", "xx"]
-    for m_idx, (m_name, tmpl) in enumerate(metrics):
+    for m_idx, (m_name, tmpl, m_id) in enumerate(metrics):
         vals = []
         for key, _, _ in _PLOT_SELECTORS:
-            if m_name == "paged_mass_ratio" and key in {"oracle_max", "mass_topk"}:
+            if m_id == "paged_mass_ratio" and key in {"oracle_max", "mass_topk"}:
                 vals.append(float("nan"))
                 continue
-            if m_name == "output_fidelity" and key == "mass_topk":
+            if m_id == "output_fidelity" and key == "mass_topk":
                 vals.append(float("nan"))
                 continue
             vals.append(_safe(tmpl.format(key=key)))
@@ -2114,7 +2152,7 @@ def _render_run_summary_plot(run_dir: Path, summary: dict) -> Path | None:
     from matplotlib.patches import Patch
     legend_handles = [
         Patch(facecolor="0.8", edgecolor="black", hatch=h, label=name)
-        for (name, _), h in zip(metrics, metric_hatches)
+        for (name, _, _), h in zip(metrics, metric_hatches)
     ]
     ax.legend(handles=legend_handles, loc="lower right", fontsize=8)
 
@@ -2122,7 +2160,7 @@ def _render_run_summary_plot(run_dir: Path, summary: dict) -> Path | None:
     ax.axhline(floor, color="red", alpha=0.4, linestyle="--", linewidth=1)
     ax.text(
         n_sel - 0.5, floor + 0.005,
-        f"sink+recent floor = {floor:.3f}",
+        f"Sink + recent floor = {floor:.3f}",
         ha="right", va="bottom", fontsize=7, color="red", alpha=0.8,
     )
 
@@ -2160,7 +2198,7 @@ def _render_run_summary_plot(run_dir: Path, summary: dict) -> Path | None:
             ax.scatter(
                 [comp_size], [float(proxy_ratio)],
                 color="C0", s=110, edgecolor="black", zorder=4,
-                label=f"DCT proxy @ comp_size={comp_size} = {float(proxy_ratio):.3f}",
+                label=f"DCT proxy @ c = {comp_size}: {float(proxy_ratio):.3f}",
             )
             ax.annotate(
                 f"{float(proxy_ratio):.3f}",
@@ -2170,34 +2208,36 @@ def _render_run_summary_plot(run_dir: Path, summary: dict) -> Path | None:
             )
 
         ax.axhline(1.0, color="red", linestyle=":", alpha=0.4,
-                   label="paged-mass ceiling")
+                   label="Paged-mass ceiling")
     else:
         ax.text(0.5, 0.5, "comp_size missing in config",
                 transform=ax.transAxes, ha="center", va="center", color="0.4")
 
-    ax.set_xlabel(f"comp_size (# representative tokens, page_size={page_size})")
-    ax.set_ylabel("paged_mass_ratio")
-    ax.set_title("paged_mass_ratio vs comp_size", fontsize=11)
+    ax.set_xlabel(f"Compressed-token budget c  (page size = {page_size})")
+    ax.set_ylabel("Paged mass ratio")
+    ax.set_title("Paged mass ratio vs. compressed-token budget", fontsize=11)
     ax.set_ylim(0.0, 1.05)
     ax.grid(True, alpha=0.3)
     ax.legend(loc="lower right", fontsize=8)
 
-    suptitle_bits = [
-        cfg.get("base_model", "?"),
-        f"seq_len={cfg.get('seq_len', '?')}",
-        f"ps={cfg.get('page_size', '?')}",
-        f"K={cfg.get('top_k', '?')}",
-        f"c={cfg.get('comp_size', '?')}",
-        f"q={cfg.get('comp_kv_quant', '?')}",
-    ]
+    base_model = cfg.get("base_model", "?")
+    if base_model != "?":
+        _, tokenizer_family = infer_model_family(base_model)
+        pretty_model = _pretty_model_family(tokenizer_family)
+    else:
+        pretty_model = base_model
     task_names = list(per_task.keys())
-    if task_names:
-        suptitle_bits.append(
-            "tasks=" + (task_names[0] if len(task_names) == 1
-                        else f"{len(task_names)} tasks")
-        )
-    fig.suptitle("attention_mass_recall_ruler — " + " | ".join(suptitle_bits),
-                 fontsize=10)
+    header = f"{pretty_model} @ {cfg.get('seq_len', '?')} tokens"
+    tasks_label = _pretty_tasks(task_names)
+    if tasks_label:
+        header += f" — {tasks_label}"
+    config_bits = [
+        f"page size = {cfg.get('page_size', '?')}",
+        f"top-K = {cfg.get('top_k', '?')}",
+        f"c = {cfg.get('comp_size', '?')}",
+        f"comp-KV quant = {cfg.get('comp_kv_quant', '?')}",
+    ]
+    fig.suptitle(f"{header}\n" + " · ".join(config_bits), fontsize=10)
     fig.tight_layout(rect=(0, 0, 1, 0.94))
 
     out = run_dir / "run_summary.png"
@@ -2253,10 +2293,10 @@ def _render_comp_size_sweep_plot(
         np.clip(ys_mean - proxy_std, 0.0, 1.0),
         np.clip(ys_mean + proxy_std, 0.0, 1.0),
         color="C0", alpha=0.18,
-        label="DCT proxy ±1σ across layers",
+        label="DCT proxy: ±1σ across layers",
     )
     ax.plot(xs, ys_mean, color="C0", linewidth=2.2, marker="o",
-            label="DCT proxy (mean over layers)")
+            label="DCT proxy: mean over layers")
 
     if infllm_per_layer_mean and infllm_overall_mean is not None:
         infllm_layers = np.array(
@@ -2273,10 +2313,10 @@ def _render_comp_size_sweep_plot(
             np.clip(ys_mean_inf - infllm_std, 0.0, 1.0),
             np.clip(ys_mean_inf + infllm_std, 0.0, 1.0),
             color="C2", alpha=0.15,
-            label="InfLLM ±1σ across layers (repr_topk=comp_size)",
+            label="InfLLM: ±1σ across layers (repr-topk = c)",
         )
         ax.plot(xs, ys_mean_inf, color="C2", linewidth=2.2, marker="s",
-                label="InfLLM (mean over layers)")
+                label="InfLLM: mean over layers")
 
     if quest_per_layer_mean and quest_overall_mean is not None:
         # Quest has no comp_size knob; band is a horizontal stripe at
@@ -2288,18 +2328,18 @@ def _render_comp_size_sweep_plot(
             max(quest_overall_mean - quest_std, 0.0),
             min(quest_overall_mean + quest_std, 1.0),
             color="C1", alpha=0.12,
-            label=f"Quest ±1σ across layers (σ={quest_std:.3f})",
+            label=f"Quest: ±1σ across layers (σ = {quest_std:.3f})",
         )
         ax.axhline(quest_overall_mean, color="C1", linewidth=2.2,
                    linestyle="-",
-                   label=f"Quest (mean over layers) = {quest_overall_mean:.3f}")
+                   label=f"Quest: mean over layers = {quest_overall_mean:.3f}")
 
     ax.axhline(1.0, color="red", alpha=0.3, linestyle="--",
-               label="paged-mass ceiling")
+               label="Paged-mass ceiling")
 
-    ax.set_xlabel(f"comp_size (lowpass cutoff; page_size={page_size})")
-    ax.set_ylabel("paged_mass_ratio_proxy")
-    ax.set_title(f"{title}\npaged_mass_ratio_proxy vs comp_size")
+    ax.set_xlabel(f"Compressed-token budget c  (page size = {page_size})")
+    ax.set_ylabel("Paged mass ratio")
+    ax.set_title(f"{title}\nPaged mass ratio vs. compressed-token budget")
     ax.set_ylim(0.0, 1.05)
     # Linear x-axis: comp_size is a token-budget count, so equal x-distance
     # should mean equal added bins. Log scale would compress the high-c jump
@@ -2704,14 +2744,14 @@ def _run_comp_size_sweep(args: argparse.Namespace) -> None:
             encoding="utf-8",
         )
 
-        title = f"{_model_family(args.base_model)} @ {args.seq_len} (page_size={args.page_size})"
+        title = _format_plot_title(_model_family(args.base_model), args.seq_len, list(args.tasks))
         _render_comp_size_sweep_plot(
             run_dir, ratio_per_layer, ratio_overall,
             comp_sizes, args.page_size, title,
             quest_per_layer_mean=quest_ratio_per_layer,
             quest_overall_mean=quest_ratio_overall,
-            infllm_per_layer_mean=infllm_ratio_per_layer,
-            infllm_overall_mean=infllm_ratio_overall,
+            infllm_per_layer_mean=None,
+            infllm_overall_mean=None,
         )
 
         elapsed = (time.time() - start_time) / 60

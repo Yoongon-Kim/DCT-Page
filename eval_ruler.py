@@ -158,7 +158,7 @@ def parse_args():
     parser.add_argument("--score_use_quest_minmax", action="store_true",
                         help="Use QUEST-style min/max key metadata scoring instead of compressed proxy scoring")
     parser.add_argument("--no_triton", action="store_true")
-    parser.add_argument("--attention_backend", type=str, default="upastream_flashinfer",
+    parser.add_argument("--attention_backend", type=str, default="sdpa",
                         choices=["sdpa", "upstream_flashinfer"],
                         help="Attention backend for page_attention mode. "
                              "'sdpa' (default): assemble + torch.scaled_dot_product_attention "

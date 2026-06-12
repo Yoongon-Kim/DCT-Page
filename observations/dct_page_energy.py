@@ -65,6 +65,36 @@ def default_run_name(args: argparse.Namespace) -> str:
     return base
 
 
+_MODEL_FAMILY_PRETTY = {"qwen3": "Qwen3", "qwen2": "Qwen2", "llama": "Llama"}
+_TASK_PRETTY = {
+    "niah_single_1": "NIAH Single 1",
+    "niah_single_2": "NIAH Single 2",
+    "niah_single_3": "NIAH Single 3",
+    "niah_multikey_1": "NIAH MultiKey 1",
+    "niah_multikey_2": "NIAH MultiKey 2",
+    "niah_multikey_3": "NIAH MultiKey 3",
+    "niah_multivalue": "NIAH MultiValue",
+    "niah_multiquery": "NIAH MultiQuery",
+    "vt": "VT",
+    "cwe": "CWE",
+    "fwe": "FWE",
+    "qa_1": "QA 1",
+    "qa_2": "QA 2",
+}
+
+
+def _pretty_model_family(name: str) -> str:
+    return _MODEL_FAMILY_PRETTY.get(name.lower(), name.capitalize())
+
+
+def _pretty_task(name: str) -> str:
+    return _TASK_PRETTY.get(name, name.replace("_", " ").title())
+
+
+def _format_plot_title(model_family: str, context_len, task: str) -> str:
+    return f"{_pretty_model_family(model_family)} @ {context_len} tokens — {_pretty_task(task)}"
+
+
 def load_samples(path: Path, num_samples: int) -> list[dict]:
     with path.open("r", encoding="utf-8") as fp:
         rows = [json.loads(line) for line in fp if line.strip()]
@@ -303,24 +333,24 @@ def render_plot(run_dir: Path, per_layer: list[dict], summary: dict, page_size: 
     kept_x = np.arange(1, page_size + 1)          # 1-indexed "number of bins kept" for the cumulative plot
     for r in per_layer:
         ax1.plot(bin_x, r["k_energy_fraction"], color="lightgray", linewidth=0.5)
-    ax1.plot(bin_x, summary["k_energy_fraction"], color="C0", linewidth=2, label="mean over layers")
+    ax1.plot(bin_x, summary["k_energy_fraction"], color="C0", linewidth=2, label="Mean over layers")
     ax1.set_yscale("log")
-    ax1.set_xlabel("DCT bin (low → high freq)")
-    ax1.set_ylabel("energy fraction")
-    ax1.set_title(f"{title}\nper-bin K energy (page_size={page_size})")
+    ax1.set_xlabel("DCT bin (low → high frequency)")
+    ax1.set_ylabel("Energy fraction")
+    ax1.set_title(f"{title}\nPer-bin K energy (page size = {page_size})")
     ax1.legend()
 
     for r in per_layer:
         ax2.plot(kept_x, r["k_cumulative"], color="lightgray", linewidth=0.5)
-    ax2.plot(kept_x, summary["k_cumulative"], color="C0", linewidth=2, label="mean over layers")
+    ax2.plot(kept_x, summary["k_cumulative"], color="C0", linewidth=2, label="Mean over layers")
     for c in HEADLINE_CUTOFFS:
         if c <= page_size:
             ax2.axvline(c, color="red", alpha=0.25, linestyle="--")
     ax2.axhline(0.9, color="black", alpha=0.3, linestyle=":")
     ax2.axhline(0.99, color="black", alpha=0.3, linestyle=":")
-    ax2.set_xlabel("number of low-frequency bins kept")
-    ax2.set_ylabel("cumulative energy retained")
-    ax2.set_title("cumulative K energy vs lowpass cutoff")
+    ax2.set_xlabel("Number of low-frequency bins kept")
+    ax2.set_ylabel("Cumulative energy retained")
+    ax2.set_title("Cumulative K energy vs. lowpass cutoff")
     ax2.set_ylim(0.0, 1.02)
     ax2.legend()
 
@@ -369,11 +399,11 @@ def render_per_layer_grid(
 
         ax_frac.plot(bin_x, r["k_energy_fraction"], color="C0", linewidth=1.2)
         ax_frac.set_yscale("log")
-        ax_frac.set_title(f"L{r['layer_idx']} fraction", fontsize=9)
+        ax_frac.set_title(f"Layer {r['layer_idx']} — fraction", fontsize=9)
         if row == nrows - 1:
             ax_frac.set_xlabel("DCT bin", fontsize=8)
         if col_pair == 0:
-            ax_frac.set_ylabel("energy frac", fontsize=8)
+            ax_frac.set_ylabel("Energy fraction", fontsize=8)
         ax_frac.tick_params(labelsize=7)
 
         ax_cum.plot(kept_x, r["k_cumulative"], color="C0", linewidth=1.2)
@@ -383,9 +413,9 @@ def render_per_layer_grid(
         ax_cum.axhline(0.9, color="black", alpha=0.3, linestyle=":")
         ax_cum.axhline(0.99, color="black", alpha=0.3, linestyle=":")
         ax_cum.set_ylim(0.0, 1.02)
-        ax_cum.set_title(f"L{r['layer_idx']} cumulative", fontsize=9)
+        ax_cum.set_title(f"Layer {r['layer_idx']} — cumulative", fontsize=9)
         if row == nrows - 1:
-            ax_cum.set_xlabel("bins kept", fontsize=8)
+            ax_cum.set_xlabel("Bins kept", fontsize=8)
         ax_cum.tick_params(labelsize=7)
 
     total_cells = nrows * layer_cols
@@ -395,7 +425,7 @@ def render_per_layer_grid(
         axes[row][2 * col_pair].set_visible(False)
         axes[row][2 * col_pair + 1].set_visible(False)
 
-    fig.suptitle(f"{title}\nper-layer K energy (page_size={page_size})", fontsize=11)
+    fig.suptitle(f"{title}\nPer-layer K energy (page size = {page_size})", fontsize=11)
     plt.tight_layout()
     fig.subplots_adjust(top=1.0 - 0.6 / max(nrows, 1))
     out = run_dir / "energy_curve_per_layer.png"
@@ -449,11 +479,11 @@ def render_per_head_grid(
 
         ax_frac.plot(bin_x, head_mean_frac[h], color="C0", linewidth=1.4)
         ax_frac.set_yscale("log")
-        ax_frac.set_title(f"head {h} fraction", fontsize=9)
+        ax_frac.set_title(f"Head {h} — fraction", fontsize=9)
         if row == nrows - 1:
             ax_frac.set_xlabel("DCT bin", fontsize=8)
         if col_pair == 0:
-            ax_frac.set_ylabel("energy frac", fontsize=8)
+            ax_frac.set_ylabel("Energy fraction", fontsize=8)
         ax_frac.tick_params(labelsize=7)
 
         ax_cum.plot(kept_x, head_mean_cum[h], color="C0", linewidth=1.4)
@@ -463,9 +493,9 @@ def render_per_head_grid(
         ax_cum.axhline(0.9, color="black", alpha=0.3, linestyle=":")
         ax_cum.axhline(0.99, color="black", alpha=0.3, linestyle=":")
         ax_cum.set_ylim(0.0, 1.02)
-        ax_cum.set_title(f"head {h} cumulative", fontsize=9)
+        ax_cum.set_title(f"Head {h} — cumulative", fontsize=9)
         if row == nrows - 1:
-            ax_cum.set_xlabel("bins kept", fontsize=8)
+            ax_cum.set_xlabel("Bins kept", fontsize=8)
         ax_cum.tick_params(labelsize=7)
 
     total_cells = nrows * head_cols
@@ -475,7 +505,7 @@ def render_per_head_grid(
         axes[row][2 * col_pair].set_visible(False)
         axes[row][2 * col_pair + 1].set_visible(False)
 
-    fig.suptitle(f"{title}\nper-head K energy (page_size={page_size})", fontsize=11)
+    fig.suptitle(f"{title}\nPer-head K energy (page size = {page_size})", fontsize=11)
     plt.tight_layout()
     fig.subplots_adjust(top=1.0 - 0.6 / max(nrows, 1))
     out = run_dir / "energy_curve_per_head.png"
@@ -528,8 +558,8 @@ def render_per_head_heatmap(
             norm=norm_frac,
             interpolation="nearest",
         )
-        ax_l.set_title(f"head {h} fraction", fontsize=8)
-        ax_l.set_ylabel("layer", fontsize=8)
+        ax_l.set_title(f"Head {h} — fraction", fontsize=8)
+        ax_l.set_ylabel("Layer", fontsize=8)
         if h == H - 1:
             ax_l.set_xlabel("DCT bin", fontsize=8)
         ax_l.tick_params(labelsize=7)
@@ -546,17 +576,17 @@ def render_per_head_heatmap(
         for c in HEADLINE_CUTOFFS:
             if c <= page_size:
                 ax_r.axvline(c - 0.5, color="red", alpha=0.5, linestyle="--", linewidth=0.8)
-        ax_r.set_title(f"head {h} cumulative", fontsize=8)
+        ax_r.set_title(f"Head {h} — cumulative", fontsize=8)
         if h == H - 1:
-            ax_r.set_xlabel("bins kept", fontsize=8)
+            ax_r.set_xlabel("Bins kept", fontsize=8)
         ax_r.tick_params(labelsize=7)
 
     if last_left is not None:
-        fig.colorbar(last_left, ax=axes[:, 0].tolist(), shrink=0.6, label="energy fraction")
+        fig.colorbar(last_left, ax=axes[:, 0].tolist(), shrink=0.6, label="Energy fraction")
     if last_right is not None:
-        fig.colorbar(last_right, ax=axes[:, 1].tolist(), shrink=0.6, label="cumulative")
+        fig.colorbar(last_right, ax=axes[:, 1].tolist(), shrink=0.6, label="Cumulative energy")
 
-    fig.suptitle(f"{title}\nper-head K energy heatmap (page_size={page_size})", fontsize=11)
+    fig.suptitle(f"{title}\nPer-head K energy heatmap (page size = {page_size})", fontsize=11)
     out = run_dir / "energy_curve_per_head_heatmap.png"
     plt.savefig(out, dpi=120, bbox_inches="tight")
     plt.close(fig)
@@ -610,9 +640,9 @@ def render_per_head_heatmap_norm(
             vmax=ac_vmax,
             interpolation="nearest",
         )
-        ax.set_title(f"head {h}", fontsize=9)
+        ax.set_title(f"Head {h}", fontsize=9)
         if h == 0:
-            ax.set_ylabel("layer", fontsize=8)
+            ax.set_ylabel("Layer", fontsize=8)
         ax.set_xlabel(f"DCT bin (1..{page_size - 1})", fontsize=8)
         ax.tick_params(labelsize=7)
 
@@ -621,11 +651,11 @@ def render_per_head_heatmap_norm(
             last_im,
             ax=axes[0, :].tolist(),
             shrink=0.7,
-            label=f"energy fraction (DC dropped, renormalized; vmax={ac_vmax:.3f})",
+            label=f"Energy fraction (DC dropped, renormalized; vmax = {ac_vmax:.3f})",
         )
 
     fig.suptitle(
-        f"{title}\nper-head AC-only K energy heatmap (page_size={page_size}, DC dropped)",
+        f"{title}\nPer-head AC-only K energy heatmap (page size = {page_size}, DC dropped)",
         fontsize=11,
     )
     out = run_dir / "energy_curve_head_heatmap_norm.png"
@@ -674,18 +704,18 @@ def render_layer_head_heatmap(
             vmax=1.0,
             interpolation="nearest",
         )
-        ax.set_title(f"cum @ {c}", fontsize=10)
-        ax.set_xlabel("kv-head", fontsize=9)
+        ax.set_title(f"Cumulative @ {c} bins", fontsize=10)
+        ax.set_xlabel("KV head", fontsize=9)
         if ci == 0:
-            ax.set_ylabel("layer", fontsize=9)
+            ax.set_ylabel("Layer", fontsize=9)
         ax.tick_params(labelsize=7)
 
     if last_im is not None:
-        fig.colorbar(last_im, ax=axes[0].tolist(), shrink=0.85, label="cumulative energy")
+        fig.colorbar(last_im, ax=axes[0].tolist(), shrink=0.85, label="Cumulative energy")
 
-    cv_str = ", ".join(f"{c}={head_cv.get(str(c), float('nan')):.3f}" for c in cutoffs)
+    cv_str = ", ".join(f"{c}: {head_cv.get(str(c), float('nan')):.3f}" for c in cutoffs)
     fig.suptitle(
-        f"{title}\nper-layer-head cum @ cutoffs (head_cv: {cv_str})",
+        f"{title}\nPer-(layer, head) cumulative energy at cutoffs (head CV — {cv_str})",
         fontsize=11,
     )
     out = run_dir / "energy_heatmap_layer_head.png"
@@ -706,7 +736,7 @@ def render_compare(run_dirs: list[Path]) -> None:
             summary = json.load(fp)
         with (rd / "config.json").open() as fp:
             cfg = json.load(fp)
-        label = cfg.get("model_family", rd.name)
+        label = _pretty_model_family(cfg.get("model_family", rd.name))
         cum = summary["k_cumulative"]
         if page_size is None:
             page_size = len(cum)
@@ -718,8 +748,8 @@ def render_compare(run_dirs: list[Path]) -> None:
     ax.axhline(0.9, color="black", alpha=0.3, linestyle=":")
     ax.axhline(0.99, color="black", alpha=0.3, linestyle=":")
     ax.set_ylim(0.0, 1.02)
-    ax.set_xlabel("number of low-frequency bins kept")
-    ax.set_ylabel("cumulative K energy retained")
+    ax.set_xlabel("Number of low-frequency bins kept")
+    ax.set_ylabel("Cumulative K energy retained")
     ax.set_title("K energy concentration across models")
     ax.legend()
     plt.tight_layout()
@@ -913,7 +943,7 @@ def run_measurement(args: argparse.Namespace) -> None:
     )
 
     if args.plot:
-        title = f"{model_family} @ {args.context_len} ({args.task})"
+        title = _format_plot_title(model_family, args.context_len, args.task)
         render_plot(run_dir, per_layer_rows, summary, args.page_size, title)
         render_per_layer_grid(run_dir, per_layer_rows, args.page_size, title)
         if args.granularity == "head" and summary_per_head is not None:
@@ -980,7 +1010,11 @@ def replot(run_dir: Path) -> None:
         for line in fp:
             if line.strip():
                 per_layer.append(json.loads(line))
-    title = f"{cfg.get('model_family', run_dir.name)} @ {cfg.get('context_len', '?')} ({cfg.get('task', '?')})"
+    title = _format_plot_title(
+        str(cfg.get("model_family", run_dir.name)),
+        cfg.get("context_len", "?"),
+        str(cfg.get("task", "?")),
+    )
     render_plot(run_dir, per_layer, summary, cfg["page_size"], title)
     render_per_layer_grid(run_dir, per_layer, cfg["page_size"], title)
 
