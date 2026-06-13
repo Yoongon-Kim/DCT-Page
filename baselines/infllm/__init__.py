@@ -2,8 +2,8 @@
 InfLLM baseline wrapper for DCT-Page.
 
 Self-contained — upstream package is vendored under `baselines/infllm/upstream/`.
-Targets transformers 5.2.0 in the DCT_Page conda env. The signature contract is
-documented in `baselines/infllm/upstream/utils/patch.py` (5.2.0
+Targets transformers 5.5.4 in the DCT_Page conda env. The signature contract is
+documented in `baselines/infllm/upstream/utils/patch.py` (transformers 5.x
 LlamaAttention.forward / LlamaModel.forward shapes; class-level patching).
 
 What this module does:
@@ -13,7 +13,7 @@ What this module does:
      instead of HF's Cache object.
 
 Llama 3.x only on the verification gate; Mistral/Qwen2 patch branches remain in
-patch.py for completeness but are untested on 5.2.0. Qwen3 is not supported
+patch.py for completeness but are untested on 5.5.4. Qwen3 is not supported
 (upstream Qwen2Attention lacks q_norm/k_norm).
 """
 

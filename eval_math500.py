@@ -64,7 +64,7 @@ QWEN3_SUPPORTED_MODES = {
 }
 LLAMA_ONLY_MODES = {"inf_llm"}
 UNSUPPORTED_MODES = {
-    "seer_prefill", "quest_attention", "duo_attention", "shadowkv",
+    "seer_prefill", "quest_attention", "duo_attention",
 }
 
 
@@ -155,7 +155,6 @@ def parse_args():
                                  "seer_prefill",
                                  "multipole_attention", "quest_attention",
                                  "duo_attention",
-                                 "shadowkv",
                                  "inf_llm"])
 
     parser.add_argument("--base_model", type=str, default="Qwen/Qwen3-8B")
@@ -213,13 +212,6 @@ def parse_args():
                         choices=["none", "fp8_e4m3", "fp8_e5m2", "int8", "int4"])
     parser.add_argument("--comp_kv_quant_granularity", type=str, default="per_page",
                         choices=["per_page", "per_comp_token"])
-
-    # ShadowKV (parity only)
-    parser.add_argument("--shadowkv_cache_mode", type=str, default="shadowkv_cpu",
-                        choices=["shadowkv", "shadowkv_cpu"])
-    parser.add_argument("--sparse_budget", type=int, default=2192)
-    parser.add_argument("--rank", type=int, default=160)
-    parser.add_argument("--chunk_size", type=int, default=8)
 
     # InfLLM (Llama-only)
     parser.add_argument("--inf_llm_n_init", type=int, default=128)

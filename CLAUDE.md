@@ -15,7 +15,7 @@ Modes:
 - **`drop`** (default): unselected pages are discarded; attention = sink + recent + top-k selected (fastest).
 - **`compressed`** (aka hybrid): unselected pages contribute DCT-lowpass-IDCT compressed KV tokens in addition to the top-k selected full pages (quality floor).
 
-The repo also hosts side-by-side **baselines** (SeerAttention-R, Multipole, Quest, DuoAttention, InfLLM, ShadowKV), a suite of **oracle diagnostics** (attention-mass recall, scoring-method comparisons, oracle upper-bound sweeps), and **speed/profiling** tools.
+The repo also hosts side-by-side **baselines** (SeerAttention-R, Multipole, Quest, DuoAttention, InfLLM), a suite of **oracle diagnostics** (attention-mass recall, scoring-method comparisons, oracle upper-bound sweeps), and **speed/profiling** tools.
 
 ## Architecture
 
@@ -67,10 +67,10 @@ Key kernels in `triton_kernels.py` (every kernel has a PyTorch fallback):
 
 | File | Benchmark | Supported modes |
 |---|---|---|
-| `eval_ruler.py` | RULER synthetic long-context (13 tasks × configurable seq_lengths, default 32k) | baseline, page_attention, seer_attention, seer_prefill, multipole_attention, quest_attention, duo_attention, shadowkv, inf_llm |
+| `eval_ruler.py` | RULER synthetic long-context (13 tasks × configurable seq_lengths, default 32k) | baseline, page_attention, seer_attention, seer_prefill, multipole_attention, quest_attention, duo_attention, inf_llm |
 | `eval_longbench_v1.py` | LongBench v1 (16 English tasks, F1 / ROUGE-L / accuracy / code similarity) | baseline, page_attention, seer_attention, multipole_attention, quest_attention, duo_attention, inf_llm |
 | `eval_longbench_v2.py` | LongBench v2 (503 multiple-choice, by difficulty/length) | baseline, page_attention, rope_gap, seer_attention, multipole_attention, quest_attention, duo_attention, inf_llm |
-| `eval_aime25.py` | AIME 2025 (30 problems, pass@1) — **Qwen3-8B only** | baseline, page_attention, seer_attention, seer_prefill, multipole_attention, quest_attention, duo_attention, shadowkv |
+| `eval_aime25.py` | AIME 2025 (30 problems, pass@1) — **Qwen3-8B only** | baseline, page_attention, seer_attention, seer_prefill, multipole_attention, quest_attention, duo_attention |
 | `eval_gpqa.py` | GPQA (diamond/main/extended, MC accuracy) — **Qwen3-8B only** | same set as AIME |
 
 All eval scripts prepend `baselines/` to `sys.path` so baseline packages are importable.
@@ -82,11 +82,10 @@ Model support: **Llama 3.x** (`replace_llama_attn`) and **Qwen3** (`replace_qwen
 | Folder | Baseline | Model support | Notes |
 |---|---|---|---|
 | `duo_attn/` | DuoAttention (head streaming + recent window) | Llama 3.x only | Requires dedicated env: `transformers==4.45.2`, `flash-attn==2.6.3`, upstream `duo-attention` installed. Config: `duo_attn/config.py` (`pattern_root`, `pattern_subdir`, `sparsity`, `sink_size`, `recent_size`). |
-| `infllm/` | InfLLM (retrieval-based block attention) | Llama 3.x only | Targets **transformers 5.2.0** (the DCT_Page main env). **Self-contained** — upstream `inf_llm` package vendored under `baselines/infllm/upstream/`, no separate `pip install -e /home/yoongonkim/InfLLM/` and no separate `infllm` conda env needed. Config: `infllm/config.py` (`attn_type`, `block_size`, `n_init`, `n_local`, `n_recent`, `topk`, `repr_topk`, `max_cached_block`, `chunk_size`). The `n_recent` knob (default None → uses `n_local`) decouples the local-output sliding window from the block-scoring horizon; only the torch-impl path supports it (fattn=True asserts at construction time). **Note:** wrapper directory must remain named `infllm` (no underscore) to avoid ambiguity with the upstream `inf_llm` import path. |
+| `infllm/` | InfLLM (retrieval-based block attention) | Llama 3.x only | Targets **transformers 5.5.4** (the DCT_Page main env). **Self-contained** — upstream `inf_llm` package vendored under `baselines/infllm/upstream/`, no separate `pip install -e /home/yoongonkim/InfLLM/` and no separate `infllm` conda env needed. Config: `infllm/config.py` (`attn_type`, `block_size`, `n_init`, `n_local`, `n_recent`, `topk`, `repr_topk`, `max_cached_block`, `chunk_size`). The `n_recent` knob (default None → uses `n_local`) decouples the local-output sliding window from the block-scoring horizon; only the torch-impl path supports it (fattn=True asserts at construction time). **Note:** wrapper directory must remain named `infllm` (no underscore) to avoid ambiguity with the upstream `inf_llm` import path. |
 | `seer_attn/` | SeerAttention-R (learned gate-based sparsity, decode-only + optional prefill) | Llama 3.x, Qwen2/3 | Has `decode_sparse/`, `prefill_sparse/`, `kernels/`, `modules/`. Configs: `config.py` (decode) and `prefill_config.py`. Loads HF checkpoints like `SeerAttention/SeerAttention-Decode-Qwen3-8B-AttnGates`. |
 | `multipole_attn/` | Multipole Attention (hierarchical k-means clustering) | Llama 3.x, Qwen2/3 | Modules: `attention_forward.py`, `clustering.py`, `kernels.py`, `kernel_wrappers.py`, `kmeans_ops_sequential.py`. Config: `percent_clusters_lst`, `percentiles_lst`, `use_replacement`, `cluster_interval`. |
 | `quest_attn/` | Quest (per-page min/max key metadata) | Llama 2/3.x, Mistral, Qwen3 | Has its own model classes (`models/llama.py`, `models/qwen3.py`) — not monkey-patch based. Custom CUDA kernels under `ops/csrc/` built via `build_kernels.sh`. Config: `page_size`, `max_seq_len`, `token_budget`. |
-| `shadow_kv/` | ShadowKV (SVD-compressed key cache + CPU-offloaded V) | Llama 3.x only | Compiled C++/CUDA kernels in `build/`. Config: `cache_mode` (`shadowkv` or `shadowkv_cpu`), `sparse_budget`, `rank`, `chunk_size`. Qwen3 unsupported (no QK-norm in upstream Qwen2 class). |
 
 ### `oracle/` — diagnostics and oracle upper bounds
 
@@ -136,9 +135,9 @@ Sweep scripts — each invokes `eval_ruler.py` / `eval_longbench_v{1,2}.py` with
 
 ```bash
 pip install -r requirements.txt
-# Core: torch 2.10.0, transformers 5.2.0, triton 3.6.0
+# Core (DCT_Page conda env): torch 2.11.0, transformers 5.5.4, triton 3.6.0
 # DuoAttention requires a separate env pinned to transformers==4.45.2 + flash-attn==2.6.3
-# InfLLM now runs in the main env (transformers 5.2.0); the legacy `infllm` conda env is retired
+# InfLLM now runs in the main env (transformers 5.5.4); the legacy `infllm` conda env is retired
 # Quest needs baselines/quest_attn/build_kernels.sh for the CUDA extension
 ```
 
@@ -240,7 +239,7 @@ python oracle/oracle_ruler.py --mode page_attention --context_len 16384 \
 - **Tensor naming**: `paged_*` = reshaped `[..., num_pages, page_size, ...]`; `comp_*` = compressed; `*_buf` = pre-allocated buffer.
 - **Buffer caching**: projection matrices and kernel caches live on `attn_module` attributes (lazy init via `_get_or_build_*`, shape/device checked each call).
 - **Triton kernels**: `@triton.jit` with constexpr block sizes; wrappers handle grid launch and switch to pure-PyTorch when `use_triton=False`.
-- **Run naming convention**: encodes params, e.g. `drop_ps32_top64_comp1`, `qwen_ps32_topk64_cr0.125_drop_tokenropemixed_popw`, `llama_shadowkv_shadowkv_cpu_sb2192_r160_cs8`.
+- **Run naming convention**: encodes params, e.g. `drop_ps32_top64_comp1`, `qwen_ps32_topk64_cr0.125_drop_tokenropemixed_popw`.
 - **`--top_k` semantics**: in `eval_*.py` (page_attention mode) `--top_k` means TOTAL pages
   (sink + middle + recent); in `oracle/*` scripts `--dct_top_k` still means MIDDLE pages.
 - **No unit tests**: validation is through benchmark runs (RULER / LongBench / AIME / GPQA) and the oracle diagnostics.
@@ -263,4 +262,4 @@ python oracle/oracle_ruler.py --mode page_attention --context_len 16384 \
 - **LongBench v1 no-chat tasks**: `trec`, `triviaqa`, `samsum`, `lcc`, `repobench-p`.
 - **AIME25 / GPQA** are Qwen3-8B only and shell out to the RULER eval helpers in `eval_ruler.py` for monkey-patching; CLI choices expose the full mode list for argparse parity but guard against non-Qwen3 at runtime.
 - **Quest baseline** is not monkey-patched — it loads its own `LlamaForCausalLM` / `Qwen3ForCausalLM` classes and must call `quest_init()` after model load. Needs the compiled CUDA extension from `baselines/quest_attn/build_kernels.sh`.
-- **ShadowKV, DuoAttention, InfLLM** do not yet support Qwen3 and only run with Llama 3.x.
+- **DuoAttention, InfLLM** do not yet support Qwen3 and only run with Llama 3.x.

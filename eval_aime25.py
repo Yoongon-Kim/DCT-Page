@@ -4,9 +4,9 @@ AIME 2025 evaluation for DCT Page Attention and baseline attention mechanisms.
 Evaluates Qwen3-8B (the default reasoning model in this harness) on the
 AIME 2025 math competition (30 integer-answer problems) across the attention
 modes exposed by eval_ruler.py. Modes that do not support Qwen3
-(seer_prefill, quest_attention, duo_attention, shadowkv) are still listed in
+(seer_prefill, quest_attention, duo_attention) are still listed in
 --mode for parity, but the script raises ValueError before model load if one
-is selected. inf_llm is Llama-only (transformers==4.37.2 env pinning) and
+is selected. inf_llm is Llama-only (runs in the main env; upstream is vendored) and
 requires --base_model pointing to a Llama-family checkpoint.
 
 Default dataset is yentinglin/aime_2025. Prompting is chain-of-thought; final
@@ -58,13 +58,13 @@ from eval_ruler import (
 QWEN3_SUPPORTED_MODES = {
     "baseline", "page_attention", "seer_attention", "multipole_attention",
 }
-# Modes that are Llama-only in this harness (e.g. InfLLM's transformers==4.37
-# shim and Llama-only RoPE replacement). When --mode is in this set, --base_model
+# Modes that are Llama-only in this harness (e.g. InfLLM's Llama-only RoPE
+# replacement). When --mode is in this set, --base_model
 # must be a Llama-family ID.
 LLAMA_ONLY_MODES = {"inf_llm"}
 # Modes intentionally listed in --mode for argparse parity but unsupported here.
 UNSUPPORTED_MODES = {
-    "seer_prefill", "quest_attention", "duo_attention", "shadowkv",
+    "seer_prefill", "quest_attention", "duo_attention",
 }
 
 
@@ -164,7 +164,6 @@ def parse_args():
                                  "seer_prefill",
                                  "multipole_attention", "quest_attention",
                                  "duo_attention",
-                                 "shadowkv",
                                  "inf_llm"])
 
     # Model — Qwen3-8B default; Llama-family accepted for inf_llm mode
@@ -248,13 +247,6 @@ def parse_args():
     parser.add_argument("--seerattn_token_budget", type=int, default=2048)
     parser.add_argument("--seerattn_gate_block_size", type=int, default=64,
                         choices=[16, 32, 64])
-
-    # ShadowKV baseline params (here for argparse parity only)
-    parser.add_argument("--shadowkv_cache_mode", type=str, default="shadowkv_cpu",
-                        choices=["shadowkv", "shadowkv_cpu"])
-    parser.add_argument("--sparse_budget", type=int, default=2192)
-    parser.add_argument("--rank", type=int, default=160)
-    parser.add_argument("--chunk_size", type=int, default=8)
 
     # InfLLM baseline params (only used when --mode inf_llm). Llama 3.x only.
     parser.add_argument("--inf_llm_n_init", type=int, default=128,

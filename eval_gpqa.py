@@ -4,7 +4,7 @@ GPQA evaluation for DCT Page Attention and baseline attention mechanisms.
 Evaluates Qwen3-8B (the only supported reasoning model in this harness) on the
 GPQA multiple-choice benchmark across the same eight attention modes exposed by
 eval_ruler.py. Attention modes that do not support Qwen3 (seer_prefill,
-quest_attention, duo_attention, shadowkv) are still listed in --mode for parity,
+quest_attention, duo_attention) are still listed in --mode for parity,
 but the script raises ValueError before model load if one is selected.
 
 Default subset is gpqa_diamond (198 hardest questions); --gpqa_subset switches
@@ -59,7 +59,7 @@ QWEN3_SUPPORTED_MODES = {
     "baseline", "page_attention", "seer_attention", "multipole_attention",
 }
 QWEN3_UNSUPPORTED_MODES = {
-    "seer_prefill", "quest_attention", "duo_attention", "shadowkv",
+    "seer_prefill", "quest_attention", "duo_attention",
 }
 
 
@@ -155,13 +155,12 @@ def extract_answer(response: str):
 def parse_args():
     parser = argparse.ArgumentParser(description="GPQA Evaluation (Qwen3-8B)")
 
-    # Mode (all 8 visible for parity with eval_ruler.py; Qwen3 guard runs after parsing)
+    # Mode (all visible for parity with eval_ruler.py; Qwen3 guard runs after parsing)
     parser.add_argument("--mode", type=str, required=True,
                         choices=["baseline", "page_attention", "seer_attention",
                                  "seer_prefill",
                                  "multipole_attention", "quest_attention",
-                                 "duo_attention",
-                                 "shadowkv"])
+                                 "duo_attention"])
 
     # Model — Qwen3-8B only
     parser.add_argument("--base_model", type=str,
@@ -225,14 +224,7 @@ def parse_args():
 
     # eval_ruler.py expects these on args even though GPQA doesn't loop over seq_lengths.
     parser.add_argument("--seq_lengths", type=int, nargs="+", default=[32768],
-                        help="Unused by GPQA but consumed by ShadowKV's max_length sizing in eval_ruler helpers")
-
-    # ShadowKV baseline params (only validated above; here for argparse parity)
-    parser.add_argument("--shadowkv_cache_mode", type=str, default="shadowkv_cpu",
-                        choices=["shadowkv", "shadowkv_cpu"])
-    parser.add_argument("--sparse_budget", type=int, default=2192)
-    parser.add_argument("--rank", type=int, default=160)
-    parser.add_argument("--chunk_size", type=int, default=8)
+                        help="Unused by GPQA; present only so shared eval_ruler helpers that read args.seq_lengths don't fail")
 
     parser.add_argument("--skip_existing", action="store_true",
                         help="Skip run if summary.json already exists in output dir")

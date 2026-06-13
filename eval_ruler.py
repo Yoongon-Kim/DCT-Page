@@ -2,8 +2,8 @@
 Unified RULER benchmark evaluation.
 
 Supports many attention modes (baseline, page_attention, seer_attention,
-seer_prefill, multipole_attention, quest_attention, duo_attention, shadowkv,
-inf_llm, snap_kv) with optional data preparation.  Mirrors the mode-based
+seer_prefill, multipole_attention, quest_attention, duo_attention,
+inf_llm) with optional data preparation.  Mirrors the mode-based
 dispatch pattern of eval_longbench_v1.py.
 
 Supported models: Llama 3.1 8B Instruct and Qwen3-8B. Chat template and
@@ -112,9 +112,7 @@ def parse_args():
                                  "seer_prefill",
                                  "multipole_attention", "quest_attention",
                                  "duo_attention",
-                                 "shadowkv",
-                                 "inf_llm",
-                                 "snap_kv"])
+                                 "inf_llm"])
 
     # Model
     parser.add_argument("--base_model", type=str,
@@ -186,18 +184,6 @@ def parse_args():
                         help="Quest baseline: page budget (=token_budget/page_size). "
                              "Default 128 → token_budget=2048 with quest_page_size=16")
 
-    # ShadowKV baseline params (only used when --mode shadowkv)
-    parser.add_argument("--shadowkv_cache_mode", type=str, default="shadowkv_cpu",
-                        choices=["shadowkv", "shadowkv_cpu"],
-                        help="ShadowKVCache_CPU offloads V to CPU (production); "
-                             "ShadowKVCache is GPU-only and batch=1 (sanity).")
-    parser.add_argument("--sparse_budget", type=int, default=2192,
-                        help="ShadowKV: tokens attended to per decode step.")
-    parser.add_argument("--rank", type=int, default=160,
-                        help="ShadowKV: SVD rank for compressed key cache.")
-    parser.add_argument("--chunk_size", type=int, default=8,
-                        help="ShadowKV: tokens per landmark chunk.")
-
     # InfLLM baseline params (only used when --mode inf_llm). All five
     # accuracy-relevant knobs (topk, block_size, n_local, n_init, repr_topk)
     # plus max_cached_block / chunk_size are exposed as CLI overrides on top
@@ -229,20 +215,6 @@ def parse_args():
                         help="InfLLM: per-iteration global-attention block size during prefill. "
                              "Upstream asserts exc_block_size <= n_local. None => "
                              "min(INF_LLM_CONFIG['exc_block_size'], n_local).")
-
-    # SnapKV baseline params (only used when --mode snap_kv). Overrides on top
-    # of baselines/snap_kv/config.py SNAPKV_CONFIG. SnapKV compresses the
-    # prefill KV cache to `max_capacity_prompt` tokens per layer.
-    parser.add_argument("--snapkv_window_size", type=int, default=32,
-                        help="SnapKV: query window for attention-mass scoring (last N queries vote).")
-    parser.add_argument("--snapkv_max_capacity_prompt", type=int, default=2048,
-                        help="SnapKV: total kept tokens per layer after compression "
-                             "(includes the trailing window_size tokens).")
-    parser.add_argument("--snapkv_kernel_size", type=int, default=5,
-                        help="SnapKV: 1D pooling kernel size for smoothing attention-mass scores.")
-    parser.add_argument("--snapkv_pooling", type=str, default="avgpool",
-                        choices=["avgpool", "maxpool"],
-                        help="SnapKV: pooling op over attention-mass scores before topk.")
 
     # SeerAttention-R overrides (only used when --mode seer_attention).
     # CLI takes precedence over baselines/seer_attn/config.py (None = fall back).
@@ -329,10 +301,6 @@ def parse_args():
             args.run_name = f"{tag}_quest_ps{args.quest_page_size}_pb{args.quest_top_k}"
         elif args.mode == "duo_attention":
             args.run_name = f"{tag}_duo_attention"
-        elif args.mode == "shadowkv":
-            args.run_name = (f"{tag}_shadowkv_{args.shadowkv_cache_mode}"
-                             f"_sb{args.sparse_budget}_r{args.rank}"
-                             f"_cs{args.chunk_size}")
         elif args.mode == "inf_llm":
             args.run_name = (f"{tag}_inf_llm_topk{args.inf_llm_topk}"
                              f"_bs{args.inf_llm_block_size}"
@@ -341,11 +309,6 @@ def parse_args():
                              f"_repr{args.inf_llm_repr_topk}")
             if args.inf_llm_n_recent is not None:
                 args.run_name += f"_nrec{args.inf_llm_n_recent}"
-        elif args.mode == "snap_kv":
-            args.run_name = (f"{tag}_snap_kv_cap{args.snapkv_max_capacity_prompt}"
-                             f"_{args.snapkv_pooling}"
-                             f"_win{args.snapkv_window_size}"
-                             f"_ks{args.snapkv_kernel_size}")
 
     if args.skip_existing:
         summary_path = Path(args.output_dir) / args.run_name / "summary.json"
@@ -635,12 +598,8 @@ def apply_monkey_patch(args):
         pass  # Quest uses custom model class, no monkey-patch needed
     elif args.mode == "duo_attention":
         pass  # DuoAttention patches per-instance forwards post-load (see load_model_and_tokenizer)
-    elif args.mode == "shadowkv":
-        pass  # ShadowKV uses a custom LLM class; no monkey-patch needed.
     elif args.mode == "inf_llm":
         pass  # InfLLM patches per-instance forwards post-load (see load_model_and_tokenizer)
-    elif args.mode == "snap_kv":
-        pass  # SnapKV patches the attention class post-load (see load_model_and_tokenizer)
     elif args.mode == "baseline":
         print("Baseline mode: full attention (no monkey-patch)")
 
@@ -734,24 +693,9 @@ def load_model_and_tokenizer(args):
         model.eval()
         tokenizer = AutoTokenizer.from_pretrained(base_model)
         print(f"Model loaded. Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
-    elif args.mode == "shadowkv":
-        from shadow_kv import SHADOWKV_CONFIG, build_shadowkv_llm
-
-        SHADOWKV_CONFIG["base_model"] = args.base_model
-        SHADOWKV_CONFIG["cache_mode"] = args.shadowkv_cache_mode
-        SHADOWKV_CONFIG["sparse_budget"] = args.sparse_budget
-        SHADOWKV_CONFIG["rank"] = args.rank
-        SHADOWKV_CONFIG["chunk_size"] = args.chunk_size
-        SHADOWKV_CONFIG["max_length"] = max(args.seq_lengths) + 4096
-        print(f"Loading ShadowKV model: {args.base_model} "
-              f"(cache={args.shadowkv_cache_mode}, sparse_budget={args.sparse_budget}, "
-              f"rank={args.rank}, chunk_size={args.chunk_size})")
-        model = build_shadowkv_llm(SHADOWKV_CONFIG)
-        tokenizer = model.tokenizer
-        print("ShadowKV LLM ready.")
     else:
-        # DuoAttention's, InfLLM's, and SnapKV's replacement forwards assume eager-style Q/K/V signatures.
-        attn_impl = "eager" if args.mode in {"duo_attention", "inf_llm", "snap_kv"} else "sdpa"
+        # DuoAttention's and InfLLM's replacement forwards assume eager-style Q/K/V signatures.
+        attn_impl = "eager" if args.mode in {"duo_attention", "inf_llm"} else "sdpa"
         print(f"Loading model: {args.base_model} (attn: {attn_impl})")
         tokenizer = AutoTokenizer.from_pretrained(args.base_model)
         yarn_kwargs = {}
@@ -819,18 +763,6 @@ def load_model_and_tokenizer(args):
             INF_LLM_CONFIG["exc_block_size"] = min(requested_exc, args.inf_llm_n_local)
             init_inf_llm(model, INF_LLM_CONFIG)
             args._inf_llm_generator = build_inf_llm_generator(model, tokenizer, INF_LLM_CONFIG)
-
-        if args.mode == "snap_kv":
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "baselines"))
-            from snap_kv import init_snap_kv
-            from snap_kv.config import SNAPKV_CONFIG
-            sys.path.pop(0)
-            SNAPKV_CONFIG["base_model"] = args.base_model
-            SNAPKV_CONFIG["window_size"] = args.snapkv_window_size
-            SNAPKV_CONFIG["max_capacity_prompt"] = args.snapkv_max_capacity_prompt
-            SNAPKV_CONFIG["kernel_size"] = args.snapkv_kernel_size
-            SNAPKV_CONFIG["pooling"] = args.snapkv_pooling
-            init_snap_kv(model, SNAPKV_CONFIG)
 
     # Seed per-attention-module `_upstream_fi_build_kwargs` AFTER from_pretrained.
     # `replace_*_attn` runs BEFORE model load by project convention, so this
@@ -959,8 +891,6 @@ def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
 
             if args.mode == "quest_attention":
                 model.quest_clear()
-            elif args.mode == "shadowkv":
-                model.shadowkv_clear()
             elif args.mode == "inf_llm":
                 # ContextManager persists past_kv across samples; reset it.
                 args._inf_llm_generator.clear()
@@ -1099,14 +1029,6 @@ def _save_summary(args, all_seq_results):
             "page_size": args.quest_page_size,
             "page_budget": args.quest_top_k,
             "token_budget": args.quest_page_size * args.quest_top_k,
-        }
-    elif args.mode == "snap_kv":
-        summary["snap_kv_config"] = {
-            "base_model": args.base_model,
-            "window_size": args.snapkv_window_size,
-            "max_capacity_prompt": args.snapkv_max_capacity_prompt,
-            "kernel_size": args.snapkv_kernel_size,
-            "pooling": args.snapkv_pooling,
         }
 
     summary_path = Path(args.output_dir) / args.run_name / "summary.json"

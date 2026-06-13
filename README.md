@@ -1,6 +1,6 @@
 # DCT-Page
 
-Decode-time sparse page attention for long-context LLMs, with training-free proxy scoring (**DCT-lowpass-IDCT**) and fused Triton kernels. The repo bundles the DCT-Page implementation together with six baseline methods (SeerAttention-R, Multipole, Quest, DuoAttention, InfLLM, ShadowKV), a full oracle/diagnostic suite, and benchmark runners for RULER, LongBench v1/v2, AIME25, and GPQA.
+Decode-time sparse page attention for long-context LLMs, with training-free proxy scoring (**DCT-lowpass-IDCT**) and fused Triton kernels. The repo bundles the DCT-Page implementation together with five baseline methods (SeerAttention-R, Multipole, Quest, DuoAttention, InfLLM), a full oracle/diagnostic suite, and benchmark runners for RULER, LongBench v1/v2, AIME25, and GPQA.
 
 ## Idea
 
@@ -40,7 +40,7 @@ Decode-time KV layout:
 
 | File | Benchmark | Notes |
 |---|---|---|
-| [eval_ruler.py](eval_ruler.py) | RULER (13 synthetic tasks, default 32k seq len) | Modes: baseline, page_attention, seer_attention, seer_prefill, multipole_attention, quest_attention, duo_attention, shadowkv, inf_llm. Llama 3.x and Qwen3. |
+| [eval_ruler.py](eval_ruler.py) | RULER (13 synthetic tasks, default 32k seq len) | Modes: baseline, page_attention, seer_attention, seer_prefill, multipole_attention, quest_attention, duo_attention, inf_llm. Llama 3.x and Qwen3. |
 | [eval_longbench_v1.py](eval_longbench_v1.py) | LongBench v1 (16 English tasks) | Modes: baseline, page_attention, seer_attention, multipole_attention, quest_attention, duo_attention, inf_llm. |
 | [eval_longbench_v2.py](eval_longbench_v2.py) | LongBench v2 (503 multiple-choice) | Adds `rope_gap` mode for RoPE interpolation studies. |
 | [eval_aime25.py](eval_aime25.py) | AIME 2025 (30 problems, pass@1) | Qwen3-8B only. |
@@ -51,11 +51,10 @@ Decode-time KV layout:
 | Folder | Baseline | Model support |
 |---|---|---|
 | [baselines/duo_attn/](baselines/duo_attn/) | DuoAttention (head streaming + recent window) | Llama 3.x (requires dedicated env: `transformers==4.45.2`, `flash-attn==2.6.3`) |
-| [baselines/inf_llm/](baselines/inf_llm/) | InfLLM (retrieval-based block attention) | Llama 3.x (requires `transformers==4.37.2`) |
+| [baselines/infllm/](baselines/infllm/) | InfLLM (retrieval-based block attention) | Llama 3.x (main DCT_Page env, vendored) |
 | [baselines/seer_attn/](baselines/seer_attn/) | SeerAttention-R (learned gate-based sparsity, decode + optional prefill) | Llama 3.x, Qwen2/3 |
 | [baselines/multipole_attn/](baselines/multipole_attn/) | Multipole Attention (hierarchical k-means clustering) | Llama 3.x, Qwen2/3 |
 | [baselines/quest_attn/](baselines/quest_attn/) | Quest (per-page min/max key metadata; custom CUDA kernels) | Llama 2/3.x, Mistral, Qwen3 |
-| [baselines/shadow_kv/](baselines/shadow_kv/) | ShadowKV (SVD-compressed keys + CPU-offloaded V) | Llama 3.x |
 
 Each baseline folder has a `config.py` with defaults (pattern paths, model names, sparsity budgets, etc.). Run scripts rewrite these configs in place for sweeps.
 
@@ -98,15 +97,14 @@ Each sweep script calls the corresponding `eval_*.py` with a parameter grid. All
 
 ```bash
 pip install -r requirements.txt
-# Core: torch 2.10.0, transformers 5.2.0, triton 3.6.0
+# Core (DCT_Page conda env): torch 2.11.0, transformers 5.5.4, triton 3.6.0
 ```
 
 Baseline-specific setup:
 
 - **DuoAttention** — dedicated conda env (`duo_env`) with `transformers==4.45.2`, `flash-attn==2.6.3`, and `pip install -e /path/to/duo-attention`. Patterns live under `attn_patterns/` in the upstream repo; set `PATTERN_ROOT` / `PATTERN_SUBDIR` or edit [baselines/duo_attn/config.py](baselines/duo_attn/config.py).
-- **InfLLM** — dedicated env (`inf_llm_env`) with `transformers==4.37.2`, `omegaconf`, `fschat`, and `pip install -e /path/to/InfLLM`. See [baselines/inf_llm/config.py](baselines/inf_llm/config.py).
+- **InfLLM** — runs in the main DCT_Page env (`transformers==5.5.4`); upstream `inf_llm` is vendored under [baselines/infllm/upstream/](baselines/infllm/upstream/), so no separate env or editable install is needed. See [baselines/infllm/config.py](baselines/infllm/config.py).
 - **Quest** — build the custom CUDA extension once: `bash baselines/quest_attn/build_kernels.sh`.
-- **ShadowKV** — compiled C++/CUDA kernels ship in `baselines/shadow_kv/build/`; rebuild via its `setup.py` if CUDA / torch versions change.
 - **SeerAttention-R** — checkpoints pulled from Hugging Face Hub on first run (e.g. `SeerAttention/SeerAttention-Decode-Qwen3-8B-AttnGates`).
 
 ## Basic usage (DCT-Page)
@@ -222,14 +220,9 @@ python eval_ruler.py --mode quest_attention --base_model Qwen/Qwen3-8B \
 python eval_ruler.py --mode duo_attention --base_model meta-llama/Llama-3.1-8B-Instruct \
   --output_dir results_ruler --run_name duo
 
-# InfLLM (requires inf_llm_env)
+# InfLLM (runs in main DCT_Page env)
 python eval_ruler.py --mode inf_llm --base_model meta-llama/Llama-3.1-8B-Instruct \
   --output_dir results_ruler --run_name inf_llm
-
-# ShadowKV
-python eval_ruler.py --mode shadowkv --base_model meta-llama/Llama-3.1-8B-Instruct \
-  --shadowkv_cache_mode shadowkv_cpu --sparse_budget 2048 --rank 160 --chunk_size 8 \
-  --output_dir results_ruler --run_name shadowkv
 ```
 
 ### Sweep scripts
@@ -413,5 +406,5 @@ Key outputs land under `results/ruler_oracle_selection/<run>/`: `summary.tsv`, `
 - `compressed` mode is for accuracy experiments; speed optimisation targets `drop`.
 - Below `min_decode_kv_len_for_paging=8192`, the patch falls back to baseline decode attention.
 - `max_unselected_compressed` (default `-1`) limits how many unselected pages contribute compressed KV: `-1` = unlimited, `0` = drop-equivalent, `N` = top-N by score.
-- ShadowKV, DuoAttention, and InfLLM currently support Llama 3.x only. Quest supports LLaMA-family models and Qwen3.
+- DuoAttention and InfLLM currently support Llama 3.x only. Quest supports LLaMA-family models and Qwen3.
 - LongBench v1 semantics follow the FastKV adjustments (prompt formatting, no-chat tasks, metric computation).

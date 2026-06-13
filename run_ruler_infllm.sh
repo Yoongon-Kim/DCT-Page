@@ -9,21 +9,9 @@
 # fattn, base, distance_scale, score_decay, async_global_stream, faiss,
 # perhead).
 #
-# InfLLM requires a dedicated conda env with transformers==4.37.2 (its
-# patch.py targets pre-4.45 attention internals). Set INFLLM_ENV_NAME
-# (default: infllm) and CONDA_SETUP to override.
+# InfLLM runs in the main DCT_Page env (transformers 5.5.4); upstream inf_llm is
+# vendored under baselines/infllm/, so no separate env or activation is needed.
 set -e
-
-# ---- Conda activation ----
-INFLLM_ENV_NAME="${INFLLM_ENV_NAME:-infllm}"
-CONDA_SETUP="${CONDA_SETUP:-/home/tools/anaconda3/etc/profile.d/conda.sh}"
-if [[ -f "$CONDA_SETUP" ]]; then
-    # shellcheck disable=SC1090
-    source "$CONDA_SETUP"
-    conda activate "$INFLLM_ENV_NAME"
-else
-    echo "WARNING: $CONDA_SETUP not found; assuming $INFLLM_ENV_NAME is already active."
-fi
 
 # ---- Configuration (env defaults, overridable via CLI flags below) ----
 BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"

@@ -3,10 +3,10 @@ from ..attention import RotaryEmbeddingESM, ATTN_FORWRAD
 
 
 def huggingface_forward(forward):
-    """Adapter from the upstream InfLLM attention forward to transformers 5.2.0's
+    """Adapter from the upstream InfLLM attention forward to transformers 5.x's
     LlamaAttention.forward signature.
 
-    The 5.2.0 attention forward returns a 2-tuple (output, attn_weights). InfLLM's
+    The 5.x attention forward returns a 2-tuple (output, attn_weights). InfLLM's
     inner forward returns (o, past_key_value) when use_cache=True. We stash pkv on
     the attention module as self._infllm_kv so the patched LlamaModel.forward can
     read it back without breaking the 2-tuple return contract.
@@ -96,7 +96,7 @@ def patch_hf(
                 cache_position=None,
                 use_cache=True,
             )
-            # LlamaDecoderLayer.forward returns a single Tensor in 5.2.0, NOT a tuple.
+            # LlamaDecoderLayer.forward returns a single Tensor in 5.x, NOT a tuple.
             if use_cache:
                 pkv = pkv + (decoder_layer.self_attn._infllm_kv,)
             decoder_layer.self_attn._infllm_kv = None  # clear stale state
@@ -127,14 +127,14 @@ def patch_hf(
     else:
         raise ValueError("Only supports llama, mistral and qwen2 models.")
 
-    # 5.2.0: LlamaRotaryEmbedding lives on the model, not on each attention instance;
+    # 5.x: LlamaRotaryEmbedding lives on the model, not on each attention instance;
     # its `dim` and `base` attrs are gone — read from config instead.
     # rope_theta moved from `config.rope_theta` (4.37) to nested under
-    # `config.rope_parameters` / `config.rope_scaling` (5.2.0). Walk the chain.
+    # `config.rope_parameters` / `config.rope_scaling` (5.x). Walk the chain.
     head_dim = model.config.hidden_size // model.config.num_attention_heads
     if base is None:
         cfg = model.config
-        # Order: 5.2.0 rope_parameters → 5.2.0 rope_scaling fallback → legacy attr → default
+        # Order: 5.x rope_parameters → 5.x rope_scaling fallback → legacy attr → default
         for src in (getattr(cfg, "rope_parameters", None), getattr(cfg, "rope_scaling", None)):
             if isinstance(src, dict) and "rope_theta" in src:
                 rope_base = src["rope_theta"]
@@ -152,7 +152,7 @@ def patch_hf(
         layer.self_attn.position_bias = rope
 
     # Class-level patching mirrors dct_page_attention.py:2529 and wins over
-    # 5.2.0's `attention_interface` dispatch (which runs INSIDE LlamaAttention.forward).
+    # 5.x's `attention_interface` dispatch (which runs INSIDE LlamaAttention.forward).
     Attention.forward = forward
     Model.forward = model_forward
 
