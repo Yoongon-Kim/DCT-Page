@@ -107,6 +107,13 @@ Baseline-specific setup:
 - **Quest** — build the custom CUDA extension once: `bash baselines/quest_attn/build_kernels.sh`.
 - **SeerAttention-R** — checkpoints pulled from Hugging Face Hub on first run (e.g. `SeerAttention/SeerAttention-Decode-Qwen3-8B-AttnGates`).
 
+### Benchmark data
+
+Benchmark data lives under `benchmark/data/` and is **gitignored** (~136 MB), so a fresh clone starts without it. Both sources regenerate on demand — no manual download step:
+
+- **RULER** — synthetic. Pass `--prepare` to an `eval_ruler.py` run (or any `run_ruler*.sh`) to generate and cache it under `benchmark/data/ruler_data/` via [benchmark/eval_ruler/data/prepare.py](benchmark/eval_ruler/data/prepare.py).
+- **LongBench v1** — `eval_longbench_v1.py` auto-downloads each task from the `THUDM/LongBench` Hugging Face dataset on first run when no local `benchmark/data/longbench_v1_data/<task>.jsonl` exists (needs network + HF access).
+
 ## Basic usage (DCT-Page)
 
 Monkey-patch **before** loading the model.
