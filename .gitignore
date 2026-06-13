@@ -9,3 +9,4 @@ baselines/quest_attn/_kernels*.so
 A_*/
 result*/
 .omc/
+.claude/settings.local.json
