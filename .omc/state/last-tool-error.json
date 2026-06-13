@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"pkill -f \\\"attention_mass_recall_ruler\\\" 2>/dev/null; sleep 2; ps aux | grep \\\"attention_mass_recall\\\" | grep -v grep | wc -l\",\"description\":\"Kill misconfigured run again\"}",
-  "error": "Exit code 144",
-  "timestamp": "2026-05-17T14:45:10.484Z",
-  "retry_count": 2
-}
