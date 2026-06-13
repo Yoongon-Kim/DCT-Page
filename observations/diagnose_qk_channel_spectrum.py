@@ -27,7 +27,7 @@ dense-recording hook from attention_mass_recall_ruler_quest so post-RoPE
 post-QK-norm K is captured exactly as the existing diagnostic sees it.
 
 Usage:
-  python oracle/diagnose_qk_channel_spectrum.py \\
+  python observations/diagnose_qk_channel_spectrum.py \\
     --base_model Qwen/Qwen3-8B \\
     --tasks niah_multikey_3 \\
     --seq_len 32768 --num_samples 5 \\
@@ -54,14 +54,14 @@ from transformers import AutoTokenizer
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT))
 
-from oracle.attention_mass_recall_ruler_quest import (
+from observations.attention_mass_recall_ruler_quest import (
     _install_recording_forward,
     _model_family,
     cleanup_model,
     load_model,
     set_recording_hook,
 )
-from oracle.attention_mass_recall_ruler import (
+from observations.attention_mass_recall_ruler import (
     ALL_TASKS,
     load_task_configs,
 )

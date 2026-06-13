@@ -87,10 +87,11 @@ Model support: **Llama 3.x** (`replace_llama_attn`) and **Qwen3** (`replace_qwen
 | `multipole_attn/` | Multipole Attention (hierarchical k-means clustering) | Llama 3.x, Qwen2/3 | Modules: `attention_forward.py`, `clustering.py`, `kernels.py`, `kernel_wrappers.py`, `kmeans_ops_sequential.py`. Config: `percent_clusters_lst`, `percentiles_lst`, `use_replacement`, `cluster_interval`. |
 | `quest_attn/` | Quest (per-page min/max key metadata) | Llama 2/3.x, Mistral, Qwen3 | Has its own model classes (`models/llama.py`, `models/qwen3.py`) — not monkey-patch based. Custom CUDA kernels under `ops/csrc/` built via `build_kernels.sh`. Config: `page_size`, `max_seq_len`, `token_budget`. |
 
-### `oracle/` — diagnostics and oracle upper bounds
+### `observations/` — diagnostics, observations, and oracle upper bounds
 
 | File | Purpose |
 |---|---|
+| `dct_page_energy.py` | Standalone observation tool: runs a model and measures per-page DCT-lowpass energy of K/V (proxy sanity/visualization). |
 | `oracle_ruler.py` | Standalone RULER runner for oracle experiments. Flat per-task JSONL output. |
 | `diagnose_scoring_methods.py` | Compares ~30 scoring methods (oracle_max/mean, proxy_max/mean, l2_energy, dc_ac_*, spectral_recon_*, continuous_cosine_max, hybrid_*) against a configurable ground truth (`oracle_max` or `output_contribution`). |
 | `attention_mass_recall_ruler.py` | Dense-trajectory reference: runs **unmodified full-KV forward**, observes Q/K/V per decode step, computes per-selector mass-recall (DCT, Quest, ShadowKV, oracle_max, mass-topk ceiling). Reports full-KV / selected-page / paged-only metric families. |
@@ -213,22 +214,22 @@ python speed/profile_decode.py --context_length 32768 \
 
 ```bash
 # Scoring-method comparison (no DCT patch; uses full-KV ground truth)
-python oracle/diagnose_scoring_methods.py \
+python observations/diagnose_scoring_methods.py \
   --ground_truths oracle_max,output_contribution \
   --context_len 16384 \
   --model_name_or_path meta-llama/Llama-3.1-8B-Instruct
 
 # Dense-trajectory mass recall across selectors (DCT, Quest, ShadowKV, oracle_max)
-python oracle/attention_mass_recall_ruler.py --context_len 32768 \
+python observations/attention_mass_recall_ruler.py --context_len 32768 \
   --page_size 32 --top_k 64
 
 # Oracle upper-bound selection sweep across page sizes (fixed selected-token budget)
-python oracle/run_ruler_oracle_selection.py \
+python observations/run_ruler_oracle_selection.py \
   --context_len 32768 --page_sizes 32,64,128 \
   --selected_token_budget 2048 --compress_ratio 0.03125
 
 # Standalone RULER runner for ad-hoc experiments
-python oracle/oracle_ruler.py --mode page_attention --context_len 16384 \
+python observations/oracle_ruler.py --mode page_attention --context_len 16384 \
   --tasks niah_multikey_3 --tag my_run --num_samples 25 --cuda_device 0 \
   --dct_page_size 32 --dct_top_k 64 --dct_unselected_mode drop
 ```
@@ -241,7 +242,7 @@ python oracle/oracle_ruler.py --mode page_attention --context_len 16384 \
 - **Triton kernels**: `@triton.jit` with constexpr block sizes; wrappers handle grid launch and switch to pure-PyTorch when `use_triton=False`.
 - **Run naming convention**: encodes params, e.g. `drop_ps32_top64_comp1`, `qwen_ps32_topk64_cr0.125_drop_tokenropemixed_popw`.
 - **`--top_k` semantics**: in `eval_*.py` (page_attention mode) `--top_k` means TOTAL pages
-  (sink + middle + recent); in `oracle/*` scripts `--dct_top_k` still means MIDDLE pages.
+  (sink + middle + recent); in `observations/*` scripts `--dct_top_k` still means MIDDLE pages.
 - **No unit tests**: validation is through benchmark runs (RULER / LongBench / AIME / GPQA) and the oracle diagnostics.
 
 ## Data paths
@@ -255,7 +256,7 @@ python oracle/oracle_ruler.py --mode page_attention --context_len 16384 \
 ## Notes
 
 - **Score proxy**: DCT-lowpass-IDCT only. Haar, Walsh-Hadamard, direct-spectral, and alternate frequency layouts have been removed.
-- **Supported `scoring_method`**: `"max"`, `"mean"`, `"sum"` (and the QUEST-style min/max variant via `score_use_quest_minmax=True`). `dc_ac`, `spectral_recon_max`, `hybrid_multi` scoring methods were removed; the `oracle/dc_ac_ruler.py` and `oracle/hybridmulti_ruler.py` sweep wrappers remain but are no longer functional without those scoring methods.
+- **Supported `scoring_method`**: `"max"`, `"mean"`, `"sum"` (and the QUEST-style min/max variant via `score_use_quest_minmax=True`). `dc_ac`, `spectral_recon_max`, `hybrid_multi` scoring methods were removed; the `observations/dc_ac_ruler.py` and `observations/hybridmulti_ruler.py` sweep wrappers remain but are no longer functional without those scoring methods.
 - **`drop` vs `compressed`**: `drop` is the speed path; `compressed` is for accuracy experiments.
 - **`min_decode_kv_len_for_paging=8192`**: below this KV length, the patch falls back to baseline decode attention.
 - **`max_unselected_compressed`** (default `-1`): caps how many unselected pages contribute compressed KV. `-1`=unlimited, `0`=drop-equivalent, `N`=top-N by score.

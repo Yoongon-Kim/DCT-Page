@@ -36,7 +36,7 @@ Quest scoring (Tang et al., MLSys 2024) — reused from the sibling script:
 Matches the CUDA kernel at ``baselines/quest_attn/ops/csrc/estimate.cu:68-76``.
 
 Usage:
-    python oracle/attention_mass_recall_ruler_quest.py \\
+    python observations/attention_mass_recall_ruler_quest.py \\
         --base_model meta-llama/Llama-3.1-8B-Instruct \\
         --tasks niah_single_1 --num_samples 2 --seq_len 32768 \\
         --page_size 16 --top_k 128 --num_decode_steps 2 \\
@@ -65,7 +65,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from eval_ruler import infer_model_family
-from oracle.attention_mass_recall_ruler import (
+from observations.attention_mass_recall_ruler import (
     ALL_TASKS,
     compute_output_fidelity,
     compute_per_page_mass,

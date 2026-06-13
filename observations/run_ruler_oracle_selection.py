@@ -199,7 +199,7 @@ def write_summary_files(run_root: Path, rows: list[dict]) -> None:
 
 def main() -> None:
     args = parse_args()
-    # Sibling script lives next to us in oracle/, but the child oracle_ruler.py
+    # Sibling script lives next to us in observations/, but the child oracle_ruler.py
     # expects to be invoked with cwd at the project root so its relative data
     # paths resolve correctly.
     script_path = Path(__file__).resolve().parent / "oracle_ruler.py"

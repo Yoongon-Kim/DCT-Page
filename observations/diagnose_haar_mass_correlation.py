@@ -28,7 +28,7 @@ Outputs per-layer ρ values to ``summary.json``. Stage-0 gate (see
                           and  ρ(haar_inject) ≥ ρ(dct_lowpass) + 0.05.
 
 Usage:
-  python oracle/diagnose_haar_mass_correlation.py \\
+  python observations/diagnose_haar_mass_correlation.py \\
     --base_model Qwen/Qwen3-8B \\
     --tasks niah_multikey_3 niah_multivalue qa_2 \\
     --seq_len 32768 --num_samples 5 \\
@@ -52,14 +52,14 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from oracle.attention_mass_recall_ruler_quest import (
+from observations.attention_mass_recall_ruler_quest import (
     _install_recording_forward,
     _model_family,
     cleanup_model,
     load_model,
     set_recording_hook,
 )
-from oracle.attention_mass_recall_ruler import (
+from observations.attention_mass_recall_ruler import (
     ALL_TASKS,
     compute_dct_lowpass_proxy_scores,
     compute_oracle_max_scores,
@@ -67,7 +67,7 @@ from oracle.attention_mass_recall_ruler import (
     compute_quest_scores,
     load_task_configs,
 )
-from oracle.haar_kernels import (
+from observations.haar_kernels import (
     haar_page_features,
     haar_score_per_page,
 )
@@ -494,7 +494,7 @@ def parse_args() -> argparse.Namespace:
 
 def _self_test() -> None:
     """No-model sanity: known correlation between mass and feature."""
-    from oracle.haar_kernels import _self_test as ker_test
+    from observations.haar_kernels import _self_test as ker_test
     ker_test()
     # Inject a synthetic relationship: bigger Haar H → bigger mass.
     torch.manual_seed(0)

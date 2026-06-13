@@ -146,7 +146,7 @@ reproduced inline from (Q, paged_k) — no dependency on the DCT forward
 itself.
 
 Usage:
-    python oracle/attention_mass_recall_ruler.py \\
+    python observations/attention_mass_recall_ruler.py \\
         --base_model meta-llama/Llama-3.1-8B-Instruct \\
         --tasks niah_single_1 --num_samples 2 --seq_len 32768 \\
         --page_size 16 --top_k 128 --num_decode_steps 2 \\
@@ -1687,7 +1687,7 @@ def generate_with_mass_traces(
     comp_kv_quant_granularity: str,
 ) -> tuple[list[dict[str, Any]], int]:
     """Run generate() with a fresh dense-trajectory recording hook installed."""
-    from oracle.attention_mass_recall_ruler_quest import (
+    from observations.attention_mass_recall_ruler_quest import (
         set_prefill_recording_hook,
         set_recording_hook,
     )
@@ -1879,7 +1879,7 @@ def generate_with_paged_mass_ratio_sweep(
     group_agg_method: str,
 ) -> tuple[list[dict[str, Any]], int]:
     """generate() wrapper that installs a fresh PagedMassRatioSweepRecorder."""
-    from oracle.attention_mass_recall_ruler_quest import set_recording_hook
+    from observations.attention_mass_recall_ruler_quest import set_recording_hook
 
     device = next(model.parameters()).device
     encoded = tokenizer(sample["input"], return_tensors="pt")
@@ -2371,7 +2371,7 @@ def _render_comp_size_sweep_plot(
 
 def _run_comp_size_sweep(args: argparse.Namespace) -> None:
     """Sweep comp_size and emit per-layer / overall paged_mass_ratio + plot."""
-    from oracle.attention_mass_recall_ruler_quest import (
+    from observations.attention_mass_recall_ruler_quest import (
         _install_recording_forward,
         _model_family,
         cleanup_model,
@@ -2774,7 +2774,7 @@ def _run_comp_size_sweep(args: argparse.Namespace) -> None:
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
-    from oracle.attention_mass_recall_ruler_quest import (
+    from observations.attention_mass_recall_ruler_quest import (
         _install_recording_forward,
         _model_family,
         cleanup_model,
