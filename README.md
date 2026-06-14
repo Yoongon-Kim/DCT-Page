@@ -65,11 +65,8 @@ Each baseline folder has a `config.py` with defaults (pattern paths, model names
 | [observations/dct_page_energy.py](observations/dct_page_energy.py) | Standalone observation: runs a model and measures per-page DCT-lowpass energy of K/V (proxy sanity/visualization). |
 | [observations/oracle_ruler.py](observations/oracle_ruler.py) | Standalone RULER runner; flat per-task JSONL output. |
 | [observations/diagnose_scoring_methods.py](observations/diagnose_scoring_methods.py) | Compares ~30 proxy scoring methods against a configurable ground truth (`oracle_max` or `output_contribution`). |
-| [observations/attention_mass_recall_ruler.py](observations/attention_mass_recall_ruler.py) | Dense-trajectory reference: full-KV forward, computes per-selector attention-mass recall (DCT, Quest, ShadowKV, oracle_max, mass-topk ceiling). |
-| [observations/attention_mass_recall_ruler_quest.py](observations/attention_mass_recall_ruler_quest.py) | Quest-specific mass-recall variant. |
+| [observations/attention_mass_recall_ruler.py](observations/attention_mass_recall_ruler.py) | Dense-trajectory reference: full-KV forward, computes per-selector attention-mass recall (DCT, Quest, ShadowKV, oracle_max, mass-topk ceiling). `--mode full` (default) or `--mode quest` (Quest-native geometry). |
 | [observations/oracle_hybrid_ruler.py](observations/oracle_hybrid_ruler.py) | Oracle-selection + hybrid-unselected sweeps. |
-| [observations/run_ruler_oracle_selection.py](observations/run_ruler_oracle_selection.py) | Oracle upper-bound selection sweeps across page sizes at a fixed selected-token budget. |
-| [observations/dc_ac_ruler.py](observations/dc_ac_ruler.py), [observations/hybridmulti_ruler.py](observations/hybridmulti_ruler.py) | Legacy sweep wrappers (relied on removed scoring methods; kept for historical comparison). |
 
 ### Speed / profiling (`speed/`)
 
@@ -367,13 +364,6 @@ python observations/attention_mass_recall_ruler.py \
   --context_len 32768 \
   --page_size 32 --top_k 64
 
-# Oracle-selection upper-bound sweep across page sizes (fixed selected-token budget)
-python observations/run_ruler_oracle_selection.py \
-  --context_len 32768 \
-  --page_sizes 32,64,128 \
-  --selected_token_budget 2048 \
-  --compress_ratio 0.03125
-
 # Standalone RULER runner (independent of eval_ruler.py)
 python observations/oracle_ruler.py \
   --mode page_attention \
@@ -410,7 +400,7 @@ Key outputs land under `results/ruler_oracle_selection/<run>/`: `summary.tsv`, `
 ## Notes
 
 - The only active score proxy is **DCT-lowpass-IDCT**. Haar, Walsh-Hadamard, direct-spectral, and alternate frequency layouts (`low_high`, `low_mid_high`, `spread`) have been removed.
-- Supported `scoring_method`: `"max"`, `"mean"`, `"sum"` (plus the QUEST-style min/max variant via `--score_use_quest_minmax`). `dc_ac` / `spectral_recon_max` / `hybrid_multi` families were removed; the `observations/dc_ac_ruler.py` and `observations/hybridmulti_ruler.py` wrappers remain but are no longer functional.
+- Supported `scoring_method`: `"max"`, `"mean"`, `"sum"` (plus the QUEST-style min/max variant via `--score_use_quest_minmax`). `dc_ac` / `spectral_recon_max` / `hybrid_multi` families were removed.
 - `compressed` mode is for accuracy experiments; speed optimisation targets `drop`.
 - Below `min_decode_kv_len_for_paging=8192`, the patch falls back to baseline decode attention.
 - `max_unselected_compressed` (default `-1`) limits how many unselected pages contribute compressed KV: `-1` = unlimited, `0` = drop-equivalent, `N` = top-N by score.

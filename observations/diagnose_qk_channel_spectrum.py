@@ -23,7 +23,7 @@ Outputs (per layer, averaged over q_head / h_kv / page / decode_step / sample):
                              = nothing lost; small = proxy can't see it.
 
 A standalone script — does NOT touch the DCT-Page forward. Reuses the
-dense-recording hook from attention_mass_recall_ruler_quest so post-RoPE
+dense-recording hook from attention_mass_recall_ruler so post-RoPE
 post-QK-norm K is captured exactly as the existing diagnostic sees it.
 
 Usage:
@@ -54,7 +54,7 @@ from transformers import AutoTokenizer
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT))
 
-from observations.attention_mass_recall_ruler_quest import (
+from observations.attention_mass_recall_ruler import (
     _install_recording_forward,
     _model_family,
     cleanup_model,

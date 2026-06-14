@@ -7,7 +7,7 @@ Hypothesis under test (HARP premise):
      receives high attention mass." Operationally:
         Haar H L2-norm summary  ↔  true softmax mass per page.
 
-The recording-forward hook from attention_mass_recall_ruler_quest.py
+The recording-forward hook from attention_mass_recall_ruler.py
 runs the **unmodified full-KV forward** and captures (Q, K) per decode
 step. We then, per layer and decode step:
   1. Reshape K into [pages × page_size] (paged_k), preserving the
@@ -52,7 +52,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from observations.attention_mass_recall_ruler_quest import (
+from observations.attention_mass_recall_ruler import (
     _install_recording_forward,
     _model_family,
     cleanup_model,

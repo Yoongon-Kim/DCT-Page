@@ -94,12 +94,8 @@ Model support: **Llama 3.x** (`replace_llama_attn`) and **Qwen3** (`replace_qwen
 | `dct_page_energy.py` | Standalone observation tool: runs a model and measures per-page DCT-lowpass energy of K/V (proxy sanity/visualization). |
 | `oracle_ruler.py` | Standalone RULER runner for oracle experiments. Flat per-task JSONL output. |
 | `diagnose_scoring_methods.py` | Compares ~30 scoring methods (oracle_max/mean, proxy_max/mean, l2_energy, dc_ac_*, spectral_recon_*, continuous_cosine_max, hybrid_*) against a configurable ground truth (`oracle_max` or `output_contribution`). |
-| `attention_mass_recall_ruler.py` | Dense-trajectory reference: runs **unmodified full-KV forward**, observes Q/K/V per decode step, computes per-selector mass-recall (DCT, Quest, ShadowKV, oracle_max, mass-topk ceiling). Reports full-KV / selected-page / paged-only metric families. |
-| `attention_mass_recall_ruler_quest.py` | Quest-specific variant of the mass-recall diagnostic. |
-| `dc_ac_ruler.py` | Sweeps `dc_ac` / `proxy_dc_ac` scoring methods with lambda tuning on RULER (relies on removed scoring methods; kept for historical comparison). |
-| `hybridmulti_ruler.py` | Sweeps the `hybrid_multi` budgeted scoring method (`M`, `alpha`). (Relies on removed scoring methods; kept for historical comparison.) |
+| `attention_mass_recall_ruler.py` | Dense-trajectory reference: runs **unmodified full-KV forward**, observes Q/K/V per decode step, computes per-selector mass-recall (DCT, Quest, ShadowKV, oracle_max, mass-topk ceiling). Reports full-KV / selected-page / paged-only metric families. Two experiments via `--mode`: `full` (default, multi-selector) and `quest` (Quest-native geometry: last-page keep, skip layers 0–1). |
 | `oracle_hybrid_ruler.py` | Oracle-selection + hybrid-unselected sweeps (oracle pages kept as Haar lowpass proxy). |
-| `run_ruler_oracle_selection.py` | Orchestrates oracle-selection upper-bound sweeps across page sizes at a fixed selected-token budget. |
 
 ### `speed/`
 
@@ -223,11 +219,6 @@ python observations/diagnose_scoring_methods.py \
 python observations/attention_mass_recall_ruler.py --context_len 32768 \
   --page_size 32 --top_k 64
 
-# Oracle upper-bound selection sweep across page sizes (fixed selected-token budget)
-python observations/run_ruler_oracle_selection.py \
-  --context_len 32768 --page_sizes 32,64,128 \
-  --selected_token_budget 2048 --compress_ratio 0.03125
-
 # Standalone RULER runner for ad-hoc experiments
 python observations/oracle_ruler.py --mode page_attention --context_len 16384 \
   --tasks niah_multikey_3 --tag my_run --num_samples 25 --cuda_device 0 \
@@ -256,7 +247,7 @@ python observations/oracle_ruler.py --mode page_attention --context_len 16384 \
 ## Notes
 
 - **Score proxy**: DCT-lowpass-IDCT only. Haar, Walsh-Hadamard, direct-spectral, and alternate frequency layouts have been removed.
-- **Supported `scoring_method`**: `"max"`, `"mean"`, `"sum"` (and the QUEST-style min/max variant via `score_use_quest_minmax=True`). `dc_ac`, `spectral_recon_max`, `hybrid_multi` scoring methods were removed; the `observations/dc_ac_ruler.py` and `observations/hybridmulti_ruler.py` sweep wrappers remain but are no longer functional without those scoring methods.
+- **Supported `scoring_method`**: `"max"`, `"mean"`, `"sum"` (and the QUEST-style min/max variant via `score_use_quest_minmax=True`). `dc_ac`, `spectral_recon_max`, `hybrid_multi` scoring methods were removed (their `observations/` sweep wrappers were deleted along with them).
 - **`drop` vs `compressed`**: `drop` is the speed path; `compressed` is for accuracy experiments.
 - **`min_decode_kv_len_for_paging=8192`**: below this KV length, the patch falls back to baseline decode attention.
 - **`max_unselected_compressed`** (default `-1`): caps how many unselected pages contribute compressed KV. `-1`=unlimited, `0`=drop-equivalent, `N`=top-N by score.
