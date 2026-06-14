@@ -64,7 +64,7 @@ Each baseline folder has a `config.py` with defaults (pattern paths, model names
 |---|---|
 | [observations/dct_page_energy.py](observations/dct_page_energy.py) | Standalone observation: runs a model and measures per-page DCT-lowpass energy of K/V (proxy sanity/visualization). |
 | [observations/oracle_ruler.py](observations/oracle_ruler.py) | Standalone RULER runner; flat per-task JSONL output. |
-| [observations/diagnose_scoring_methods.py](observations/diagnose_scoring_methods.py) | Compares ~30 proxy scoring methods against a configurable ground truth (`oracle_max` or `output_contribution`). |
+| [observations/scoring_method_recall.py](observations/scoring_method_recall.py) | Compares ~30 proxy scoring methods against a configurable ground truth (`oracle_max` or `output_contribution`). |
 | [observations/attention_mass_recall_ruler.py](observations/attention_mass_recall_ruler.py) | Dense-trajectory reference: full-KV forward, computes per-selector attention-mass recall (DCT, Quest, ShadowKV, oracle_max, mass-topk ceiling). `--mode full` (default) or `--mode quest` (Quest-native geometry). |
 | [observations/oracle_hybrid_ruler.py](observations/oracle_hybrid_ruler.py) | Oracle-selection + hybrid-unselected sweeps. |
 
@@ -354,7 +354,7 @@ Reports chained-CUDA-event timings for `qkv`, `score_cache_update`, `score_pages
 
 ```bash
 # Scoring-method comparison vs. full-KV ground truth
-python observations/diagnose_scoring_methods.py \
+python observations/scoring_method_recall.py \
   --ground_truths oracle_max,output_contribution \
   --context_len 16384 \
   --model_name_or_path meta-llama/Llama-3.1-8B-Instruct

@@ -27,7 +27,7 @@ dense-recording hook from attention_mass_recall_ruler so post-RoPE
 post-QK-norm K is captured exactly as the existing diagnostic sees it.
 
 Usage:
-  python observations/diagnose_qk_channel_spectrum.py \\
+  python observations/qk_channel_spectrum.py \\
     --base_model Qwen/Qwen3-8B \\
     --tasks niah_multikey_3 \\
     --seq_len 32768 --num_samples 5 \\

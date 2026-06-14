@@ -2,7 +2,7 @@
 
 Forward decomposition, top-K detail selection, and adaptive 2-token
 representative reconstruction (L_3 ± β · H_selected). Pure PyTorch — no
-Triton fallback at this stage. Used by observations/diagnose_haar_mass_correlation.py
+Triton fallback at this stage. Used by observations/haar_mass_correlation.py
 and (later) by the Haar selector in observations/attention_mass_recall_ruler.py.
 
 Shape convention:

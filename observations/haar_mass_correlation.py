@@ -28,7 +28,7 @@ Outputs per-layer ρ values to ``summary.json``. Stage-0 gate (see
                           and  ρ(haar_inject) ≥ ρ(dct_lowpass) + 0.05.
 
 Usage:
-  python observations/diagnose_haar_mass_correlation.py \\
+  python observations/haar_mass_correlation.py \\
     --base_model Qwen/Qwen3-8B \\
     --tasks niah_multikey_3 niah_multivalue qa_2 \\
     --seq_len 32768 --num_samples 5 \\

@@ -93,7 +93,7 @@ Model support: **Llama 3.x** (`replace_llama_attn`) and **Qwen3** (`replace_qwen
 |---|---|
 | `dct_page_energy.py` | Standalone observation tool: runs a model and measures per-page DCT-lowpass energy of K/V (proxy sanity/visualization). |
 | `oracle_ruler.py` | Standalone RULER runner for oracle experiments. Flat per-task JSONL output. |
-| `diagnose_scoring_methods.py` | Compares ~30 scoring methods (oracle_max/mean, proxy_max/mean, l2_energy, dc_ac_*, spectral_recon_*, continuous_cosine_max, hybrid_*) against a configurable ground truth (`oracle_max` or `output_contribution`). |
+| `scoring_method_recall.py` | Compares ~30 scoring methods (oracle_max/mean, proxy_max/mean, l2_energy, dc_ac_*, spectral_recon_*, continuous_cosine_max, hybrid_*) against a configurable ground truth (`oracle_max` or `output_contribution`). |
 | `attention_mass_recall_ruler.py` | Dense-trajectory reference: runs **unmodified full-KV forward**, observes Q/K/V per decode step, computes per-selector mass-recall (DCT, Quest, ShadowKV, oracle_max, mass-topk ceiling). Reports full-KV / selected-page / paged-only metric families. Two experiments via `--mode`: `full` (default, multi-selector) and `quest` (Quest-native geometry: last-page keep, skip layers 0–1). |
 | `oracle_hybrid_ruler.py` | Oracle-selection + hybrid-unselected sweeps (oracle pages kept as Haar lowpass proxy). |
 
@@ -210,7 +210,7 @@ python speed/profile_decode.py --context_length 32768 \
 
 ```bash
 # Scoring-method comparison (no DCT patch; uses full-KV ground truth)
-python observations/diagnose_scoring_methods.py \
+python observations/scoring_method_recall.py \
   --ground_truths oracle_max,output_contribution \
   --context_len 16384 \
   --model_name_or_path meta-llama/Llama-3.1-8B-Instruct
