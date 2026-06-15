@@ -101,9 +101,9 @@ Model support: **Llama 3.x** (`replace_llama_attn`) and **Qwen3** (`replace_qwen
 
 | File | Purpose |
 |---|---|
-| `speed_test_dummy.py` | Decode throughput benchmark with dummy (random) token inputs. `--mode baseline\|dct\|multipole\|both` (`both`=baseline+dct; `multipole` standalone). |
+| `speed_test_dummy.py` | Decode throughput benchmark with dummy (random) token inputs. `--mode baseline\|dct\|multipole` (one per run). |
 | `profile_decode.py` | Per-stage decode-path timing with chained CUDA events (`qkv`, `score_cache_update`, `score_pages_kernel`, `topk`, `assemble_drop_and_final_k_original_rope`, `sdpa`, `o_proj`). |
-| `run_speed_test_dummy.sh` | Wrapper that runs baseline + DCT configurations and prints a tok/s comparison table. |
+| `compare_speed_dummy.sh` | Wrapper that runs baseline + DCT configurations and prints a tok/s comparison table. |
 
 ### `benchmark/`
 
@@ -192,7 +192,7 @@ python eval_gpqa.py --mode page_attention --gpqa_subset diamond \
 ### Speed / profiling
 
 ```bash
-bash speed/run_speed_test_dummy.sh
+bash speed/compare_speed_dummy.sh
 
 python speed/speed_test_dummy.py --mode dct \
   --model meta-llama/Llama-3.1-8B-Instruct \

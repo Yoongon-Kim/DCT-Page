@@ -72,9 +72,9 @@ Each baseline folder has a `config.py` with defaults (pattern paths, model names
 
 | File | Purpose |
 |---|---|
-| [speed/speed_test_dummy.py](speed/speed_test_dummy.py) | Decode throughput benchmark with dummy (random) token inputs. Modes: `baseline`, `dct`, `multipole`, `both` (=baseline+dct). |
+| [speed/speed_test_dummy.py](speed/speed_test_dummy.py) | Decode throughput benchmark with dummy (random) token inputs. Modes: `baseline`, `dct`, `multipole` (one per run). |
 | [speed/profile_decode.py](speed/profile_decode.py) | Per-stage decode profile with chained CUDA events. |
-| [speed/run_speed_test_dummy.sh](speed/run_speed_test_dummy.sh) | Wrapper that runs baseline + DCT configs and prints a tok/s table. |
+| [speed/compare_speed_dummy.sh](speed/compare_speed_dummy.sh) | Wrapper that runs baseline + DCT configs and prints a tok/s table. |
 
 ### Benchmark infrastructure (`benchmark/`)
 
@@ -316,8 +316,8 @@ python eval_gpqa.py --mode page_attention \
 ### Throughput (dummy inputs)
 
 ```bash
-bash speed/run_speed_test_dummy.sh
-GPU=1 CONTEXT_LENGTHS="8192,16384,32768,65536" NUM_REPEATS=5 bash speed/run_speed_test_dummy.sh
+bash speed/compare_speed_dummy.sh
+GPU=1 CONTEXT_LENGTHS="8192,16384,32768,65536" NUM_REPEATS=5 bash speed/compare_speed_dummy.sh
 ```
 
 Direct invocation:

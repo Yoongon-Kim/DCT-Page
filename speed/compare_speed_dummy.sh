@@ -1,5 +1,6 @@
 #!/bin/bash
-# Decode speed benchmark with dummy inputs — Baseline vs DCT Page Attention
+# Compare decode speed (dummy inputs): runs Baseline + DCT Page Attention,
+# then prints a tok/s table across every run under $OUTPUT_DIR.
 set -e
 
 # ---- Configuration ----
@@ -32,25 +33,21 @@ for COMPRESS_RATIO in 0.032; do
         for SCORING in mean; do
             for GAM in max; do
                 for UMODE in compressed; do
-                    for CROPE in continuous; do
-                        for TRITON in triton; do
-                            echo ""
-                            echo "============================================================"
-                            echo "DCT: compress=${COMPRESS_RATIO} top_k=${TOP_K} scoring=${SCORING} gam=${GAM} unselected=${UMODE} rope=${CROPE} ${TRITON}"
-                            echo "============================================================"
-                            python speed_test_dummy.py \
-                                --mode dct \
-                                $COMMON_ARGS \
-                                --page_size        $PAGE_SIZE \
-                                --num_sink_pages   $NUM_SINK_PAGES \
-                                --num_recent_pages $NUM_RECENT_PAGES \
-                                --compress_ratio   $COMPRESS_RATIO \
-                                --top_k            $TOP_K \
-                                --scoring_method   $SCORING \
-                                --group_agg_method $GAM \
-                                --unselected_mode  $UMODE
-                        done
-                    done
+                    echo ""
+                    echo "============================================================"
+                    echo "DCT: compress=${COMPRESS_RATIO} top_k=${TOP_K} scoring=${SCORING} gam=${GAM} unselected=${UMODE}"
+                    echo "============================================================"
+                    python speed_test_dummy.py \
+                        --mode dct \
+                        $COMMON_ARGS \
+                        --page_size        $PAGE_SIZE \
+                        --num_sink_pages   $NUM_SINK_PAGES \
+                        --num_recent_pages $NUM_RECENT_PAGES \
+                        --compress_ratio   $COMPRESS_RATIO \
+                        --top_k            $TOP_K \
+                        --scoring_method   $SCORING \
+                        --group_agg_method $GAM \
+                        --unselected_mode  $UMODE
                 done
             done
         done
