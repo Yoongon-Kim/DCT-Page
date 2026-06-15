@@ -382,13 +382,6 @@ Mass-recall reports three metric families per query head (see the module docstri
 - **Selected-page mass** — fraction of total softmax mass landing on the selector's top-k pages.
 - **Paged-only mass** — same fraction with the sink+recent floor stripped out of both numerator and denominator.
 
-The oracle upper-bound sweep fixes the *selected full-token budget* and varies page size, e.g.:
-- `page_size=32 → top_k=64`
-- `page_size=64 → top_k=32`
-- `page_size=128 → top_k=16`
-
-Key outputs land under `results/ruler_oracle_selection/<run>/`: `summary.tsv`, `summary_avg.tsv`, `summary.json`, `commands.sh`, and per-task JSONL files in each `ps<N>_topk<K>/` subdir.
-
 ## Results directories
 
 All benchmark and diagnostic outputs live under a single `results/` root (gitignored), one subdirectory per benchmark:
