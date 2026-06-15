@@ -7,7 +7,7 @@ set -e
 
 PYTHON="conda run -n dct python"
 
-OUTPUT_DIR="${OUTPUT_DIR:-result/ruler}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/ruler}"
 NUM_SAMPLES="${NUM_SAMPLES:-25}"
 PAGE_SIZE="${PAGE_SIZE:-32}"
 TOP_K="${TOP_K:-64}"

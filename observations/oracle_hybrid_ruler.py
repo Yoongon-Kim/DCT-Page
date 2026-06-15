@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data_root", type=Path, default=Path("benchmark/data/ruler_data"),
                    help="Root dir containing <model_family>/<context_len>/<task>/validation.jsonl. "
                         "Forwarded to oracle_ruler.py as --data_root.")
-    p.add_argument("--output_root", type=Path, default=Path("results/results_ruler/oracle_hybrid"))
+    p.add_argument("--output_root", type=Path, default=Path("results/ruler/oracle_hybrid"))
     p.add_argument("--tag", default="oracle_hybrid")
     p.add_argument("--combos", nargs="+", default=["16,8", "32,4", "64,2"],
                    help="Space-separated page_size,top_k pairs. "

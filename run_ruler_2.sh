@@ -6,7 +6,7 @@ set -e
 # ---- Configuration (env defaults, overridable via CLI flags below) ----
 BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-8B}"
 NUM_SAMPLES="${NUM_SAMPLES:-25}"
-OUTPUT_DIR="${OUTPUT_DIR:-result/ruler}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/ruler}"
 PREPARE_FLAG=""
 
 # ---- Parse CLI flags ----

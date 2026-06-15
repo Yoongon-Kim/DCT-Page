@@ -1225,7 +1225,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output_dir",
         type=Path,
-        default=Path("results/results_ruler/scoring_methods_diagnostic"),
+        default=Path("results/ruler/scoring_methods_diagnostic"),
     )
     p.add_argument("--tasks", default="cwe", help="Comma-separated task names or 'all'")
     p.add_argument("--num_samples", type=int, default=10)

@@ -21,7 +21,7 @@ MAX_INPUT_LEN="${MAX_INPUT_LEN:-127500}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
 PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-2048}"
-OUTPUT_DIR="${OUTPUT_DIR:-result/longbench_v2}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/longbench_v2}"
 
 # Llama only
 case "$(echo "$BASE_MODEL" | tr '[:upper:]' '[:lower:]')" in

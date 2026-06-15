@@ -19,7 +19,7 @@ BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 MODEL_FAMILY="${MODEL_FAMILY:-llama3}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-127500}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
-OUTPUT_DIR="${OUTPUT_DIR:-result/longbench_v1}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/longbench_v1}"
 
 # Llama only
 case "$(echo "$BASE_MODEL" | tr '[:upper:]' '[:lower:]')" in

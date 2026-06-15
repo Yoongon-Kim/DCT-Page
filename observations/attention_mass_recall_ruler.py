@@ -1860,7 +1860,7 @@ def parse_args_full() -> argparse.Namespace:
 
     # Output
     p.add_argument("--output_dir", type=Path,
-                   default=Path("result/attention_mass_recall"))
+                   default=Path("results/attention_mass_recall"))
     p.add_argument("--run_name", type=str, default=None)
     return p.parse_args()
 
@@ -3327,7 +3327,7 @@ def parse_args_quest() -> argparse.Namespace:
     p.add_argument("--num_decode_steps", type=int, default=20)
 
     p.add_argument("--output_dir", type=Path,
-                   default=Path("results_quest_mass_recall"))
+                   default=Path("results/quest_mass_recall"))
     p.add_argument("--run_name", type=str, default=None)
     return p.parse_args()
 

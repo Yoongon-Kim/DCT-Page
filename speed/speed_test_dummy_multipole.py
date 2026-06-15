@@ -6,7 +6,7 @@ dependency.  Measures prefill time, decode speed, and attention-only time
 separately.
 
 Results are saved under:
-    results/speed_test_dummy_multipole/<run_name>/
+    results/speed_multipole/<run_name>/
         samples.jsonl   — per-(length, repeat) timing records
         summary.json    — aggregated stats grouped by context length
 
@@ -449,7 +449,7 @@ def parse_args():
     p.add_argument("--chunk_size", type=int, default=0,
                    help="Chunked prefill size (0 = single-pass). "
                         "Use e.g. 8192 to reduce peak memory for long contexts.")
-    p.add_argument("--output_dir", default="results/results_speed/speed_test_dummy_multipole")
+    p.add_argument("--output_dir", default="results/speed/speed_test_dummy_multipole")
     p.add_argument("--run_name", default=None)
     p.add_argument("--no_measure_attn", action="store_true",
                    help="Disable attention-only timing (enabled by default)")

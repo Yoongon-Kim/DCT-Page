@@ -20,11 +20,11 @@ Outputs:
 
 Usage:
     python eval_math500.py --mode baseline \
-        --num_samples 25 --output_dir result/math500 --run_name smoke
+        --num_samples 25 --output_dir results/math500 --run_name smoke
 
     python eval_math500.py --mode page_attention \
         --page_size 32 --top_k 64 --unselected_mode drop \
-        --output_dir result/math500 --run_name page_topk64
+        --output_dir results/math500 --run_name page_topk64
 """
 
 import os
@@ -184,7 +184,7 @@ def parse_args():
     parser.add_argument("--min_p", type=float, default=0.0)
 
     # Output
-    parser.add_argument("--output_dir", type=str, default="result/math500")
+    parser.add_argument("--output_dir", type=str, default="results/math500")
     parser.add_argument("--run_name", type=str, default=None)
 
     # DCT Page Attention params (mirror eval_aime25)

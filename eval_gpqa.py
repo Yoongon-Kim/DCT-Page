@@ -19,11 +19,11 @@ Outputs:
 Usage:
     python eval_gpqa.py --mode baseline \
         --gpqa_subset diamond --num_samples 5 \
-        --output_dir result/gpqa --run_name smoke_baseline
+        --output_dir results/gpqa --run_name smoke_baseline
 
     python eval_gpqa.py --mode page_attention \
         --page_size 32 --top_k 64 --unselected_mode drop \
-        --output_dir result/gpqa --run_name qwen_page_topk64
+        --output_dir results/gpqa --run_name qwen_page_topk64
 """
 
 import os
@@ -183,7 +183,7 @@ def parse_args():
                         help="Reasoning chains can be long; default 8192 tokens")
 
     # Output
-    parser.add_argument("--output_dir", type=str, default="result/gpqa")
+    parser.add_argument("--output_dir", type=str, default="results/gpqa")
     parser.add_argument("--run_name", type=str, default=None,
                         help="Name for this run (auto-generated if not given)")
 

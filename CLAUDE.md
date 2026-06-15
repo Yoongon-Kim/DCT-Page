@@ -146,11 +146,11 @@ python eval_ruler.py --mode page_attention \
   --base_model Qwen/Qwen3-8B \
   --seq_lengths 32768 --num_samples 25 \
   --page_size 32 --top_k 64 --compress_ratio 0.125 \
-  --unselected_mode drop --output_dir results_ruler --run_name qwen_drop_ps32_t64
+  --unselected_mode drop --output_dir results/ruler --run_name qwen_drop_ps32_t64
 
 # Baseline
 python eval_ruler.py --mode baseline --base_model Qwen/Qwen3-8B \
-  --seq_lengths 32768 --output_dir results_ruler --run_name baseline
+  --seq_lengths 32768 --output_dir results/ruler --run_name baseline
 
 # Baseline sweep
 bash run_ruler.sh            # Qwen3-8B default
@@ -182,7 +182,7 @@ python eval_longbench_v2.py --mode baseline \
 ```bash
 python eval_aime25.py --mode page_attention --max_new_tokens 16384 \
   --page_size 32 --top_k 64 --unselected_mode drop \
-  --output_dir results_aime25 --run_name aime25_drop
+  --output_dir results/aime25 --run_name aime25_drop
 
 python eval_gpqa.py --mode page_attention --gpqa_subset diamond \
   --max_new_tokens 8192 \
@@ -240,9 +240,8 @@ python observations/oracle_ruler.py --mode page_attention --context_len 16384 \
 
 - RULER synthetic data (on-disk cache from `benchmark/eval_ruler/data/prepare.py`):
   - `benchmark/data/ruler_data/{model_family}/{seq_len}/{task}/validation.jsonl` (canonical)
-  - `results_ruler/data/synthetic/{seq_len}/` (legacy, used by some oracle scripts)
 - LongBench v1: `longbench_v1_data/data/*.jsonl` or `benchmark/data/longbench_v1_data/*.jsonl`
-- Results roots: `results/`, `results_ruler/`, `results_attention_mass_recall/`, `results_proxy_slice_overlap/`, `results_quest_mass_recall/`
+- Results root: single `results/` (gitignored), one subdir per benchmark — `results/{ruler,longbench_v1,longbench_v2,aime25,gpqa,math500,speed,energy,attention_mass_recall}/`. RULER oracle diagnostics live under `results/ruler/{oracle,oracle_hybrid,ablations,scoring_methods_diagnostic}/`.
 
 ## Notes
 

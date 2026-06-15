@@ -8,7 +8,7 @@ set -e
 BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-8B}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-127500}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
-OUTPUT_DIR="${OUTPUT_DIR:-result/longbench_v1}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/longbench_v1}"
 
 # Same tasks as run_longbench_v1.sh
 TASKS="${TASKS:-narrativeqa qasper gov_report 2wikimqa multifieldqa_en triviaqa}"

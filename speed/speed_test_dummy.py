@@ -5,7 +5,7 @@ Generates random token sequences of configurable lengths, avoiding any dataset
 dependency.  Measures prefill and decode speed separately.
 
 Results are saved under:
-    results/speed_test_dummy/<run_name>/
+    results/speed/<run_name>/
         samples.jsonl   — per-(length, repeat) timing records
         summary.json    — aggregated stats grouped by context length
 
@@ -328,7 +328,7 @@ def parse_args():
                         "Default: baseline uses PreAllocatedLayer, matching the DCT path, "
                         "so the measured speedup isolates the attention-sparsity gain "
                         "rather than conflating it with cache-management overhead.")
-    p.add_argument("--output_dir", default="results/speed_test_dummy")
+    p.add_argument("--output_dir", default="results/speed")
     p.add_argument("--run_name", default=None)
 
     dct = p.add_argument_group("DCT Page Attention config")

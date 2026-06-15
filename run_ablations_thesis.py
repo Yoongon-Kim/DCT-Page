@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Iterable
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "results_ruler" / "ablations"
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "results/ruler" / "ablations"
 
 BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 SEQ_LEN = 32768

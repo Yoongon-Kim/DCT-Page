@@ -182,7 +182,7 @@ python eval_ruler.py \
   --page_size 32 --top_k 64 \
   --compress_ratio 0.125 \
   --unselected_mode drop \
-  --output_dir results_ruler \
+  --output_dir results/ruler \
   --run_name qwen_drop_ps32_t64
 ```
 
@@ -193,7 +193,7 @@ python eval_ruler.py \
   --base_model Qwen/Qwen3-8B \
   --seq_lengths 32768 \
   --num_samples 25 \
-  --output_dir results_ruler \
+  --output_dir results/ruler \
   --run_name baseline
 ```
 
@@ -210,24 +210,24 @@ Add `--prepare` to generate synthetic data on demand (cached under `benchmark/da
 ```bash
 # SeerAttention-R
 python eval_ruler.py --mode seer_attention --base_model Qwen/Qwen3-8B \
-  --output_dir results_ruler --run_name seer_budget1024
+  --output_dir results/ruler --run_name seer_budget1024
 # (token budget set in baselines/seer_attn/config.py or via seer CLI flags)
 
 # Multipole
 python eval_ruler.py --mode multipole_attention --base_model meta-llama/Llama-3.1-8B-Instruct \
-  --output_dir results_ruler --run_name multipole
+  --output_dir results/ruler --run_name multipole
 
 # Quest
 python eval_ruler.py --mode quest_attention --base_model Qwen/Qwen3-8B \
-  --page_size 16 --top_k 128 --output_dir results_ruler --run_name quest
+  --page_size 16 --top_k 128 --output_dir results/ruler --run_name quest
 
 # DuoAttention (requires duo_env)
 python eval_ruler.py --mode duo_attention --base_model meta-llama/Llama-3.1-8B-Instruct \
-  --output_dir results_ruler --run_name duo
+  --output_dir results/ruler --run_name duo
 
 # InfLLM (runs in main DCT_Page env)
 python eval_ruler.py --mode inf_llm --base_model meta-llama/Llama-3.1-8B-Instruct \
-  --output_dir results_ruler --run_name inf_llm
+  --output_dir results/ruler --run_name inf_llm
 ```
 
 ### Sweep scripts
@@ -247,7 +247,7 @@ bash run_ruler_quest.sh            # launches LLaMA on GPU 2, Qwen3 on GPU 3
 python benchmark/eval_ruler/pred/predict_dctpage.py \
   --model_name_or_path meta-llama/Llama-3.1-8B-Instruct \
   --data_dir benchmark/data/ruler_data/llama/8192 \
-  --save_dir results_ruler/predict_dctpage \
+  --save_dir results/ruler/predict_dctpage \
   --task qa_1 \
   --dct_page_size 32 --dct_top_k 64 \
   --dct_compress_ratio 0.03125 \
@@ -303,7 +303,7 @@ Reasoning benchmarks. Both scripts accept the full method-mode list for argparse
 python eval_aime25.py --mode page_attention \
   --max_new_tokens 16384 \
   --page_size 32 --top_k 64 --unselected_mode drop \
-  --output_dir results_aime25 --run_name drop
+  --output_dir results/aime25 --run_name drop
 
 python eval_gpqa.py --mode page_attention \
   --gpqa_subset diamond \
@@ -391,11 +391,14 @@ Key outputs land under `results/ruler_oracle_selection/<run>/`: `summary.tsv`, `
 
 ## Results directories
 
-- `results/` — LongBench v1/v2, RULER, and speed test results
-- `results_ruler/` — legacy RULER result tree (some oracle scripts still write here)
-- `results_attention_mass_recall/` — per-configuration mass-recall outputs (e.g. `mass_dense_ps32_topk128_cr0.125_fp8_e4m3/`)
-- `results_proxy_slice_overlap/` — proxy slice-overlap experiments (`fwe/`, `smoke/`)
-- `results_quest_mass_recall/` — Quest-specific mass-recall analyses
+All benchmark and diagnostic outputs live under a single `results/` root (gitignored), one subdirectory per benchmark:
+
+- `results/ruler/` — RULER runs, plus oracle diagnostics under `oracle/`, `oracle_hybrid/`, `ablations/`, `scoring_methods_diagnostic/`
+- `results/longbench_v1/`, `results/longbench_v2/` — LongBench v1/v2 runs
+- `results/aime25/`, `results/gpqa/`, `results/math500/` — reasoning benchmarks
+- `results/speed/` — decode-throughput speed tests
+- `results/energy/` — per-page DCT energy measurements
+- `results/attention_mass_recall/` — per-configuration mass-recall outputs (e.g. `mass_dense_ps16_topk128_cr0.125_fp8_e4m3/`)
 
 ## Notes
 

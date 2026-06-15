@@ -185,7 +185,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model_name_or_path", default="Qwen/Qwen3-8B")
     p.add_argument("--context_len", type=int, default=32768)
     p.add_argument("--data_root", type=Path, default=Path("benchmark/data/ruler_data"))
-    p.add_argument("--output_root", type=Path, default=Path("results/results_ruler/oracle"))
+    p.add_argument("--output_root", type=Path, default=Path("results/ruler/oracle"))
     p.add_argument("--tag", default="ruler_run")
     p.add_argument("--run_dir", type=Path, default=None)
     p.add_argument("--benchmark", default="synthetic")

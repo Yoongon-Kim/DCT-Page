@@ -1,7 +1,7 @@
 #!/bin/bash
 # Baseline (Full Attention) RULER Evaluation Script
 # Usage: bash run_baseline.sh [MODEL_NAME] [ROOT_DIR] [MODEL_TEMPLATE_TYPE]
-# Example: bash run_baseline.sh meta-llama/Llama-3.1-8B-Instruct results_ruler llama-3
+# Example: bash run_baseline.sh meta-llama/Llama-3.1-8B-Instruct results/ruler llama-3
 
 export TOKENIZERS_PARALLELISM=false
 RULER_PATH=$(dirname $0)
@@ -41,7 +41,7 @@ TOP_K="32"
 
 # Arguments
 MODEL_NAME=${1:-"meta-llama/Llama-3.1-8B-Instruct"}
-ROOT_DIR=${2:-"results_ruler"}
+ROOT_DIR=${2:-"results/ruler"}
 MODEL_TEMPLATE_TYPE=${3:-"llama-3"}
 
 BENCHMARK="synthetic"

@@ -20,11 +20,11 @@ Outputs:
 
 Usage:
     python eval_aime25.py --mode baseline \
-        --num_samples 5 --output_dir result/aime25 --run_name smoke_baseline
+        --num_samples 5 --output_dir results/aime25 --run_name smoke_baseline
 
     python eval_aime25.py --mode page_attention \
         --page_size 32 --top_k 64 --unselected_mode drop \
-        --output_dir result/aime25 --run_name qwen_page_topk64
+        --output_dir results/aime25 --run_name qwen_page_topk64
 """
 
 import os
@@ -197,7 +197,7 @@ def parse_args():
     parser.add_argument("--min_p", type=float, default=0.0)
 
     # Output
-    parser.add_argument("--output_dir", type=str, default="result/aime25")
+    parser.add_argument("--output_dir", type=str, default="results/aime25")
     parser.add_argument("--run_name", type=str, default=None)
 
     # DCT Page Attention params

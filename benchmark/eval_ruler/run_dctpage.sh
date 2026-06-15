@@ -44,7 +44,7 @@ shift
 if [ "$MODE" == "prepare" ]; then
     # ---- DATA PREPARATION ----
     MODEL_NAME=${1:-"meta-llama/Llama-3.1-8B-Instruct"}
-    ROOT_DIR=${2:-"results_ruler"}
+    ROOT_DIR=${2:-"results/ruler"}
     MODEL_TEMPLATE_TYPE=${3:-"llama-3"}
 
     python -c "import nltk; nltk.download('punkt')"
@@ -72,7 +72,7 @@ if [ "$MODE" == "prepare" ]; then
 elif [ "$MODE" == "predict" ]; then
     # ---- PREDICTION + EVAL ----
     MODEL_NAME=${1:-"meta-llama/Llama-3.1-8B-Instruct"}
-    ROOT_DIR=${2:-"results_ruler"}
+    ROOT_DIR=${2:-"results/ruler"}
     DCT_TOP_K=${3:-8}
     COMPRESS_RATIO=${4:-0.032}
     MODEL_TEMPLATE_TYPE=${5:-"llama-3"}
