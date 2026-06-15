@@ -44,18 +44,11 @@ def model_family(model_name):
     return model_name.split("/")[-1].lower()
 
 
-def load_model_and_tokenizer(model_name, attn_implementation="sdpa", use_legacy_dtype_kwarg=False):
+def load_model_and_tokenizer(model_name, attn_implementation="sdpa"):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    # Old transformers envs (duo_attention) only accept torch_dtype=;
-    # transformers 5.x (main DCT-Page env) only accepts dtype=.
-    dtype_kwarg = (
-        {"torch_dtype": torch.bfloat16}
-        if use_legacy_dtype_kwarg
-        else {"dtype": torch.bfloat16}
-    )
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        **dtype_kwarg,
+        dtype=torch.bfloat16,
         device_map="auto",
         attn_implementation=attn_implementation,
     )
@@ -313,7 +306,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Dummy-input decode speed benchmark")
 
     p.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
-    p.add_argument("--mode", choices=["baseline", "dct", "both", "duo_attention"], default="both")
+    p.add_argument("--mode", choices=["baseline", "dct", "both"], default="both")
     p.add_argument("--context_lengths", type=str, default="4096,8192,16384,32768",
                    help="Comma-separated context lengths to benchmark")
     p.add_argument("--num_repeats", type=int, default=3,
@@ -360,8 +353,6 @@ def make_run_name(label, args):
     family = model_family(args.model)
     if label == "baseline":
         return f"{family}_baseline_dummy"
-    if label == "duo_attention":
-        return f"{family}_duo_attn_dummy"
     rope_tag = "crope" if args.continuous_rope else "nocrope"
     triton_tag = "notriton" if getattr(args, 'no_triton', False) else "triton"
     parts = [
@@ -609,48 +600,6 @@ def main():
     context_lengths = [int(x.strip()) for x in args.context_lengths.split(",")]
     print(f"Context lengths: {context_lengths}")
     print(f"Repeats per length: {args.num_repeats}")
-
-    # DuoAttention's replacement forward assumes eager-style Q/K/V signatures,
-    # and patches per-instance (no clean restore). Give it a dedicated flow.
-    if args.mode == "duo_attention":
-        if "llama" not in args.model.lower():
-            raise ValueError(
-                f"DuoAttention only supports Llama models, got: {args.model}"
-            )
-        # DuoAttention runs in an old transformers env that only accepts torch_dtype=.
-        model, tokenizer = load_model_and_tokenizer(
-            args.model, attn_implementation="eager", use_legacy_dtype_kwarg=True
-        )
-
-        # baselines/ is added to sys.path by the eval scripts; do the same here.
-        repo_root = Path(__file__).resolve().parent.parent
-        sys.path.insert(0, str(repo_root / "baselines"))
-        from duo_attn import init_duo_attention, assert_llama
-        from duo_attn.config import DUO_ATTN_CONFIG
-        assert_llama(args.model)
-        DUO_ATTN_CONFIG["base_model"] = args.model
-        init_duo_attention(model, DUO_ATTN_CONFIG)
-
-        results = {}
-
-        def run_duo():
-            run_name = args.run_name or make_run_name("duo_attention", args)
-            run_dir = Path(args.output_dir) / run_name
-            run_dir.mkdir(parents=True, exist_ok=True)
-            stats, records = benchmark_dummy(
-                model, tokenizer, args, "duo_attention", context_lengths
-            )
-            save_results(records, run_dir)
-            save_summary(stats, run_dir, args, "duo_attention")
-            results["duo_attention"] = stats
-            print(f"\nResults written to: {run_dir}/")
-
-        print("\n" + "=" * 65)
-        print("DUO ATTENTION")
-        print("=" * 65)
-        run_duo()
-        print_summary(results, context_lengths)
-        return
 
     original_forward = get_original_forward(args.model)
     model, tokenizer = load_model_and_tokenizer(args.model)
