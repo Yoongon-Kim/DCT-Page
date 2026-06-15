@@ -28,7 +28,7 @@ Outputs per-layer ρ values to ``summary.json``. Stage-0 gate (see
                           and  ρ(haar_inject) ≥ ρ(dct_lowpass) + 0.05.
 
 Usage:
-  python observations/haar_mass_correlation.py \\
+  python observations/harp_mass_correlation.py \\
     --base_model Qwen/Qwen3-8B \\
     --tasks niah_multikey_3 niah_multivalue qa_2 \\
     --seq_len 32768 --num_samples 5 \\
@@ -67,7 +67,7 @@ from observations.attention_mass_recall_ruler import (
     compute_quest_scores,
     load_task_configs,
 )
-from observations.haar_kernels import (
+from observations.harp_kernels import (
     haar_page_features,
     haar_score_per_page,
 )
@@ -494,7 +494,7 @@ def parse_args() -> argparse.Namespace:
 
 def _self_test() -> None:
     """No-model sanity: known correlation between mass and feature."""
-    from observations.haar_kernels import _self_test as ker_test
+    from observations.harp_kernels import _self_test as ker_test
     ker_test()
     # Inject a synthetic relationship: bigger Haar H → bigger mass.
     torch.manual_seed(0)

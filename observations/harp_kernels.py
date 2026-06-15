@@ -2,7 +2,7 @@
 
 Forward decomposition, top-K detail selection, and adaptive 2-token
 representative reconstruction (L_3 ± β · H_selected). Pure PyTorch — no
-Triton fallback at this stage. Used by observations/haar_mass_correlation.py
+Triton fallback at this stage. Used by observations/harp_mass_correlation.py
 and (later) by the Haar selector in observations/attention_mass_recall_ruler.py.
 
 Shape convention:
@@ -312,7 +312,7 @@ def _self_test() -> None:
     assert scores.shape == (H_kv, P), scores.shape
     assert torch.isfinite(scores).all(), "non-finite scores"
 
-    print("haar_kernels self-test OK")
+    print("harp_kernels self-test OK")
 
 
 if __name__ == "__main__":
