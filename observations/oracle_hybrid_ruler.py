@@ -3,7 +3,8 @@
 Run RULER oracle-selection + hybrid unselected-mode sweeps and summarize results.
 
 Uses oracle page scores for selection, but keeps unselected pages as
-Haar lowpass proxy KV cache (hybrid mode) instead of dropping them.
+DCT-lowpass-IDCT compressed proxy KV cache (hybrid mode) instead of
+dropping them.
 """
 
 from __future__ import annotations

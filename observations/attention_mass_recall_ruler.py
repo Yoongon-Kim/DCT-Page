@@ -1806,7 +1806,7 @@ def parse_args_full() -> argparse.Namespace:
     p.add_argument("--num_sink_pages", type=int, default=1)
     p.add_argument("--num_recent_pages", type=int, default=4)
     p.add_argument("--compress_ratio", type=float, default=0.125,
-                   help="Haar proxy compression ratio; comp_size = "
+                   help="DCT-lowpass proxy compression ratio; comp_size = "
                         "max(1, int(page_size * compress_ratio)).")
     p.add_argument("--scoring_method", type=str, default="max",
                    choices=["mean", "max", "sum"])

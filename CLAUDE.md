@@ -95,7 +95,7 @@ Model support: **Llama 3.x** (`replace_llama_attn`) and **Qwen3** (`replace_qwen
 | `oracle_ruler.py` | Standalone RULER runner for oracle experiments. Flat per-task JSONL output. |
 | `scoring_method_recall.py` | Compares ~30 scoring methods (oracle_max/mean, proxy_max/mean, l2_energy, dc_ac_*, spectral_recon_*, continuous_cosine_max, hybrid_*) against a configurable ground truth (`oracle_max` or `output_contribution`). |
 | `attention_mass_recall_ruler.py` | Dense-trajectory reference: runs **unmodified full-KV forward**, observes Q/K/V per decode step, computes per-selector mass-recall (DCT, Quest, ShadowKV, oracle_max, mass-topk ceiling). Reports full-KV / selected-page / paged-only metric families. Two experiments via `--mode`: `full` (default, multi-selector) and `quest` (Quest-native geometry: last-page keep, skip layers 0–1). |
-| `oracle_hybrid_ruler.py` | Oracle-selection + hybrid-unselected sweeps (oracle pages kept as Haar lowpass proxy). |
+| `oracle_hybrid_ruler.py` | Oracle-selection + hybrid-unselected sweeps (unselected pages kept as DCT-lowpass-IDCT compressed proxy). |
 
 ### `speed/`
 
