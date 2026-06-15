@@ -11,11 +11,11 @@ Results are saved under:
         summary.json    — aggregated stats grouped by context length
 
 Usage:
-    python speed_test_dummy.py --context_lengths 4096,8192,16384 --mode both
+    python speed_test_dummy.py --context_lengths 4096,8192,16384 --mode dct
     python speed_test_dummy.py --context_lengths 32768 --mode baseline --num_repeats 5
     # Multipole (standalone) — typically on Qwen3:
     python speed_test_dummy.py --mode multipole --model Qwen/Qwen3-8B \\
-        --percent_clusters 6.25 --percentiles 2180
+        --percent_clusters 6.25 --percentiles 2048
 """
 
 import argparse
@@ -117,7 +117,6 @@ def apply_dct_patch(args, model=None):
         group_agg_method=args.group_agg_method,
         unselected_mode=args.unselected_mode,
         compressed_token_rope=args.compressed_token_rope,
-        continuous_rope=args.continuous_rope,
         use_triton=not getattr(args, 'no_triton', False),
         weight_compressed_by_population=True,
     )
@@ -221,7 +220,7 @@ def chunked_prefill(model, input_ids, chunk_size):
     original forward for prefill: the DCT forward attends only over the current
     chunk's keys, which shape-mismatches the causal mask on chunk 2+. The
     original forward stores RoPE-rotated keys — exactly what DCT decode expects
-    (with continuous_rope=False, RoPE is baked into the cached keys).
+    (RoPE is baked into the cached keys; decode reads them directly).
     """
     seq_len = input_ids.shape[1]
     if chunk_size <= 0 or seq_len <= chunk_size:
@@ -318,8 +317,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="Dummy-input decode speed benchmark")
 
     p.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
-    p.add_argument("--mode", choices=["baseline", "dct", "multipole", "both"], default="both",
-                   help="'both' = baseline + dct. 'multipole' runs Multipole Attention standalone.")
+    p.add_argument("--mode", choices=["baseline", "dct", "multipole"], default="dct",
+                   help="Which attention to benchmark (one per run).")
     p.add_argument("--context_lengths", type=str, default="4096,8192,16384,32768",
                    help="Comma-separated context lengths to benchmark")
     p.add_argument("--num_repeats", type=int, default=3,
@@ -350,15 +349,13 @@ def parse_args():
     dct.add_argument("--unselected_mode", default="drop",
                      choices=["drop", "compressed"])
     dct.add_argument("--compressed_token_rope", default="mixed", choices=["mixed", "block_center"])
-    dct.add_argument("--continuous_rope", action="store_true",
-                     help="Temporarily disabled — raises error if used")
     dct.add_argument("--no_triton", action="store_true",
                      help="Disable Triton kernels (use pure PyTorch for comparison)")
 
     mp = p.add_argument_group("Multipole Attention config (--mode multipole)")
     mp.add_argument("--percent_clusters", type=str, default="6.25",
                     help="Comma-separated percent_clusters_lst values")
-    mp.add_argument("--percentiles", type=str, default="2180",
+    mp.add_argument("--percentiles", type=str, default="2048",
                     help="Comma-separated percentiles_lst values (token budgets)")
     mp.add_argument("--use_replacement", action="store_true", default=False,
                     help="Use centroid value approximation for non-selected tokens")
@@ -385,7 +382,6 @@ def make_run_name(label, args):
             "repl" if args.use_replacement else "norepl",
         ]
         return "_".join(parts)
-    rope_tag = "crope" if args.continuous_rope else "nocrope"
     triton_tag = "notriton" if getattr(args, 'no_triton', False) else "triton"
     parts = [
         family, "page_attn_dummy",
@@ -394,7 +390,7 @@ def make_run_name(label, args):
         args.scoring_method,
         args.group_agg_method,
         args.unselected_mode,
-        rope_tag,
+        "nocrope",
         triton_tag,
     ]
     return "_".join(parts)
@@ -650,12 +646,7 @@ def main():
     results = {}
 
     def run_mode(label):
-        if args.run_name is not None:
-            run_name = args.run_name
-            if args.mode == "both":
-                run_name = f"{run_name}_{label}"
-        else:
-            run_name = make_run_name(label, args)
+        run_name = args.run_name if args.run_name is not None else make_run_name(label, args)
         run_dir = Path(args.output_dir) / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -673,13 +664,13 @@ def main():
         results[label] = stats
         print(f"\nResults written to: {run_dir}/")
 
-    if args.mode in ("baseline", "both"):
+    if args.mode == "baseline":
         print("\n" + "=" * 65)
         print("BASELINE (full attention)")
         print("=" * 65)
         run_mode("baseline")
 
-    if args.mode in ("dct", "both"):
+    if args.mode == "dct":
         print("\n" + "=" * 65)
         print("DCT PAGE ATTENTION")
         print("=" * 65)
