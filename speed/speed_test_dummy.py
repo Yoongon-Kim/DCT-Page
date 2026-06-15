@@ -15,7 +15,7 @@ Usage:
     python speed_test_dummy.py --context_lengths 32768 --mode baseline --num_repeats 5
     # Multipole (standalone) — typically on Qwen3:
     python speed_test_dummy.py --mode multipole --model Qwen/Qwen3-8B \\
-        --percent_clusters 6.25 --percentiles 2048
+        --percent_clusters 3.125 --percentiles 2048
 """
 
 import argparse
@@ -353,7 +353,7 @@ def parse_args():
                      help="Disable Triton kernels (use pure PyTorch for comparison)")
 
     mp = p.add_argument_group("Multipole Attention config (--mode multipole)")
-    mp.add_argument("--percent_clusters", type=str, default="6.25",
+    mp.add_argument("--percent_clusters", type=str, default="3.125",
                     help="Comma-separated percent_clusters_lst values")
     mp.add_argument("--percentiles", type=str, default="2048",
                     help="Comma-separated percentiles_lst values (token budgets)")
