@@ -1,13 +1,10 @@
 """
 Profile DCT + upstream-FlashInfer decode (virtual-batch-per-(b, h) layout).
 
-Sibling of `speed/profile_decode_flash_infer.py`. That driver uses the
-DCT-Page fork of FlashInfer at `/home/yoongonkim/flashinfer-dct` with a
-per-head `indices` patch (plan() `page_budget` kwarg). This driver tests
-whether we can drop that patch entirely by reshaping the KV cache so each
-physical page holds one (batch, KV head)'s slice, then treating each
-(batch, KV head) pair as a virtual batch entry for stock FlashInfer's
-2-D indices API.
+Uses stock (upstream) FlashInfer — no custom fork patch. The KV cache is
+reshaped so each physical page holds one (batch, KV head)'s slice, then each
+(batch, KV head) pair is treated as a virtual batch entry for stock
+FlashInfer's 2-D indices API.
 
 Correctness argument: multi-head attention is separable over KV heads
 AND batches — softmax is per Q head per batch. Packing "(batch b, KV head
@@ -532,8 +529,8 @@ def _pack_preallocated_to_paged_per_layer(
     """Pack PreAllocatedLayer → paged buf one layer at a time, freeing each
     layer's flat keys/values immediately after pack. Pure-torch (no FI ops).
 
-    Mirrors `flashinfer_backend._build_paged_buf_per_layer` — copied locally to
-    sever the upstream profiler's dependency on the fork backend. `_fi_mode`
+    Builds the per-layer paged buffer (pure-torch, no FI ops); self-contained
+    with no fork-backend dependency. `_fi_mode`
     flips on each layer so subsequent `PreAllocatedLayer.update` calls in
     counter-only mode skip writes to the freed flat KV.
     """
@@ -959,9 +956,7 @@ def parse_args():
                    help="Capture per-attention-substep CUDA events inside "
                         "the captured graph and report them after replay. "
                         "Implies `--cudagraph`. Forces `--sync` off inside "
-                        "capture (sync is not graph-capturable). Sibling "
-                        "driver `profile_decode_flash_infer.py` lacks the "
-                        "same flag — fork-FI variant is a follow-up PR.")
+                        "capture (sync is not graph-capturable).")
     p.add_argument("--cudagraph_breakdown_method",
                    choices=["profiler", "events"], default="profiler",
                    help="Breakdown mechanism. `profiler` (default): wrap "
@@ -1643,10 +1638,9 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
         extra += 64
     # FI-based modes (dct_upstream_flashinfer + baseline) free the per-layer
     # flat keys/values right after the prefill→paged pack, so the per-layer
-    # `extra` slack would be allocated and immediately freed — skip it. This
-    # mirrors `profile_decode_flash_infer.py:1318`. Without this, at long
-    # context × large bsz the slack alloc adds gigabytes of transient memory
-    # that drives OOM at buf alloc time.
+    # `extra` slack would be allocated and immediately freed — skip it.
+    # Without this, at long context × large bsz the slack alloc adds gigabytes
+    # of transient memory that drives OOM at buf alloc time.
     pa_extra = 0 if mode in ("dct_upstream_flashinfer", "baseline") else extra
     past_key_values = pre_allocate_cache(past_key_values, extra_tokens=pa_extra)
     print(f"  Converted to pre-allocated cache (+{pa_extra} tokens)")

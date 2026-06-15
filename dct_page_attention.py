@@ -36,12 +36,6 @@ from triton_kernels import (
     topk_sort_and_pack_triton,
 )
 
-# Module-level FlashInfer cache handle. The profiling driver / test harness
-# builds the cache post-prefill via speed.flashinfer_backend.build_flashinfer_paged_cache
-# and assigns it here BEFORE the first decode step. The FlashInfer forward
-# reads this on every layer; layer 0 advances the cache counters.
-_flashinfer_cache_ref = [None]
-
 # Module-level upstream-FlashInfer cache handle. The eval forward lazy-builds
 # this on the first decode step (layer 0); cleared by reset_upstream_fi_cache_state
 # between every model.generate() call.
@@ -1662,256 +1656,6 @@ def dct_page_attention_forward(
 
 
 # ---------------------------------------------------------------------------
-# FlashInfer forward — Phase 2b Stage 7
-# ---------------------------------------------------------------------------
-def dct_page_attention_forward_flashinfer(
-    self,
-    hidden_states: torch.Tensor,
-    position_embeddings: tuple,
-    attention_mask: Optional[torch.Tensor] = None,
-    past_key_values: Optional[Cache] = None,
-    cache_position: Optional[torch.LongTensor] = None,
-    **kwargs,
-) -> tuple:
-    """FlashInfer-backed decode forward. Drop-mode only.
-
-    Replaces `assemble_kv_drop_triton` + SDPA with
-    `topk_sort_and_pack_triton` + `flashinfer_decode_attention`, eliminating
-    the gather pass. Prefill and short-KV fallback delegate to
-    `dct_page_attention_forward` (no duplication).
-
-    Caller contract: build `FlashInferPagedKVCache` post-prefill and assign
-    to `_flashinfer_cache_ref[0]` before the first decode step. `cfg.top_k`
-    must match the `top_k` passed to `build_flashinfer_paged_cache`.
-
-    Verify path: when `self._verify_flashinfer` is True, gather the same
-    selected pages from `cache.buf` via `cache.indices_buf` and run SDPA;
-    append `(layer_idx, step_max_abs_diff)` to `self._verify_diffs`.
-    """
-    cfg = _dct_page_cfg
-    if cfg.unselected_mode != "drop":
-        raise NotImplementedError(
-            "dct_page_attention_forward_flashinfer supports drop mode only; "
-            "use dct_page_attention_forward for compressed mode."
-        )
-    if cfg.continuous_rope:
-        raise NotImplementedError(
-            "continuous_rope=True is temporarily disabled."
-        )
-
-    input_shape = hidden_states.shape[:-1]
-    bsz, q_len = input_shape
-    _maybe_reset_dct_runtime_state(self, past_key_values)
-
-    # Prefill delegates to the SDPA forward (cache alloc + prefill attention).
-    if q_len > 1:
-        return dct_page_attention_forward(
-            self, hidden_states, position_embeddings,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            cache_position=cache_position,
-            **kwargs,
-        )
-
-    # Short-KV fallback: delegate to the SDPA forward. This peeks at the
-    # cached length pre-projection so we don't double-update the cache.
-    min_len_for_paging = max(
-        (cfg.num_sink_pages + cfg.top_k + 1 + cfg.num_recent_pages) * cfg.page_size,
-        getattr(cfg, "min_decode_kv_len_for_paging", 0),
-    )
-    if past_key_values is not None:
-        prev_len = int(past_key_values.layers[self.layer_idx].get_seq_length())
-    else:
-        prev_len = 0
-    if prev_len + q_len < min_len_for_paging:
-        return dct_page_attention_forward(
-            self, hidden_states, position_embeddings,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            cache_position=cache_position,
-            **kwargs,
-        )
-
-    # ---- DECODE PATH with FlashInfer ----
-    hidden_shape = (*input_shape, -1, self.head_dim)
-    _has_qk_norm = hasattr(self, "q_norm") and hasattr(self, "k_norm")
-
-    # Step 1: QKV projection (with optional QK-norm for Qwen3).
-    query_states = self.q_proj(hidden_states).view(hidden_shape)
-    key_states = self.k_proj(hidden_states).view(hidden_shape)
-    if _has_qk_norm:
-        query_states = self.q_norm(query_states)
-        key_states = self.k_norm(key_states)
-    query_states = query_states.transpose(1, 2)
-    key_states = key_states.transpose(1, 2)
-    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-    # Step 2: RoPE + bookkeeping. The FI paged buf is the single source of
-    # truth at decode time; `past_key_values.update()` is a counter-only shim
-    # that advances `_seen` (flat keys/values were freed at FI build).
-    cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-    if past_key_values is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        past_key_values.update(
-            key_states, value_states, self.layer_idx, cache_kwargs
-        )
-
-    # Acquire FlashInfer cache (built once by the driver post-prefill).
-    cache = _flashinfer_cache_ref[0]
-    if cache is None:
-        raise RuntimeError(
-            "FlashInfer cache is not set. Build via "
-            "speed.flashinfer_backend.build_flashinfer_paged_cache(...) "
-            "post-prefill and assign to "
-            "dct_page_attention._flashinfer_cache_ref[0] before decode."
-        )
-    if cache.top_k != cfg.top_k:
-        raise RuntimeError(
-            f"cfg.top_k ({cfg.top_k}) != FlashInfer cache.top_k "
-            f"({cache.top_k}); cache top_k is fixed at build time."
-        )
-
-    # Lazy import: flashinfer_backend lives under speed/, not the repo root.
-    # Caller must have the project root on sys.path (standard for entry points).
-    import sys as _sys, os as _os
-    _speed_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "speed")
-    if _speed_dir not in _sys.path:
-        _sys.path.insert(0, _speed_dir)
-    from flashinfer_backend import (
-        append_flashinfer_cache,
-        flashinfer_decode_attention,
-    )
-
-    # Step 3: Append new K/V into FlashInfer's paged cache. Only layer 0
-    # advances the shared counters (last_page_idx_py / last_page_len_py).
-    append_flashinfer_cache(
-        cache,
-        key_states[:, :, -1:, :],
-        value_states[:, :, -1:, :],
-        self.layer_idx,
-    )
-
-    # Step 4: Build paged views over cache.buf and update the compressed
-    # proxy for scoring. `num_pages` matches FI's eligible middle range so
-    # comp_cache and FI selection see the same page set. `last_page_idx_py`
-    # is the per-batch LOGICAL page index (lockstep across batch).
-    num_pages = (
-        cache.last_page_idx_py - cache.num_sink_pages
-        - cache.num_recent_pages_fixed
-    )
-    comp_size = max(1, int(cfg.page_size * cfg.compress_ratio))
-    paged_k, paged_v = paged_views_from_buf(
-        cache.buf[self.layer_idx], cache.num_sink_pages, num_pages,
-        bsz=cache.bsz, pages_per_batch=cache.pages_per_batch,
-    )
-    comp_k, comp_v = _update_comp_cache(
-        self, paged_k, paged_v, num_pages, comp_size, cfg,
-    )
-
-    # Step 5: Score pages. Buffer sized for num_pages; we pass a slice to
-    # the fused kernel so its writes match FI's eligible middle range.
-    _num_kv_heads = self.config.num_key_value_heads
-    page_scores_buf = getattr(self, '_page_scores_buf', None)
-    if (
-        page_scores_buf is None
-        or page_scores_buf.shape[0] != bsz
-        or page_scores_buf.shape[1] != _num_kv_heads
-        or page_scores_buf.shape[2] < num_pages
-    ):
-        self._page_scores_buf = torch.empty(
-            bsz, _num_kv_heads, num_pages,
-            dtype=torch.float32, device=paged_k.device,
-        )
-    if cfg.score_use_quest_minmax:
-        quest_min_k, quest_max_k = _update_quest_metadata(self, paged_k, num_pages)
-        page_scores = _score_pages_quest(
-            query_states, quest_min_k, quest_max_k,
-            cfg.group_agg_method, self.num_key_value_groups,
-            out=self._page_scores_buf[:, :, :num_pages],
-        )
-    else:
-        page_scores = score_pages_triton(
-            query_states, comp_k, cfg.scoring_method, cfg.group_agg_method,
-            self.num_key_value_groups,
-            out=self._page_scores_buf[:, :, :num_pages],
-        )
-
-    # Step 6: num_pages already matches FI's eligible middle range (count of
-    # pages between sink and recent, excluding the open page). Score the full
-    # range — no truncation needed in the unified paged-buf layout.
-    if num_pages < cache.top_k:
-        raise RuntimeError(
-            f"num_pages ({num_pages}) < cache.top_k ({cache.top_k}). "
-            f"Configure min_decode_kv_len_for_paging to keep decode in the "
-            f"steady-state regime before enabling FlashInfer."
-        )
-    eff_scores = page_scores[:, :, :num_pages]
-
-    # Step 7: Fused topk + pack. Writes indices_buf[:, :, num_sink:num_sink+top_k]
-    # with (topk_indices + num_sink_pages + b*pages_per_batch) and the recent
-    # slice with (last_page_idx[b] + recent_offsets) where last_page_idx is
-    # already batch-biased. Sink slice was filled at cache init (also biased).
-    topk_sort_and_pack_triton(
-        eff_scores,
-        cache.indices_buf,
-        num_sink_pages=cache.num_sink_pages,
-        top_k=cache.top_k,
-        last_page_idx=cache.last_page_idx,
-        recent_offsets=cache.recent_offsets,
-        sort_ascending=False,  # drop mode — order-invariant middle
-        pages_per_batch=(cache.pages_per_batch if cache.bsz > 1 else 0),
-    )
-
-    # Step 8: FlashInfer paged decode attention. Native bf16 end-to-end.
-    attn_output_fi = flashinfer_decode_attention(
-        query_states, cache, self.layer_idx,
-    )  # (1, num_qo_heads, 1, head_dim) bf16
-
-    # Optional verify: gather the SAME pages FI used and run SDPA, then
-    # compare. Identical K/V coverage on both sides, so the diff measures
-    # kernel numerics only (bf16 floor + split_kv drift). Per-(b, h) gather
-    # — `cache.indices_buf[b, h]` holds batch-biased physical IDs that index
-    # `cache.buf[layer_idx]` directly.
-    if getattr(self, "_verify_flashinfer", False):
-        buf_l = cache.buf[self.layer_idx]       # (cap, 2, ps, nkv, d)
-        page_budget = cache.page_budget
-        last_page_len = cache.last_page_len_py
-        full_len = (page_budget - 1) * cache.page_size + last_page_len
-        cache_bsz = cache.bsz
-        batch_kv = []
-        for b in range(cache_bsz):
-            k_pages = []
-            v_pages = []
-            for h in range(_num_kv_heads):
-                sel_h = cache.indices_buf[b, h].long()
-                kv_h = buf_l[sel_h][:, :, :, h, :]    # (page_budget, 2, ps, d)
-                k_h = kv_h[:, 0].reshape(page_budget * cache.page_size, self.head_dim)
-                v_h = kv_h[:, 1].reshape(page_budget * cache.page_size, self.head_dim)
-                k_pages.append(k_h[:full_len])
-                v_pages.append(v_h[:full_len])
-            k_b = torch.stack(k_pages, dim=0)      # (nkv, full_len, d)
-            v_b = torch.stack(v_pages, dim=0)
-            batch_kv.append((k_b, v_b))
-        k_flat = torch.stack([kv[0] for kv in batch_kv], dim=0)   # (bsz, nkv, full_len, d)
-        v_flat = torch.stack([kv[1] for kv in batch_kv], dim=0)
-        sdpa_out = F.scaled_dot_product_attention(
-            query_states, k_flat, v_flat,
-            is_causal=False, enable_gqa=True,
-        )
-        max_diff = (attn_output_fi.float() - sdpa_out.float()).abs().max().item()
-        if not hasattr(self, "_verify_diffs"):
-            self._verify_diffs = []
-        self._verify_diffs.append(max_diff)
-
-    # Step 9: Output projection. attn_output_fi has the same (bsz, num_qo_heads,
-    # 1, head_dim) layout as SDPA's pre-transpose output — reuse the tail.
-    attn_output = attn_output_fi.transpose(1, 2).reshape(*input_shape, -1).contiguous()
-    attn_output = self.o_proj(attn_output)
-    return attn_output, None
-
-
-# ---------------------------------------------------------------------------
 # Upstream-FlashInfer forward — eval-side canonical
 # ---------------------------------------------------------------------------
 def dct_page_attention_forward_upstream_flashinfer(
@@ -2291,9 +2035,6 @@ def _select_dct_forward(attention_backend):
     """Pick the forward to monkey-patch based on `attention_backend`.
 
     `"sdpa"` — original DCT forward (assemble_kv_drop_triton + SDPA).
-    `"flashinfer"` — Phase 2b Stage 7 fork-FlashInfer forward (drop mode only,
-    reads FI cache from `_flashinfer_cache_ref[0]` which the driver/harness
-    populates post-prefill).
     `"upstream_flashinfer"` — eval-side upstream-FlashInfer forward (drop
     mode only); lazy-builds the cache on the first decode step. Eval scripts
     must wrap `model.generate()` calls in `_generate_with_upstream_fi(...)`
@@ -2301,13 +2042,11 @@ def _select_dct_forward(attention_backend):
     """
     if attention_backend == "sdpa":
         return dct_page_attention_forward
-    if attention_backend == "flashinfer":
-        return dct_page_attention_forward_flashinfer
     if attention_backend == "upstream_flashinfer":
         return dct_page_attention_forward_upstream_flashinfer
     raise ValueError(
         f"Unsupported attention_backend={attention_backend!r}; "
-        f"expected 'sdpa', 'flashinfer', or 'upstream_flashinfer'."
+        f"expected 'sdpa' or 'upstream_flashinfer'."
     )
 
 
@@ -2480,10 +2219,6 @@ def replace_llama_attn(
     Must be called BEFORE loading the model.
     LlamaAttention has the same forward signature and attributes as Qwen2Attention,
     so we reuse dct_page_attention_forward directly.
-
-    `attention_backend="flashinfer"` patches `dct_page_attention_forward_flashinfer`
-    instead. Requires an FI cache to be assigned to
-    `_flashinfer_cache_ref[0]` post-prefill (driver/harness responsibility).
     """
     global _dct_page_cfg
     _dct_page_cfg = DCTPageConfig(
