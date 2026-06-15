@@ -72,7 +72,7 @@ Each baseline folder has a `config.py` with defaults (pattern paths, model names
 
 | File | Purpose |
 |---|---|
-| [speed/speed_test_dummy.py](speed/speed_test_dummy.py) | Decode throughput benchmark with dummy (random) token inputs. Modes: `baseline`, `dct`, `multipole` (one per run). |
+| [speed/speed_dummy.py](speed/speed_dummy.py) | Decode throughput benchmark with dummy (random) token inputs. Modes: `baseline`, `dct`, `multipole` (one per run). |
 | [speed/profile_decode.py](speed/profile_decode.py) | Per-stage decode profile with chained CUDA events. |
 | [speed/compare_speed_dummy.sh](speed/compare_speed_dummy.sh) | Wrapper that runs baseline + DCT configs and prints a tok/s table. |
 
@@ -323,7 +323,7 @@ GPU=1 CONTEXT_LENGTHS="8192,16384,32768,65536" NUM_REPEATS=5 bash speed/compare_
 Direct invocation:
 
 ```bash
-python speed/speed_test_dummy.py \
+python speed/speed_dummy.py \
   --mode dct \
   --model meta-llama/Llama-3.1-8B-Instruct \
   --context_lengths 8192,16384,32768 \

@@ -80,7 +80,7 @@ from profile_decode import (
 from dataclasses import dataclass
 from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 
-from speed_test_dummy import (
+from speed_dummy import (
     load_model_and_tokenizer,
     get_original_forward,
     restore_forward,

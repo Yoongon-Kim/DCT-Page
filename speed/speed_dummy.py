@@ -11,10 +11,10 @@ Results are saved under:
         summary.json    — aggregated stats grouped by context length
 
 Usage:
-    python speed_test_dummy.py --context_lengths 4096,8192,16384 --mode dct
-    python speed_test_dummy.py --context_lengths 32768 --mode baseline --num_repeats 5
+    python speed_dummy.py --context_lengths 4096,8192,16384 --mode dct
+    python speed_dummy.py --context_lengths 32768 --mode baseline --num_repeats 5
     # Multipole (standalone) — typically on Qwen3:
-    python speed_test_dummy.py --mode multipole --model Qwen/Qwen3-8B \\
+    python speed_dummy.py --mode multipole --model Qwen/Qwen3-8B \\
         --percent_clusters 3.125 --percentiles 2048
 """
 

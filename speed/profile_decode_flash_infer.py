@@ -59,7 +59,7 @@ from profile_decode import (
     profiled_dct_page_attention_forward,
 )
 
-from speed_test_dummy import (
+from speed_dummy import (
     load_model_and_tokenizer,
     get_original_forward,
     restore_forward,

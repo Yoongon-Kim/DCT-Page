@@ -23,7 +23,7 @@ COMMON_ARGS="--model $MODEL \
 echo "============================================================"
 echo "BASELINE: full attention (dummy inputs)"
 echo "============================================================"
-python speed_test_dummy.py \
+python speed_dummy.py \
     --mode baseline \
     $COMMON_ARGS
 
@@ -37,7 +37,7 @@ for COMPRESS_RATIO in 0.032; do
                     echo "============================================================"
                     echo "DCT: compress=${COMPRESS_RATIO} top_k=${TOP_K} scoring=${SCORING} gam=${GAM} unselected=${UMODE}"
                     echo "============================================================"
-                    python speed_test_dummy.py \
+                    python speed_dummy.py \
                         --mode dct \
                         $COMMON_ARGS \
                         --page_size        $PAGE_SIZE \

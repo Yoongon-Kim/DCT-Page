@@ -20,7 +20,7 @@ from collections import defaultdict
 from pathlib import Path
 
 # Bootstrap sys.path so this script runs from any cwd. The sibling
-# `speed_test_dummy.py` lives in this dir; `dct_page_attention.py` and
+# `speed_dummy.py` lives in this dir; `dct_page_attention.py` and
 # `triton_kernels.py` live at the project root one level up.
 _THIS_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _THIS_DIR.parent
@@ -31,7 +31,7 @@ for _p in (_THIS_DIR, _REPO_ROOT):
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from speed_test_dummy import (
+from speed_dummy import (
     load_model_and_tokenizer,
     get_original_forward,
     restore_forward,
