@@ -177,11 +177,10 @@ def chunked_prefill(model, input_ids, chunk_size):
     but with much lower peak GPU memory usage.
 
     When a DCT-patched attention forward is active, temporarily restores the
-    original forward for prefill (DCT prefill paths store unrotated keys but
-    use only the current chunk's rotated keys for attention, causing a shape
-    mismatch with the causal mask on chunk 2+).  After prefill, cached keys
-    are un-rotated so that DCT decode (which expects unrotated keys) works
-    correctly.
+    original forward for prefill: the DCT forward attends only over the current
+    chunk's keys, which shape-mismatches the causal mask on chunk 2+. The
+    original forward stores RoPE-rotated keys — exactly what DCT decode expects
+    (with continuous_rope=False, RoPE is baked into the cached keys).
     """
     seq_len = input_ids.shape[1]
     if chunk_size <= 0 or seq_len <= chunk_size:
@@ -222,35 +221,7 @@ def chunked_prefill(model, input_ids, chunk_size):
         if attn_cls is not None and patched_forward is not None:
             attn_cls.forward = patched_forward
 
-    # Original forward stores rotated keys; DCT decode expects unrotated.
-    if patched_forward is not None:
-        _unrotate_cache_keys(model, past_key_values, seq_len, input_ids.device)
-
     return out
-
-
-def _unrotate_cache_keys(model, cache, seq_len, device):
-    """Apply inverse RoPE to convert rotated cached keys to unrotated.
-
-    The original attention forward stores RoPE-rotated keys in the cache.
-    DCT decode expects unrotated keys (it applies continuous RoPE later).
-    Inverse RoPE: apply_rotary_pos_emb with negated sin.
-    """
-    from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
-
-    base_model = model.model if hasattr(model, 'model') else model
-    rotary_emb = base_model.rotary_emb
-
-    with torch.no_grad():
-        for layer_cache in cache.layers:
-            keys = layer_cache.keys  # [bsz, num_kv_heads, seq_len, head_dim]
-            layer_device = keys.device
-            positions = torch.arange(seq_len, device=layer_device).unsqueeze(0)
-            dummy = torch.empty(1, 1, device=layer_device, dtype=keys.dtype)
-            cos, sin = rotary_emb(dummy, position_ids=positions)
-            # Inverse RoPE: cos stays, sin is negated
-            _, unrotated = apply_rotary_pos_emb(keys, keys, cos, -sin)
-            layer_cache.keys = unrotated
 
 
 def time_sample(model, tokenizer, input_ids, max_new_tokens, warmup_steps,
