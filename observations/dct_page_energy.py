@@ -21,7 +21,7 @@ Usage
 
   # Compare two prior runs in one plot
   python observations/dct_page_energy.py --compare_runs \
-      result/energy/qwen3_8b_32k_ps32,result/energy/llama31_8b_32k_ps32
+      results/energy/qwen3_8b_32k_ps32,results/energy/llama31_8b_32k_ps32
 """
 
 from __future__ import annotations
@@ -59,10 +59,7 @@ def resolve_model_family(model_name_or_path: str) -> str:
 
 def default_run_name(args: argparse.Namespace) -> str:
     short = args.model_name_or_path.split("/")[-1].lower().replace(".", "")
-    base = f"{short}_{args.context_len}_ps{args.page_size}_{args.task}"
-    if getattr(args, "granularity", "layer") == "head":
-        base += "_ghead"
-    return base
+    return f"{short}_{args.context_len}_ps{args.page_size}_{args.task}"
 
 
 _MODEL_FAMILY_PRETTY = {"qwen3": "Qwen3", "qwen2": "Qwen2", "llama": "Llama"}
@@ -181,18 +178,15 @@ def compute_layer_energies(
     k_caches: list[torch.Tensor],
     v_caches: list[torch.Tensor],
     cfg: DCTPageConfig,
-    *,
-    granularity: str = "layer",
-) -> tuple[list[dict], list[dict] | None]:
+) -> tuple[list[dict], list[dict]]:
     """Run one sample through segment_kv + per_bin_k_energy across all layers.
 
-    granularity="layer": returns (per_layer_rows, None). Identical to legacy.
-    granularity="head":  returns (per_layer_rows, per_head_rows) where the
-    per_layer_rows path uses the same fully-reduced call as legacy (bitwise
-    parity required) and per_head_rows holds one row per (layer_idx, kv_head).
+    Returns (per_layer_rows, per_head_rows). The per_layer_rows path uses the
+    same fully-reduced call as legacy (bitwise parity required); per_head_rows
+    holds one row per (layer_idx, kv_head).
     """
     per_layer_rows: list[dict] = []
-    per_head_rows: list[dict] | None = [] if granularity == "head" else None
+    per_head_rows: list[dict] = []
     for layer_idx, (k, v) in enumerate(zip(k_caches, v_caches)):
         if k is None:
             continue
@@ -210,19 +204,18 @@ def compute_layer_energies(
                 "k_cumulative": cum.tolist(),
             }
         )
-        if per_head_rows is not None:
-            head_frac = per_bin_k_energy(paged_k, per_head=True)  # [H, page_size]
-            head_cum = np.cumsum(head_frac, axis=1)
-            for h_idx in range(head_frac.shape[0]):
-                per_head_rows.append(
-                    {
-                        "layer_idx": layer_idx,
-                        "kv_head_idx": int(h_idx),
-                        "num_pages": int(num_pages),
-                        "k_energy_fraction": head_frac[h_idx].tolist(),
-                        "k_cumulative": head_cum[h_idx].tolist(),
-                    }
-                )
+        head_frac = per_bin_k_energy(paged_k, per_head=True)  # [H, page_size]
+        head_cum = np.cumsum(head_frac, axis=1)
+        for h_idx in range(head_frac.shape[0]):
+            per_head_rows.append(
+                {
+                    "layer_idx": layer_idx,
+                    "kv_head_idx": int(h_idx),
+                    "num_pages": int(num_pages),
+                    "k_energy_fraction": head_frac[h_idx].tolist(),
+                    "k_cumulative": head_cum[h_idx].tolist(),
+                }
+            )
     return per_layer_rows, per_head_rows
 
 
@@ -792,27 +785,9 @@ def run_measurement(args: argparse.Namespace) -> None:
     run_name = args.run_name or default_run_name(args)
     run_dir = args.output_dir / run_name
 
-    # Pre-write clobber guard: refuse to mix granularities in one run_dir.
-    existing_per_layer = run_dir / "per_layer.jsonl"
-    existing_cfg_path = run_dir / "config.json"
-    if existing_per_layer.exists() and existing_cfg_path.exists():
-        try:
-            with existing_cfg_path.open() as fp:
-                existing_cfg = json.load(fp)
-        except Exception:
-            existing_cfg = {}
-        existing_g = existing_cfg.get("granularity", "layer")
-        if existing_g != args.granularity and not args.overwrite:
-            raise RuntimeError(
-                f"refusing to clobber {run_dir}: existing run was --granularity={existing_g} "
-                f"but --granularity={args.granularity} was requested. "
-                f"Pass --overwrite or use --run_name <new>."
-            )
-
     samples = load_samples(data_path, args.num_samples)
     print(f"[setup] model={args.model_name_or_path} family={model_family} "
-          f"ctx={args.context_len} task={args.task} samples={len(samples)} "
-          f"granularity={args.granularity}")
+          f"ctx={args.context_len} task={args.task} samples={len(samples)}")
     print(f"[setup] data={data_path}")
     print(f"[setup] run_dir={run_dir}")
 
@@ -826,10 +801,10 @@ def run_measurement(args: argparse.Namespace) -> None:
 
     layer_accum: list[list[np.ndarray]] = []
     layer_num_pages: list[int] = []
-    # Head-mode parallel buffer; sized to num_hidden_layers (NOT post-skip).
-    layer_head_accum: list[list[np.ndarray]] = (
-        [[] for _ in range(num_hidden_layers)] if args.granularity == "head" else []
-    )
+    # Per-head parallel buffer; sized to num_hidden_layers (NOT post-skip).
+    layer_head_accum: list[list[np.ndarray]] = [
+        [] for _ in range(num_hidden_layers)
+    ]
 
     for s_idx, sample in enumerate(samples, start=1):
         encoded = tokenizer(sample["input"], return_tensors="pt")
@@ -839,7 +814,7 @@ def run_measurement(args: argparse.Namespace) -> None:
             out = model(input_ids, use_cache=True)
         k_caches, v_caches = extract_layer_kv(out.past_key_values)
         per_layer, per_head_sample = compute_layer_energies(
-            k_caches, v_caches, cfg, granularity=args.granularity
+            k_caches, v_caches, cfg
         )
 
         if not layer_accum:
@@ -849,7 +824,7 @@ def run_measurement(args: argparse.Namespace) -> None:
             # BITWISE-LOAD-BEARING: do not refactor
             layer_accum[i].append(np.array(r["k_energy_fraction"], dtype=np.float64))  # site (b)
 
-        if args.granularity == "head" and per_head_sample is not None:
+        if per_head_sample:
             # Bucket per-head rows by layer_idx, stack into [H, page_size] per layer.
             by_layer: dict[int, list[np.ndarray]] = {}
             for r in per_head_sample:
@@ -881,43 +856,40 @@ def run_measurement(args: argparse.Namespace) -> None:
 
     summary = aggregate_layers(per_layer_rows, args.page_size)
 
-    per_head_rows: list[dict] | None = None
-    summary_per_head: dict | None = None
-    if args.granularity == "head":
-        # Zero-valid-layers guard: fire BEFORE aggregate_layers_per_head.
-        if not any(layer_head_accum[li] for li in range(num_hidden_layers)):
-            raise RuntimeError(
-                "zero valid layers in layer_head_accum; check context length / page config"
-            )
-        per_head_rows = []
-        for li in range(num_hidden_layers):
-            runs = layer_head_accum[li]
-            if not runs:
-                continue
-            stacked = np.stack(runs, axis=0)  # [num_samples, H, page_size]
-            with np.errstate(all="ignore"):
-                mean_frac = np.nanmean(stacked, axis=0)  # [H, page_size]
-                row_sums = np.nansum(mean_frac, axis=1)
-            for h_idx in range(mean_frac.shape[0]):
-                rs = float(row_sums[h_idx])
-                if rs <= 1e-12 or not np.isfinite(rs):
-                    frac_row = np.full(args.page_size, np.nan, dtype=np.float64)
-                    cum_row = np.full(args.page_size, np.nan, dtype=np.float64)
-                else:
-                    frac_row = mean_frac[h_idx] / rs
-                    cum_row = np.cumsum(frac_row)
-                per_head_rows.append(
-                    {
-                        "layer_idx": li,
-                        "kv_head_idx": int(h_idx),
-                        "num_pages": layer_num_pages[li] if li < len(layer_num_pages) else 0,
-                        "k_energy_fraction": frac_row.tolist(),
-                        "k_cumulative": cum_row.tolist(),
-                    }
-                )
-        summary_per_head = aggregate_layers_per_head(
-            layer_head_accum, num_hidden_layers, num_kv_heads, args.page_size
+    # Zero-valid-layers guard: fire BEFORE aggregate_layers_per_head.
+    if not any(layer_head_accum[li] for li in range(num_hidden_layers)):
+        raise RuntimeError(
+            "zero valid layers in layer_head_accum; check context length / page config"
         )
+    per_head_rows: list[dict] = []
+    for li in range(num_hidden_layers):
+        runs = layer_head_accum[li]
+        if not runs:
+            continue
+        stacked = np.stack(runs, axis=0)  # [num_samples, H, page_size]
+        with np.errstate(all="ignore"):
+            mean_frac = np.nanmean(stacked, axis=0)  # [H, page_size]
+            row_sums = np.nansum(mean_frac, axis=1)
+        for h_idx in range(mean_frac.shape[0]):
+            rs = float(row_sums[h_idx])
+            if rs <= 1e-12 or not np.isfinite(rs):
+                frac_row = np.full(args.page_size, np.nan, dtype=np.float64)
+                cum_row = np.full(args.page_size, np.nan, dtype=np.float64)
+            else:
+                frac_row = mean_frac[h_idx] / rs
+                cum_row = np.cumsum(frac_row)
+            per_head_rows.append(
+                {
+                    "layer_idx": li,
+                    "kv_head_idx": int(h_idx),
+                    "num_pages": layer_num_pages[li] if li < len(layer_num_pages) else 0,
+                    "k_energy_fraction": frac_row.tolist(),
+                    "k_cumulative": cum_row.tolist(),
+                }
+            )
+    summary_per_head = aggregate_layers_per_head(
+        layer_head_accum, num_hidden_layers, num_kv_heads, args.page_size
+    )
 
     config_dict = {
         "model_name_or_path": args.model_name_or_path,
@@ -930,7 +902,6 @@ def run_measurement(args: argparse.Namespace) -> None:
         "num_recent_pages": args.num_recent_pages,
         "data_path": str(data_path),
         "run_name": run_name,
-        "granularity": args.granularity,
     }
 
     write_outputs(
@@ -946,7 +917,7 @@ def run_measurement(args: argparse.Namespace) -> None:
         title = _format_plot_title(model_family, args.context_len, args.task)
         render_plot(run_dir, per_layer_rows, summary, args.page_size, title)
         render_per_layer_grid(run_dir, per_layer_rows, args.page_size, title)
-        if args.granularity == "head" and summary_per_head is not None:
+        if summary_per_head is not None:
             render_per_head_grid(run_dir, summary_per_head, args.page_size, title)
             render_per_head_heatmap(run_dir, summary_per_head, args.page_size, title)
             render_per_head_heatmap_norm(run_dir, summary_per_head, args.page_size, title)
@@ -965,26 +936,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_sink_pages", type=int, default=1)
     p.add_argument("--num_recent_pages", type=int, default=4)
     p.add_argument("--data_root", type=Path, default=_REPO_ROOT / "benchmark" / "data" / "ruler_data")
-    p.add_argument("--output_dir", type=Path, default=_REPO_ROOT / "result" / "energy")
+    p.add_argument("--output_dir", type=Path, default=_REPO_ROOT / "results" / "energy")
     p.add_argument("--run_name", default=None)
     p.add_argument("--cuda_device", type=int, default=0)
     p.add_argument("--plot", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument(
-        "--granularity",
-        choices=["layer", "head"],
-        default="layer",
-        help="Reduction axis for the energy measurement. 'layer' (default) "
-             "averages over batch+heads+pages+head_dim; output is unchanged. "
-             "'head' keeps the kv-head axis separate and writes per_head.jsonl "
-             "plus a per-head block inside summary.json.",
-    )
-    p.add_argument(
-        "--overwrite",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Allow writing into a run_dir whose existing config.json records a "
-             "different --granularity. Default refuses to clobber.",
-    )
     p.add_argument(
         "--compare_runs",
         default=None,
