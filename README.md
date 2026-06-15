@@ -72,8 +72,7 @@ Each baseline folder has a `config.py` with defaults (pattern paths, model names
 
 | File | Purpose |
 |---|---|
-| [speed/speed_test_dummy.py](speed/speed_test_dummy.py) | Decode throughput benchmark with dummy (random) token inputs. |
-| [speed/speed_test_dummy_multipole.py](speed/speed_test_dummy_multipole.py) | Multipole-specific variant. |
+| [speed/speed_test_dummy.py](speed/speed_test_dummy.py) | Decode throughput benchmark with dummy (random) token inputs. Modes: `baseline`, `dct`, `multipole`, `both` (=baseline+dct). |
 | [speed/profile_decode.py](speed/profile_decode.py) | Per-stage decode profile with chained CUDA events. |
 | [speed/run_speed_test_dummy.sh](speed/run_speed_test_dummy.sh) | Wrapper that runs baseline + DCT configs and prints a tok/s table. |
 

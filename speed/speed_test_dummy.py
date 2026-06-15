@@ -1,6 +1,7 @@
 """
-Decode speed benchmark with dummy (random) inputs: Baseline vs DCT Page Attention.
+Decode speed benchmark with dummy (random) inputs.
 
+Modes: Baseline (full attention), DCT Page Attention, and Multipole Attention.
 Generates random token sequences of configurable lengths, avoiding any dataset
 dependency.  Measures prefill and decode speed separately.
 
@@ -12,9 +13,13 @@ Results are saved under:
 Usage:
     python speed_test_dummy.py --context_lengths 4096,8192,16384 --mode both
     python speed_test_dummy.py --context_lengths 32768 --mode baseline --num_repeats 5
+    # Multipole (standalone) — typically on Qwen3:
+    python speed_test_dummy.py --mode multipole --model Qwen/Qwen3-8B \\
+        --percent_clusters 6.25 --percentiles 2180
 """
 
 import argparse
+import importlib
 import json
 import sys
 import time
@@ -58,29 +63,47 @@ def load_model_and_tokenizer(model_name, attn_implementation="sdpa"):
     return model, tokenizer
 
 
+# Architecture-aware attention-class resolution (handles llama, qwen2, qwen3).
+_ARCH_MODULES = {
+    "llama": "transformers.models.llama.modeling_llama",
+    "qwen2": "transformers.models.qwen2.modeling_qwen2",
+    "qwen3": "transformers.models.qwen3.modeling_qwen3",
+}
+_ARCH_ATTN_CLS_NAME = {
+    "llama": "LlamaAttention",
+    "qwen2": "Qwen2Attention",
+    "qwen3": "Qwen3Attention",
+}
+
+
+def _detect_arch(model_name):
+    name = model_name.lower()
+    if "qwen3" in name:
+        return "qwen3"
+    if "qwen2" in name:
+        return "qwen2"
+    if "llama" in name:
+        return "llama"
+    raise ValueError(f"Cannot detect architecture from '{model_name}'")
+
+
+def _get_attn_cls(model_name):
+    arch = _detect_arch(model_name)
+    mod = importlib.import_module(_ARCH_MODULES[arch])
+    return getattr(mod, _ARCH_ATTN_CLS_NAME[arch])
+
+
 def get_original_forward(model_name):
-    import transformers
-    if "llama" in model_name.lower():
-        return transformers.models.llama.modeling_llama.LlamaAttention.forward
-    return transformers.models.qwen2.modeling_qwen2.Qwen2Attention.forward
+    return _get_attn_cls(model_name).forward
 
 
 def restore_forward(model_name, original_forward, model=None):
-    import transformers
-    if "llama" in model_name.lower():
-        transformers.models.llama.modeling_llama.LlamaAttention.forward = original_forward
-        if model is not None:
-            attn_cls = transformers.models.llama.modeling_llama.LlamaAttention
-            for module in model.modules():
-                if isinstance(module, attn_cls) and hasattr(module, "_old_forward"):
-                    module._old_forward = types.MethodType(original_forward, module)
-    else:
-        transformers.models.qwen2.modeling_qwen2.Qwen2Attention.forward = original_forward
-        if model is not None:
-            attn_cls = transformers.models.qwen2.modeling_qwen2.Qwen2Attention
-            for module in model.modules():
-                if isinstance(module, attn_cls) and hasattr(module, "_old_forward"):
-                    module._old_forward = types.MethodType(original_forward, module)
+    attn_cls = _get_attn_cls(model_name)
+    attn_cls.forward = original_forward
+    if model is not None:
+        for module in model.modules():
+            if isinstance(module, attn_cls) and hasattr(module, "_old_forward"):
+                module._old_forward = types.MethodType(original_forward, module)
 
 
 def apply_dct_patch(args, model=None):
@@ -116,6 +139,24 @@ def apply_dct_patch(args, model=None):
             for module in model.modules():
                 if isinstance(module, attn_cls) and hasattr(module, "_old_forward"):
                     module._old_forward = types.MethodType(dct_page_attention_forward, module)
+
+
+def build_multipole_config(args):
+    return {
+        "base_model": args.model,
+        "use_centroids": True,
+        "percent_clusters_lst": [float(x) for x in args.percent_clusters.split(",")],
+        "percentiles_lst": [int(x) for x in args.percentiles.split(",")],
+        "use_replacement": args.use_replacement,
+        "cluster_interval": args.cluster_interval,
+        "inference_tp": 1,
+    }
+
+
+def apply_multipole_patch(model, config_dict):
+    from multipole_attn import replace_attn_multipole, init_multipole_layers
+    replace_attn_multipole(config_dict)
+    init_multipole_layers(model)
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +235,7 @@ def chunked_prefill(model, input_ids, chunk_size):
 
     if original_forward is not None:
         for module in model.modules():
-            if type(module).__name__ in ('LlamaAttention', 'Qwen2Attention'):
+            if type(module).__name__ in ('LlamaAttention', 'Qwen2Attention', 'Qwen3Attention'):
                 attn_cls = type(module)
                 break
         if attn_cls is not None:
@@ -277,7 +318,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="Dummy-input decode speed benchmark")
 
     p.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
-    p.add_argument("--mode", choices=["baseline", "dct", "both"], default="both")
+    p.add_argument("--mode", choices=["baseline", "dct", "multipole", "both"], default="both",
+                   help="'both' = baseline + dct. 'multipole' runs Multipole Attention standalone.")
     p.add_argument("--context_lengths", type=str, default="4096,8192,16384,32768",
                    help="Comma-separated context lengths to benchmark")
     p.add_argument("--num_repeats", type=int, default=3,
@@ -313,6 +355,16 @@ def parse_args():
     dct.add_argument("--no_triton", action="store_true",
                      help="Disable Triton kernels (use pure PyTorch for comparison)")
 
+    mp = p.add_argument_group("Multipole Attention config (--mode multipole)")
+    mp.add_argument("--percent_clusters", type=str, default="6.25",
+                    help="Comma-separated percent_clusters_lst values")
+    mp.add_argument("--percentiles", type=str, default="2180",
+                    help="Comma-separated percentiles_lst values (token budgets)")
+    mp.add_argument("--use_replacement", action="store_true", default=False,
+                    help="Use centroid value approximation for non-selected tokens")
+    mp.add_argument("--cluster_interval", type=int, default=128,
+                    help="Tokens between re-clustering during generation")
+
     args = p.parse_args()
     return args
 
@@ -324,6 +376,15 @@ def make_run_name(label, args):
     family = model_family(args.model)
     if label == "baseline":
         return f"{family}_baseline_dummy"
+    if label == "multipole":
+        parts = [
+            family, "multipole_dummy",
+            f"pct{'_'.join(args.percent_clusters.split(','))}",
+            f"ptl{'_'.join(args.percentiles.split(','))}",
+            f"ci{args.cluster_interval}",
+            "repl" if args.use_replacement else "norepl",
+        ]
+        return "_".join(parts)
     rope_tag = "crope" if args.continuous_rope else "nocrope"
     triton_tag = "notriton" if getattr(args, 'no_triton', False) else "triton"
     parts = [
@@ -483,7 +544,7 @@ def save_summary(stats, run_dir, args, label):
     summary["model"] = args.model
     summary["context_lengths"] = [int(x) for x in args.context_lengths.split(",")]
     summary["num_repeats"] = args.num_repeats
-    if label != "baseline":
+    if label == "dct":
         summary.update({
             "page_size": args.page_size,
             "top_k": args.top_k,
@@ -493,6 +554,13 @@ def save_summary(stats, run_dir, args, label):
             "scoring_method": args.scoring_method,
             "unselected_mode": args.unselected_mode,
             "use_triton": not getattr(args, 'no_triton', False),
+        })
+    elif label == "multipole":
+        summary.update({
+            "percent_clusters_lst": [float(x) for x in args.percent_clusters.split(",")],
+            "percentiles_lst": [int(x) for x in args.percentiles.split(",")],
+            "use_replacement": args.use_replacement,
+            "cluster_interval": args.cluster_interval,
         })
     path = Path(run_dir) / "summary.json"
     path.write_text(json.dumps(summary, indent=2))
@@ -507,38 +575,40 @@ def print_summary(results, context_lengths):
     print("DECODE SPEED SUMMARY  (dummy inputs)")
     print("=" * 75)
 
-    # Per-length comparison table
+    # Per-length comparison table. Baseline + any sparse method(s) present.
     has_baseline = "baseline" in results
-    has_dct = "dct" in results
+    methods = [m for m in ("dct", "multipole") if m in results]
 
     header = f"{'ctx_len':>10}"
     if has_baseline:
         header += f" | {'baseline (tok/s)':>18} {'prefill (ms)':>14}"
-    if has_dct:
-        header += f" | {'dct (tok/s)':>18} {'prefill (ms)':>14}"
-    if has_baseline and has_dct:
+    for m in methods:
+        header += f" | {m + ' (tok/s)':>18} {'prefill (ms)':>14}"
+    if has_baseline and len(methods) == 1:
         header += f" | {'speedup':>8}"
     print(header)
     print("-" * len(header))
 
     for ctx_len in context_lengths:
         row = f"{ctx_len:>10}"
-        b_tok = d_tok = None
 
+        b_tok = None
         if has_baseline:
             bl = results["baseline"]["per_length"].get(ctx_len, {})
             b_tok = bl.get("decode_tok_per_s")
             b_pre = bl.get("avg_prefill_ms")
-            row += f" | {b_tok:>18.1f} {b_pre:>14.0f}" if b_tok else " | {'N/A':>18} {'N/A':>14}"
+            row += f" | {b_tok:>18.1f} {b_pre:>14.0f}" if b_tok else f" | {'N/A':>18} {'N/A':>14}"
 
-        if has_dct:
-            dl = results["dct"]["per_length"].get(ctx_len, {})
-            d_tok = dl.get("decode_tok_per_s")
-            d_pre = dl.get("avg_prefill_ms")
-            row += f" | {d_tok:>18.1f} {d_pre:>14.0f}" if d_tok else " | {'N/A':>18} {'N/A':>14}"
+        m_tok_last = None
+        for m in methods:
+            ml = results[m]["per_length"].get(ctx_len, {})
+            m_tok = ml.get("decode_tok_per_s")
+            m_pre = ml.get("avg_prefill_ms")
+            row += f" | {m_tok:>18.1f} {m_pre:>14.0f}" if m_tok else f" | {'N/A':>18} {'N/A':>14}"
+            m_tok_last = m_tok
 
-        if has_baseline and has_dct and b_tok and d_tok:
-            row += f" | {d_tok/b_tok:>7.2f}x"
+        if has_baseline and len(methods) == 1 and b_tok and m_tok_last:
+            row += f" | {m_tok_last/b_tok:>7.2f}x"
 
         print(row)
 
@@ -553,11 +623,12 @@ def print_summary(results, context_lengths):
               f"{tok_s:.1f} tok/s  |  {ms:.2f} ms/tok  |  "
               f"{stats['total_decode_steps']} decode steps")
 
-    if has_baseline and has_dct:
+    if has_baseline:
         b = results["baseline"].get("decode_tok_per_s")
-        d = results["dct"].get("decode_tok_per_s")
-        if b and d:
-            print(f"\n  Overall decode speedup (DCT / baseline): {d/b:.2f}x")
+        for m in methods:
+            d = results[m].get("decode_tok_per_s")
+            if b and d:
+                print(f"\n  Overall decode speedup ({m} / baseline): {d/b:.2f}x")
 
     print("=" * 75)
 
@@ -578,7 +649,7 @@ def main():
 
     results = {}
 
-    def run_mode(label, patch=False):
+    def run_mode(label):
         if args.run_name is not None:
             run_name = args.run_name
             if args.mode == "both":
@@ -589,8 +660,10 @@ def main():
         run_dir.mkdir(parents=True, exist_ok=True)
 
         restore_forward(args.model, original_forward, model)
-        if patch:
+        if label == "dct":
             apply_dct_patch(args, model)
+        elif label == "multipole":
+            apply_multipole_patch(model, build_multipole_config(args))
 
         stats, records = benchmark_dummy(
             model, tokenizer, args, label, context_lengths
@@ -604,13 +677,19 @@ def main():
         print("\n" + "=" * 65)
         print("BASELINE (full attention)")
         print("=" * 65)
-        run_mode("baseline", patch=False)
+        run_mode("baseline")
 
     if args.mode in ("dct", "both"):
         print("\n" + "=" * 65)
         print("DCT PAGE ATTENTION")
         print("=" * 65)
-        run_mode("dct", patch=True)
+        run_mode("dct")
+
+    if args.mode == "multipole":
+        print("\n" + "=" * 65)
+        print("MULTIPOLE ATTENTION")
+        print("=" * 65)
+        run_mode("multipole")
 
     print_summary(results, context_lengths)
 
