@@ -13,11 +13,11 @@ Q heads that attend to it as that batch's query heads, computes the exact
 same attention output (up to FI kernel numerics).
 
 Modes (via `--mode`, default `dct_upstream_flashinfer`):
-  - baseline                   : full-KV FlashInfer (shared with the fork
-                                  profiler — no per-head selection needed).
-  - dct_sdpa                   : DCT + SDPA (pure reference).
-  - dct_upstream_flashinfer    : DCT + upstream FI via virtual batching.
-  - all                        : run all three back-to-back with comparison.
+  - baseline_upstream_flashinfer : full-KV FlashInfer (no per-head selection).
+  - baseline_sdpa                : full-KV SDPA (pure reference).
+  - dct_sdpa                     : DCT + SDPA (pure reference).
+  - dct_upstream_flashinfer      : DCT + upstream FI via virtual batching.
+  - all                          : run all four back-to-back with comparison.
 
 Usage:
     CUDA_VISIBLE_DEVICES=1 python speed/profile_decode_upstream_flash_infer.py \\
@@ -880,7 +880,7 @@ def _fi_cache_for_mode(mode):
     """
     if mode == "dct_upstream_flashinfer":
         return _upstream_fi_cache_ref[0]
-    if mode == "baseline":
+    if mode == "baseline_upstream_flashinfer":
         return _fi_baseline_cache_ref[0]
     return None
 
@@ -899,7 +899,7 @@ def parse_args():
     p.add_argument("--warmup_steps", type=int, default=8)
     p.add_argument(
         "--mode",
-        choices=["baseline", "baseline_sdpa", "dct_sdpa",
+        choices=["baseline_upstream_flashinfer", "baseline_sdpa", "dct_sdpa",
                  "dct_upstream_flashinfer", "all"],
         default="dct_upstream_flashinfer",
     )
@@ -1311,7 +1311,7 @@ def _print_graph_breakdown(
         # Baseline has no DCT-side critical buckets; the only attention-side
         # bucket besides FI run is `2_rope_and_cache_append` (index_kernel),
         # which is left unconstrained.
-        if mode == "baseline":
+        if mode == "baseline_upstream_flashinfer":
             critical = set()
         else:
             critical = {"5_score_pages_kernel", "6_topk_and_pack"}
@@ -1404,7 +1404,7 @@ def _print_graph_breakdown(
     #
     # Subtracting the two gives the marginal cost of DCT page selection vs
     # full attention.
-    if mode == "baseline":
+    if mode == "baseline_upstream_flashinfer":
         attn_substeps = ("8_flashinfer_run",)
         attn_label = "Baseline non-shared attention (8) — full-KV FI run"
         compare_hint = (
@@ -1569,7 +1569,7 @@ _SUBSTEP_NAME_PATTERNS_BASELINE = {
 def _substep_patterns_for(mode):
     """Per-mode kernel-name → bucket dict. Baseline uses 8_flashinfer_run
     (matches its eager forward); DCT modes use 7_upstream_fi_run."""
-    if mode == "baseline":
+    if mode == "baseline_upstream_flashinfer":
         return _SUBSTEP_NAME_PATTERNS_BASELINE
     return _SUBSTEP_NAME_PATTERNS
 # cublasLt gemms: by default merged into a single `gemm_total` bucket. This
@@ -1604,7 +1604,7 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
     _breakdown_disambig = args.cudagraph_breakdown_disambig
     _seal_microbench = args.cudagraph_breakdown_seal_microbench
     _capture_with_seal = args.cudagraph_capture_with_seal
-    if mode == "baseline":
+    if mode == "baseline_upstream_flashinfer":
         if _breakdown_disambig == "ordering":
             print(
                 "[INFO] baseline mode: --cudagraph_breakdown_disambig=ordering "
@@ -1624,7 +1624,7 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
             )
             _capture_with_seal = False
 
-    if mode == "baseline":
+    if mode == "baseline_upstream_flashinfer":
         _patch_baseline(model, args, original_forward)
     elif mode == "baseline_sdpa":
         _patch_baseline_sdpa(model, args, original_forward)
@@ -1667,13 +1667,13 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
     # `extra` slack would be allocated and immediately freed — skip it.
     # Without this, at long context × large bsz the slack alloc adds gigabytes
     # of transient memory that drives OOM at buf alloc time.
-    pa_extra = 0 if mode in ("dct_upstream_flashinfer", "baseline") else extra
+    pa_extra = 0 if mode in ("dct_upstream_flashinfer", "baseline_upstream_flashinfer") else extra
     past_key_values = pre_allocate_cache(past_key_values, extra_tokens=pa_extra)
     print(f"  Converted to pre-allocated cache (+{pa_extra} tokens)")
 
     if mode == "dct_upstream_flashinfer":
         _build_upstream_fi_cache(model, past_key_values, prefill_len, args)
-    elif mode == "baseline":
+    elif mode == "baseline_upstream_flashinfer":
         cfg_model = model.config
         num_kv_heads = cfg_model.num_key_value_heads
         num_qo_heads = cfg_model.num_attention_heads
@@ -2328,7 +2328,7 @@ def main():
     print(f"Model layers: {num_layers}")
     print(f"Context length: {args.context_length}  batch_size: {args.batch_size}")
 
-    modes_order = ["baseline", "baseline_sdpa", "dct_sdpa",
+    modes_order = ["baseline_upstream_flashinfer", "baseline_sdpa", "dct_sdpa",
                    "dct_upstream_flashinfer"]
     if args.mode == "all":
         modes_to_run = modes_order
@@ -2378,15 +2378,15 @@ def main():
             print(
                 f"  {'-' * 28} {'-' * 10} {'-' * 10} {'-' * 11} {'-' * 14}"
             )
-        base = results.get("baseline")
+        base = results.get("baseline_upstream_flashinfer")
         for mode in modes_order:
             if mode not in results:
                 continue
             avg, tok, _, _graph = results[mode]
-            if base is not None and mode != "baseline":
+            if base is not None and mode != "baseline_upstream_flashinfer":
                 delta_pct = (tok - base[1]) / base[1] * 100
                 vs_str = f"{delta_pct:+.1f}%"
-            elif mode == "baseline":
+            elif mode == "baseline_upstream_flashinfer":
                 vs_str = "(ref)"
             else:
                 vs_str = "—"
@@ -2411,15 +2411,15 @@ def main():
                 print(
                     f"  {'-' * 28} {'-' * 10} {'-' * 10} {'-' * 11} {'-' * 14}"
                 )
-            base_graph = results.get("baseline", (None,) * 4)[3]
+            base_graph = results.get("baseline_upstream_flashinfer", (None,) * 4)[3]
             for mode in modes_order:
                 if mode not in results or results[mode][3] is None:
                     continue
                 gp, gts = results[mode][3]
-                if base_graph is not None and mode != "baseline":
+                if base_graph is not None and mode != "baseline_upstream_flashinfer":
                     delta_pct = (gts - base_graph[1]) / base_graph[1] * 100
                     vs_str = f"{delta_pct:+.1f}%"
-                elif mode == "baseline":
+                elif mode == "baseline_upstream_flashinfer":
                     vs_str = "(ref)"
                 else:
                     vs_str = "—"
