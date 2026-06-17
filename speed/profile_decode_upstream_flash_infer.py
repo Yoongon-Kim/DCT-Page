@@ -42,6 +42,7 @@ Rollback path (if bsz>1 verify fails):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import sys
 import time
@@ -62,6 +63,9 @@ import profile_decode as _pd
 from profile_decode import (
     print_profile,
     profiled_dct_page_attention_forward,
+    profiled_baseline_forward,
+    _sdpa_backend_context,
+    _probe_sdpa_backend,
 )
 # `pre_allocate_cache` MUST come from dct_page_attention (not profile_decode)
 # because the dct_page_attention.PreAllocatedLayer.update has the _fi_mode
@@ -803,7 +807,6 @@ def profiled_baseline_upstream_flashinfer_forward(
 def _reset_mode_state():
     _upstream_fi_cache_ref[0] = None
     _fi_baseline_cache_ref[0] = None
-    _pd._quest_cache_ref[0] = None
     _pd._step_timings.clear()
     _pd._cpu_timings.clear()
     _pd._pending_events.clear()
@@ -896,7 +899,8 @@ def parse_args():
     p.add_argument("--warmup_steps", type=int, default=8)
     p.add_argument(
         "--mode",
-        choices=["baseline", "dct_sdpa", "dct_upstream_flashinfer", "all"],
+        choices=["baseline", "baseline_sdpa", "dct_sdpa",
+                 "dct_upstream_flashinfer", "all"],
         default="dct_upstream_flashinfer",
     )
 
@@ -920,6 +924,16 @@ def parse_args():
     p.add_argument("--topk_impl",
                    choices=["auto", "fused", "twostage", "torch"],
                    default="auto")
+    p.add_argument("--sdpa_backend",
+                   choices=["auto", "flash", "mem_efficient", "math", "cudnn"],
+                   default="flash",
+                   help="Pin PyTorch's SDPA dispatcher to a single backend for "
+                        "the SDPA-based modes (baseline_sdpa, dct_sdpa). 'flash' "
+                        "= FA2 only (raises if SDPA can't route there). 'auto' = "
+                        "PyTorch default heuristic. A one-step torch.profiler "
+                        "probe before the measured loop prints which backend "
+                        "actually fired. No effect on the FlashInfer modes "
+                        "(baseline, dct_upstream_flashinfer).")
 
     p.add_argument("--batch_size", type=int, default=1,
                    help="Batch size (B). vbsz = B * num_kv_heads — each (b, h) "
@@ -1037,6 +1051,22 @@ def _patch_baseline(model, args, original_forward):
     attn_cls = transformers.models.llama.modeling_llama.LlamaAttention
     attn_cls.forward = profiled_baseline_upstream_flashinfer_forward
     _rebind_instance_forward(model, attn_cls, profiled_baseline_upstream_flashinfer_forward)
+
+
+def _patch_baseline_sdpa(model, args, original_forward):
+    """Full-KV SDPA baseline (ported from profile_decode.py).
+
+    Uses the shared `profiled_baseline_forward` (q_len==1 decode runs SDPA over
+    the whole pre-allocated KV cache, emitting the 1_qkv_proj /
+    2_rope_and_cache_append / 8_sdpa / 9_o_proj chained events). The SDPA
+    backend is pinned via --sdpa_backend in the measured loop so this is a
+    like-for-like reference against the FlashInfer full-KV baseline. No FI
+    cache is built for this mode — the flat pre-allocated cache is the SoT.
+    """
+    restore_forward(args.model, original_forward, model)
+    attn_cls = transformers.models.llama.modeling_llama.LlamaAttention
+    attn_cls.forward = profiled_baseline_forward
+    _rebind_instance_forward(model, attn_cls, profiled_baseline_forward)
 
 
 def _patch_dct_sdpa(model, args, original_forward):
@@ -1595,16 +1625,12 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
             _capture_with_seal = False
 
     if mode == "baseline":
-        _pd._profile_attn_backend.value = "sdpa"
-        _pd._profile_attn_backend.verify = False
         _patch_baseline(model, args, original_forward)
+    elif mode == "baseline_sdpa":
+        _patch_baseline_sdpa(model, args, original_forward)
     elif mode == "dct_sdpa":
-        _pd._profile_attn_backend.value = "sdpa"
-        _pd._profile_attn_backend.verify = False
         _patch_dct_sdpa(model, args, original_forward)
     elif mode == "dct_upstream_flashinfer":
-        _pd._profile_attn_backend.value = "sdpa"  # unused by our forward
-        _pd._profile_attn_backend.verify = False
         _patch_dct_upstream_flashinfer(model, args, original_forward)
     else:
         raise ValueError(f"Unknown mode: {mode!r}")
@@ -1715,26 +1741,61 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
         past_key_values = out.past_key_values
         next_token = out.logits[:, -1:].argmax(dim=-1)
 
-    print(f"  Warming up ({args.warmup_steps} steps)...")
-    _pd._enabled = False
-    for step in range(args.warmup_steps):
-        _do_one_decode_step(step, profiled=False)
-    torch.cuda.synchronize(device)
+    # SDPA backend pin (option-2 port from profile_decode.py): for the
+    # SDPA-based modes (`baseline_sdpa`, `dct_sdpa`) pin PyTorch's SDPA
+    # dispatcher to the chosen backend so the comparison against the
+    # FlashInfer modes is fair and reproducible. The FlashInfer modes
+    # (`baseline`, `dct_upstream_flashinfer`) don't call SDPA in steady state,
+    # so the context is a nullcontext there — the verify-shadow SDPA in
+    # dct_upstream_flashinfer is intentionally left on the default dispatcher.
+    _is_sdpa_mode = mode in ("baseline_sdpa", "dct_sdpa")
+    sdpa_ctx = (
+        _sdpa_backend_context(args.sdpa_backend)
+        if _is_sdpa_mode else contextlib.nullcontext()
+    )
 
-    if args.verify_upstream and mode == "dct_upstream_flashinfer":
-        for m in model.modules():
-            if isinstance(m, attn_cls):
-                m._verify_upstream = saved_verify.get(id(m), True)
-                m._verify_diffs = []
+    # Probe once (before warmup) to report which SDPA kernel actually fires.
+    if _is_sdpa_mode:
+        _sdpa_label_map = {
+            "flash": "FlashAttention-2", "mem_efficient": "memory-efficient",
+            "math": "math (unfused)", "cudnn": "cuDNN attention", "auto": None,
+        }
+        _probe_sdpa_backend._requested_label = _sdpa_label_map.get(args.sdpa_backend)
+        print(
+            f"  SDPA backend: --sdpa_backend={args.sdpa_backend} "
+            f"(requested: {_probe_sdpa_backend._requested_label or 'PyTorch default'})"
+        )
+        try:
+            _probe_sdpa_backend(
+                model, past_key_values, next_token,
+                current_pos=prefill_len,
+                backend_ctx=_sdpa_backend_context(args.sdpa_backend),
+                mode_label=mode,
+            )
+        except Exception as e:
+            print(f"  [SDPA probe skipped: {type(e).__name__}: {e}]")
 
-    print(f"  Profiling ({args.num_decode_steps} steps)...")
-    _pd._step_timings.clear()
-    _pd._cpu_timings.clear()
-    _pd._pending_events.clear()
-    _pd._enabled = True
-    for step in range(args.num_decode_steps):
-        _do_one_decode_step(args.warmup_steps + step, profiled=True)
-    _pd._enabled = False
+    with sdpa_ctx:
+        print(f"  Warming up ({args.warmup_steps} steps)...")
+        _pd._enabled = False
+        for step in range(args.warmup_steps):
+            _do_one_decode_step(step, profiled=False)
+        torch.cuda.synchronize(device)
+
+        if args.verify_upstream and mode == "dct_upstream_flashinfer":
+            for m in model.modules():
+                if isinstance(m, attn_cls):
+                    m._verify_upstream = saved_verify.get(id(m), True)
+                    m._verify_diffs = []
+
+        print(f"  Profiling ({args.num_decode_steps} steps)...")
+        _pd._step_timings.clear()
+        _pd._cpu_timings.clear()
+        _pd._pending_events.clear()
+        _pd._enabled = True
+        for step in range(args.num_decode_steps):
+            _do_one_decode_step(args.warmup_steps + step, profiled=True)
+        _pd._enabled = False
     # B1: stash per-substep eager averages BEFORE the cudagraph block so the
     # graph-mode bucketer can compute eager_ms / graph_ms ratios as a disambig
     # sanity check. Reads from `_pd._step_timings` populated by the eager
@@ -1868,6 +1929,17 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
         if args.cudagraph_breakdown:
             _breakdown_toggle = _CudagraphBreakdownToggle()
             _breakdown_toggle.__enter__()
+        # Pin SDPA to the same backend as the eager measured loop during graph
+        # priming + capture, so the captured kernel matches what the eager rows
+        # report (replay is a no-op under the context — kernels are already
+        # baked). Fresh context: sdpa_kernel is not guaranteed reusable after
+        # the eager-loop `with` already exited it. FI modes don't call SDPA, so
+        # this is a nullcontext there.
+        graph_sdpa_ctx = (
+            _sdpa_backend_context(args.sdpa_backend)
+            if _is_sdpa_mode else contextlib.nullcontext()
+        )
+        graph_sdpa_ctx.__enter__()
         try:
             s = torch.cuda.Stream(device=device)
             s.wait_stream(torch.cuda.current_stream(device))
@@ -2233,6 +2305,7 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
         finally:
             if args.cudagraph_breakdown:
                 _breakdown_toggle.__exit__(None, None, None)
+            graph_sdpa_ctx.__exit__(None, None, None)
 
     return (
         avg_total, tok_s,
@@ -2255,7 +2328,8 @@ def main():
     print(f"Model layers: {num_layers}")
     print(f"Context length: {args.context_length}  batch_size: {args.batch_size}")
 
-    modes_order = ["baseline", "dct_sdpa", "dct_upstream_flashinfer"]
+    modes_order = ["baseline", "baseline_sdpa", "dct_sdpa",
+                   "dct_upstream_flashinfer"]
     if args.mode == "all":
         modes_to_run = modes_order
     else:
