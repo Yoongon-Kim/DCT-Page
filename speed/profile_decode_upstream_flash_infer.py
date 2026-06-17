@@ -59,14 +59,11 @@ import torch
 import torch.nn.functional as F
 import transformers
 
-import profile_decode as _pd
-from profile_decode import (
-    print_profile,
-    profiled_dct_page_attention_forward,
-    profiled_baseline_forward,
-    _sdpa_backend_context,
-    _probe_sdpa_backend,
-)
+from collections import defaultdict
+from torch.nn.attention import sdpa_kernel, SDPBackend
+from torch.profiler import profile as _torch_profile, ProfilerActivity
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.models.qwen2.modeling_qwen2 import eager_attention_forward
 # `pre_allocate_cache` MUST come from dct_page_attention (not profile_decode)
 # because the dct_page_attention.PreAllocatedLayer.update has the _fi_mode
 # counter-only shim that lets us free flat KV after FI build. The
@@ -94,12 +91,17 @@ from dct_page_attention import (
     dct_page_attention_forward,
     pre_allocate_cache,
     replace_llama_attn,
+    segment_kv,
     _maybe_reset_dct_runtime_state,
     _update_comp_cache,
 )
+# Alias kept for the merged profiled_dct_page_attention_forward, which used the
+# `_update_comp_cache_original` name in the standalone profile_decode module.
+_update_comp_cache_original = _update_comp_cache
 from triton_kernels import (
     score_pages_triton,
     topk_sort_and_pack_triton,
+    assemble_kv_drop_triton,
 )
 from upstream_flashinfer_backend import (
     UpstreamFlashInferPagedKVCache,
@@ -108,6 +110,657 @@ from upstream_flashinfer_backend import (
     refresh_upstream_indices_flat,
     upstream_flashinfer_decode_attention,
 )
+
+
+# ===========================================================================
+# Merged engine (formerly speed/profile_decode.py). The SDPA-path forwards,
+# timing infrastructure, SDPA-backend pin/probe, print_profile, and the
+# topk micro-benchmark now live here so this file is self-contained.
+# ===========================================================================
+
+
+_SDPA_BACKEND_MAP = {
+    "auto":         None,
+    "flash":        [SDPBackend.FLASH_ATTENTION],
+    "mem_efficient":[SDPBackend.EFFICIENT_ATTENTION],
+    "math":         [SDPBackend.MATH],
+    "cudnn":        [SDPBackend.CUDNN_ATTENTION],
+}
+
+
+def _sdpa_backend_context(backend_str):
+    """Return a context manager that pins SDPA to the chosen backend.
+
+    `auto` keeps PyTorch's default dispatcher (all backends allowed). Any
+    other value whitelists ONLY that backend — SDPA will raise rather than
+    silently fall back, which is what we want when benchmarking.
+    """
+    backends = _SDPA_BACKEND_MAP.get(backend_str)
+    if backends is None:
+        return contextlib.nullcontext()
+    return sdpa_kernel(backends)
+
+
+_SDPA_KERNEL_SIGNATURES = [
+    # (label, substrings — any match wins)
+    ("FlashAttention-2",     ("flash_fwd", "flash::flash_fwd", "flash_attn")),
+    ("memory-efficient",     ("fmha_cutlass", "cutlassf", "mem_efficient_attention")),
+    ("cuDNN attention",      ("cudnn_attention", "cudnn_fused_attention")),
+    ("math (unfused)",       ("scaled_dot_product_attention_math", "sdp_math")),
+]
+
+
+def _probe_sdpa_backend(model, past_key_values, next_token, current_pos,
+                        backend_ctx, mode_label):
+    """Run ONE decode step under torch.profiler, grep kernel names, and
+    print which SDPA backend actually fired. `backend_ctx` is a context
+    manager for the first `with` block; a second one is constructed via
+    the stashed `_requested_label -> backend_str` map for the profile run
+    (sdpa_kernel isn't re-entrant on a single instance)."""
+    device = next_token.device
+    static_pos = torch.tensor([current_pos], device=device, dtype=torch.long)
+    # Resolve the backend string from the requested_label so we can build a
+    # second fresh context for the profiled call.
+    requested_label = getattr(_probe_sdpa_backend, "_requested_label", None)
+    label_to_str = {
+        "FlashAttention-2": "flash", "memory-efficient": "mem_efficient",
+        "math (unfused)": "math", "cuDNN attention": "cudnn", None: "auto",
+    }
+    backend_str = label_to_str.get(requested_label, "auto")
+
+    # Warmup (cuDNN + FA pick plans on first call; skip that cost from the trace).
+    with backend_ctx, torch.no_grad():
+        model(next_token, past_key_values=past_key_values,
+              use_cache=True, cache_position=static_pos)
+    torch.cuda.synchronize(device)
+
+    with _sdpa_backend_context(backend_str), torch.no_grad(), _torch_profile(
+        activities=[ProfilerActivity.CUDA], record_shapes=False,
+    ) as prof:
+        model(next_token, past_key_values=past_key_values,
+              use_cache=True, cache_position=static_pos)
+    torch.cuda.synchronize(device)
+
+    kernel_names = []
+    for ev in prof.events():
+        dur = getattr(ev, "cuda_time_total", 0) or getattr(ev, "self_cuda_time_total", 0)
+        if dur > 0 and ev.name:
+            kernel_names.append(ev.name.lower())
+
+    hits = {label: [] for label, _ in _SDPA_KERNEL_SIGNATURES}
+    unmatched_attn_like = []
+    for name in kernel_names:
+        matched = False
+        for label, needles in _SDPA_KERNEL_SIGNATURES:
+            if any(n in name for n in needles):
+                hits[label].append(name)
+                matched = True
+                break
+        if not matched and ("attention" in name or "sdpa" in name or "fmha" in name):
+            unmatched_attn_like.append(name)
+
+    print(f"\n  [SDPA probe: {mode_label}]")
+    any_hit = False
+    for label, _ in _SDPA_KERNEL_SIGNATURES:
+        if hits[label]:
+            any_hit = True
+            sample = hits[label][0]
+            print(f"    -> {label}  (e.g. {sample[:90]})  count={len(hits[label])}")
+    if not any_hit:
+        print(f"    -> NO known SDPA kernel matched. "
+              f"Attention-like kernels observed: {list(set(unmatched_attn_like))[:5]}")
+    # Extra: print a warning if FA2 was requested but not observed.
+    requested = getattr(_probe_sdpa_backend, "_requested_label", None)
+    if requested == "FlashAttention-2" and not hits["FlashAttention-2"]:
+        print(f"    [WARN] FA2 was requested via --sdpa_backend flash but "
+              f"no flash_fwd kernels were observed.")
+    elif requested == "FlashAttention-2":
+        print(f"    [OK] FA2 confirmed.")
+
+
+def _get_attention_interface(attn_module):
+    if attn_module.config._attn_implementation == "eager":
+        return eager_attention_forward
+    return ALL_ATTENTION_FUNCTIONS[attn_module.config._attn_implementation]
+
+
+_step_timings = defaultdict(list)  # step_name -> list of ms
+_cpu_timings = defaultdict(list)   # step_name -> list of ms (CPU wall-clock with sync)
+_pending_events = []  # (name, start_event, end_event) — flushed after each decode step
+_enabled = False
+_sync_mode = False  # when True, add torch.cuda.synchronize() between steps for CPU timing
+_current_layer = 0
+
+
+class _ProfileTopKImpl:
+    """Tiny mutable holder so the forward can read the chosen topk impl
+    without threading a kwarg through each call."""
+    value = 'auto'
+
+
+_profile_topk_impl = _ProfileTopKImpl()
+
+
+def _flush_events():
+    """Sync all devices, then compute all deferred elapsed times."""
+    for i in range(torch.cuda.device_count()):
+        torch.cuda.synchronize(device=i)
+    for name, s, e in _pending_events:
+        _step_timings[name].append(s.elapsed_time(e))
+    _pending_events.clear()
+
+
+def profiled_dct_page_attention_forward(
+    self,
+    hidden_states,
+    position_embeddings,
+    attention_mask=None,
+    past_key_values=None,
+    cache_position=None,
+    **kwargs,
+):
+    """Instrumented version of dct_page_attention_forward for profiling.
+
+    Uses 8 chained CUDA events so that total attention = sum of steps 1-7
+    with zero gaps.
+    """
+    global _current_layer
+
+    from dct_page_attention import _dct_page_cfg as cfg, _maybe_reset_dct_runtime_state
+    from typing import Callable
+
+    input_shape = hidden_states.shape[:-1]  # (bsz, q_len)
+    hidden_shape = (*input_shape, -1, self.head_dim)  # (bsz, q_len, num_heads, head_dim)
+    bsz, q_len = input_shape
+    _maybe_reset_dct_runtime_state(self, past_key_values)
+
+    if q_len > 1:
+        # Prefill path — always use standard attention (no profiling)
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if past_key_values is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+
+        attention_interface = _get_attention_interface(self)
+        attn_output, attn_weights = attention_interface(
+            self, query_states, key_states, value_states, attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=getattr(self, "sliding_window", None), **kwargs,
+        )
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+    # ---- DECODE PATH (q_len == 1) ----
+    # Peek at KV length for the short-KV fallback without running step 1/2
+    # (matches dct_page_attention.py:1152).
+    if past_key_values is not None:
+        prev_len = int(past_key_values.layers[self.layer_idx].get_seq_length())
+    else:
+        prev_len = 0
+    projected_kv_len = prev_len + q_len
+
+    min_len_for_paging = max(
+        (cfg.num_sink_pages + cfg.top_k + 1 + cfg.num_recent_pages) * cfg.page_size,
+        getattr(cfg, "min_decode_kv_len_for_paging", 0),
+    )
+    if projected_kv_len < min_len_for_paging:
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if past_key_values is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+        attention_interface = _get_attention_interface(self)
+        attn_output, _ = attention_interface(
+            self, query_states, key_states, value_states, attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=getattr(self, "sliding_window", None), **kwargs,
+        )
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        _current_layer += 1
+        return attn_output, None
+
+    # Chained CUDA events: ev[i] is the boundary between step i and step i+1.
+    # Total attention = ev[0] → ev[-1] = exact sum of all profiled steps.
+    if _enabled:
+        _dev = hidden_states.device
+        _stream = torch.cuda.current_stream(_dev)
+        ev = [torch.cuda.Event(enable_timing=True) for _ in range(11)]
+        _cpu_ts = []
+
+        def _rec(i):
+            if _sync_mode:
+                torch.cuda.synchronize(_dev)
+            ev[i].record(_stream)
+            if _sync_mode:
+                _cpu_ts.append(time.perf_counter())
+
+        _rec(0)
+
+    # Step 1: qkv
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    if _enabled:
+        _rec(1)
+
+    # Step 2: RoPE + KV cache update (post-RoPE stored in cache)
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    if past_key_values is not None:
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        key_states, value_states = past_key_values.update(
+            key_states, value_states, self.layer_idx, cache_kwargs
+        )
+    kv_len = key_states.shape[2]
+
+    if _enabled:
+        _rec(2)
+
+    # Step 3: segment
+    comp_size = max(1, int(cfg.page_size * cfg.compress_ratio))
+    (sink_k, sink_v, paged_k, paged_v,
+     recent_k, recent_v, num_pages, actual_recent) = segment_kv(
+        key_states, value_states, cfg
+    )
+
+    if _enabled:
+        _rec(3)
+
+    # Step 4: compressed page cache maintenance. comp_k is always needed for
+    # scoring; comp_v is only stored in "compressed" mode (drop mode returns
+    # comp_v=None).
+    comp_k, comp_v = _update_comp_cache_original(
+        self, paged_k, paged_v, num_pages, comp_size, cfg,
+    )
+
+    if _enabled:
+        _rec(4)
+
+    # Step 5a: score cache update
+    from triton_kernels import (
+        score_pages_triton,
+        topk_sort,
+        topk_sort_triton,
+        topk_sort_twostage_triton,
+        topk_sort_torch,
+    )
+
+    _num_kv_heads = self.config.num_key_value_heads  # 8 for Llama-3.1-8B
+    page_scores_buf = getattr(self, '_page_scores_buf', None)
+    if (
+        page_scores_buf is None
+        or page_scores_buf.shape[0] != bsz
+        or page_scores_buf.shape[1] != _num_kv_heads
+        or page_scores_buf.shape[2] != num_pages
+    ):
+        self._page_scores_buf = torch.empty(
+            bsz, _num_kv_heads, num_pages,
+            dtype=torch.float32, device=paged_k.device,
+        )
+
+    score_query_states = query_states
+    score_comp_k = comp_k
+
+    if _enabled:
+        _rec(5)
+
+    # Step 5b: score pages kernel
+    page_scores = score_pages_triton(
+        score_query_states, score_comp_k,
+        cfg.scoring_method, cfg.group_agg_method,
+        self.num_key_value_groups,
+        out=self._page_scores_buf,
+    )
+
+    if _enabled:
+        _rec(6)
+
+    # Step 6: topk
+    actual_top_k = min(cfg.top_k, num_pages)
+
+    topk_buf = getattr(self, '_topk_out_buf', None)
+    if (
+        topk_buf is None
+        or topk_buf.shape[0] != bsz
+        or topk_buf.shape[1] != _num_kv_heads
+        or topk_buf.shape[2] != actual_top_k
+    ):
+        self._topk_out_buf = torch.empty(
+            bsz, _num_kv_heads, actual_top_k, dtype=torch.int32, device=paged_k.device
+        )
+    # Scratch for two-stage dispatch; large enough for NUM_CHUNKS=8.
+    scratch_n = 8 * actual_top_k
+    scratch_buf = getattr(self, '_topk_scratch_buf', None)
+    if (
+        scratch_buf is None
+        or scratch_buf.shape[0] != bsz
+        or scratch_buf.shape[1] != _num_kv_heads
+        or scratch_buf.shape[2] < scratch_n
+    ):
+        self._topk_scratch_buf = torch.empty(
+            bsz, _num_kv_heads, scratch_n, dtype=torch.int64, device=paged_k.device
+        )
+
+    topk_impl = getattr(_profile_topk_impl, 'value', 'auto')
+    _sort_ascending = (cfg.unselected_mode == "compressed")
+    if topk_impl == 'fused':
+        selected_indices = topk_sort_triton(
+            page_scores, actual_top_k, out=self._topk_out_buf,
+            sort_ascending=_sort_ascending,
+        )
+    elif topk_impl == 'twostage':
+        selected_indices = topk_sort_twostage_triton(
+            page_scores, actual_top_k,
+            out=self._topk_out_buf,
+            scratch=self._topk_scratch_buf[:, :, :scratch_n],
+            sort_ascending=_sort_ascending,
+        )
+    elif topk_impl == 'torch':
+        selected_indices = topk_sort_torch(
+            page_scores, actual_top_k, out=self._topk_out_buf,
+            sort_ascending=_sort_ascending,
+        )
+    else:  # auto
+        selected_indices = topk_sort(
+            page_scores, actual_top_k,
+            out=self._topk_out_buf,
+            scratch=self._topk_scratch_buf[:, :, :scratch_n],
+            sort_ascending=_sort_ascending,
+        )
+
+    if _enabled:
+        _rec(7)
+
+    if cfg.unselected_mode == "drop":
+        assembled_len = cfg.num_sink_pages * cfg.page_size + actual_top_k * cfg.page_size + actual_recent
+    else:
+        num_unselected = num_pages - actual_top_k
+        middle_len = actual_top_k * cfg.page_size + num_unselected * comp_size
+        assembled_len = cfg.num_sink_pages * cfg.page_size + middle_len + actual_recent
+
+    # Pre-allocate or expand output buffers (avoids torch.empty per step).
+    _buf_len = getattr(self, '_assemble_buf_len', 0)
+    if assembled_len > _buf_len:
+        _max_len = assembled_len + cfg.page_size
+        _nkv = _num_kv_heads
+        self._final_k_buf = torch.empty(bsz, _nkv, _max_len, self.head_dim, dtype=paged_k.dtype, device=paged_k.device)
+        self._final_v_buf = torch.empty_like(self._final_k_buf)
+        self._sel_idx_buf = torch.empty(bsz, _nkv, actual_top_k, dtype=torch.int32, device=paged_k.device)
+        self._assemble_buf_len = _max_len
+
+    # Step 7: assemble KV. Cache is post-RoPE, so no RoPE is re-applied here.
+    if cfg.unselected_mode == "drop":
+        final_k, final_v = assemble_kv_drop_triton(
+            paged_k, paged_v,
+            sink_k, sink_v, recent_k, recent_v,
+            selected_indices,
+            None, None,
+            out_k=self._final_k_buf,
+            out_v=self._final_v_buf,
+            out_sel_idx=self._sel_idx_buf,
+            original_position_rope=False,
+        )
+    else:
+        raise NotImplementedError("profile_decode only supports the current drop-mode default path.")
+
+    if _enabled:
+        _rec(8)
+
+    # Step 8: attention (SDPA).
+    attn_output = F.scaled_dot_product_attention(
+        query_states, final_k, final_v,
+        is_causal=False, enable_gqa=True,
+    )
+    attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+
+    if _enabled:
+        _rec(9)
+
+    attn_output = self.o_proj(attn_output)
+
+    if _enabled:
+        _rec(10)
+        step_names = [
+            "1_qkv_proj", "2_rope_and_cache_append", "3_segment",
+            "4_compress", "5a_score_cache_update", "5b_score_pages_kernel",
+            "6_topk", "7_assemble_drop",
+            "8_sdpa", "9_o_proj",
+        ]
+        for i, name in enumerate(step_names):
+            _pending_events.append((name, ev[i], ev[i + 1]))
+        if _sync_mode:
+            for i, name in enumerate(step_names):
+                cpu_ms = (_cpu_ts[i + 1] - _cpu_ts[i]) * 1000
+                _cpu_timings[name].append(cpu_ms)
+
+    _current_layer += 1
+    return attn_output, None
+
+
+def profiled_baseline_forward(
+    self,
+    hidden_states,
+    position_embeddings,
+    attention_mask=None,
+    past_key_values=None,
+    cache_position=None,
+    **kwargs,
+):
+    """Instrumented baseline (standard) attention for comparison.
+
+    Chained CUDA events with step names matching the DCT forward
+    (1_qkv_proj, 2_rope_and_cache_append, 8_sdpa, 9_o_proj) for direct
+    comparison. Run with pre-allocated KV cache (same backend as DCT) so
+    2_rope_and_cache_append is apples-to-apples.
+    """
+    from typing import Callable
+
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+    bsz, q_len = input_shape
+
+    if q_len > 1:
+        # Prefill — standard path
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if past_key_values is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+
+        attention_interface = _get_attention_interface(self)
+        attn_output, attn_weights = attention_interface(
+            self, query_states, key_states, value_states, attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=getattr(self, "sliding_window", None), **kwargs,
+        )
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+    # ---- Decode path (fast SDPA; events only when _enabled) ----
+    if _enabled:
+        _dev = hidden_states.device
+        _stream = torch.cuda.current_stream(_dev)
+        ev = [torch.cuda.Event(enable_timing=True) for _ in range(5)]
+        ev[0].record(_stream)
+
+    # Step 1: QKV projection
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    if _enabled:
+        ev[1].record(_stream)
+
+    # Step 2: RoPE + KV cache update
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    if past_key_values is not None:
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        key_states, value_states = past_key_values.update(
+            key_states, value_states, self.layer_idx, cache_kwargs
+        )
+
+    if _enabled:
+        ev[2].record(_stream)
+
+    # Step 8: SDPA (matches DCT's step 8 label for the comparison table)
+    attn_output = F.scaled_dot_product_attention(
+        query_states, key_states, value_states,
+        is_causal=False,  # q_len=1 decode: no future positions to mask
+        enable_gqa=True,
+    )
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+
+    if _enabled:
+        ev[3].record(_stream)
+
+    attn_output = self.o_proj(attn_output)
+
+    if _enabled:
+        ev[4].record(_stream)
+        step_names = ["1_qkv_proj", "2_rope_and_cache_append", "8_sdpa", "9_o_proj"]
+        for i, name in enumerate(step_names):
+            _pending_events.append((name, ev[i], ev[i + 1]))
+
+    return attn_output, None
+
+
+def print_profile(mode, avg_model_total, tok_s, timings, num_layers=32, cpu_timings=None, bsz=1):
+    print(f"\n{'=' * 70}")
+    print(f"PROFILE: {mode.upper()}")
+    print(f"{'=' * 70}")
+
+    # Compute per-token time for each step
+    step_order = sorted(timings.keys())
+    step_per_token = {}
+    for step_name in step_order:
+        vals = timings[step_name]
+        n_decode_steps = len(vals) / num_layers if num_layers > 0 else 1
+        step_per_token[step_name] = sum(vals) / n_decode_steps if n_decode_steps > 0 else 0.0
+
+    # Attention total = exact sum of all steps (guaranteed by chained events)
+    attn_total = sum(step_per_token.values())
+
+    # `tok_s` is steps/sec (== `1000 / avg_model_total`). One step generates
+    # `bsz` tokens (one per batch element), so aggregate throughput is
+    # `bsz * tok_s`. At bsz=1 the two coincide. Print both to make the
+    # distinction explicit when bsz>1.
+    print(f"  Attention total: {attn_total:.2f} ms/step")
+    if bsz == 1:
+        print(f"  Model total:     {avg_model_total:.2f} ms/step  ({tok_s:.1f} tok/s)")
+    else:
+        agg_tok_s = tok_s * bsz
+        print(
+            f"  Model total:     {avg_model_total:.2f} ms/step  "
+            f"({tok_s:.1f} step/s, {agg_tok_s:.1f} agg tok/s @ bsz={bsz})"
+        )
+    print()
+
+    has_cpu = cpu_timings and len(cpu_timings) > 0
+    if has_cpu:
+        print(f"  {'Step':<25} {'GPU (ms/tok)':>12} {'CPU+sync (ms/tok)':>18} {'GPU kern (µs)':>14} {'% of attn':>10}")
+        print(f"  {'-'*25} {'-'*12} {'-'*18} {'-'*14} {'-'*10}")
+    else:
+        print(f"  {'Step':<25} {'Per-layer (ms)':>15} {'Per-token (ms)':>15} {'% of attn':>12}")
+        print(f"  {'-'*25} {'-'*15} {'-'*15} {'-'*12}")
+
+    for step_name in step_order:
+        vals = timings[step_name]
+        avg_per_call = sum(vals) / len(vals) if vals else 0.0
+        per_token = step_per_token[step_name]
+        pct = per_token / attn_total * 100 if attn_total > 0 else 0.0
+
+        if has_cpu and step_name in cpu_timings:
+            cpu_vals = cpu_timings[step_name]
+            cpu_per_tok = sum(cpu_vals) / (len(cpu_vals) / num_layers) if cpu_vals else 0.0
+            print(f"  {step_name:<25} {per_token:>12.3f} {cpu_per_tok:>18.3f} {avg_per_call*1000:>14.1f} {pct:>9.1f}%")
+        elif has_cpu:
+            print(f"  {step_name:<25} {per_token:>12.3f} {'—':>18} {avg_per_call*1000:>14.1f} {pct:>9.1f}%")
+        else:
+            print(f"  {step_name:<25} {avg_per_call:>15.4f} {per_token:>15.3f} {pct:>11.1f}%")
+
+    print(f"  {'-'*25} {'-'*12 if has_cpu else '-'*15} {'-'*18 if has_cpu else '-'*15} {'-'*14 if has_cpu else '-'*12}")
+    total_label = 'TOTAL'
+    if has_cpu:
+        cpu_total = sum(sum(v) / (len(v) / num_layers) for v in cpu_timings.values() if v)
+        print(f"  {total_label:<25} {attn_total:>12.3f} {cpu_total:>18.3f} {'':>14} {'100.0':>9}%")
+    else:
+        print(f"  {total_label:<25} {'':>15} {attn_total:>15.3f} {'100.0':>11}%")
+
+
+def run_benchmark_topk():
+    """Standalone micro-benchmark: fused vs twostage vs torch across shapes.
+
+    Reports average per-call time and validates that all three kernels produce
+    the same output.
+    """
+    from triton_kernels import (
+        topk_sort_triton, topk_sort_twostage_triton, topk_sort_torch,
+    )
+
+    def bench(fn, *args, trials=1000, warmup=50):
+        for _ in range(warmup):
+            fn(*args)
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(trials):
+            fn(*args)
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) / trials * 1000  # us
+
+    print("Top-K micro-benchmark (bsz=1, num_kv_heads=8, top_k=64)")
+    print(f"{'num_pages':>10} {'fused us':>10} {'2stage-4':>10} {'2stage-8':>10} {'torch':>8} {'ok':>5}")
+    torch.manual_seed(0)
+    top_k = 64
+    for num_pages in [512, 1020, 1024, 1025, 2040, 2048]:
+        scores = torch.randn(1, 8, num_pages, dtype=torch.float32, device='cuda')
+        out_buf = torch.empty(1, 8, top_k, dtype=torch.int32, device='cuda')
+        scratch4 = torch.empty(1, 8, 4 * top_k, dtype=torch.int64, device='cuda')
+        scratch8 = torch.empty(1, 8, 8 * top_k, dtype=torch.int64, device='cuda')
+
+        us_fused = bench(topk_sort_triton, scores, top_k, out_buf)
+        us_ts4 = bench(topk_sort_twostage_triton, scores, top_k, out_buf, scratch4, 4)
+        us_ts8 = bench(topk_sort_twostage_triton, scores, top_k, out_buf, scratch8, 8)
+        us_torch = bench(topk_sort_torch, scores, top_k, out_buf)
+
+        a = topk_sort_triton(scores, top_k).clone()
+        b = topk_sort_twostage_triton(scores, top_k, num_chunks=4)
+        c = topk_sort_twostage_triton(scores, top_k, num_chunks=8)
+        d = topk_sort_torch(scores, top_k)
+        ok = torch.equal(a, b) and torch.equal(a, c) and torch.equal(a, d)
+
+        print(f"{num_pages:>10} {us_fused:>10.2f} {us_ts4:>10.2f} {us_ts8:>10.2f} {us_torch:>8.2f} {str(ok):>5}")
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +800,7 @@ def profiled_dct_upstream_flashinfer_forward(
     appended to `self._verify_diffs`. Gathered OUTSIDE the event window so
     it doesn't bias 7_upstream_fi_run.
     """
+    global _current_layer
     cfg = _dpa._dct_page_cfg
     if cfg.unselected_mode != "drop":
         raise NotImplementedError("upstream-FI forward supports drop mode only")
@@ -186,17 +840,17 @@ def profiled_dct_upstream_flashinfer_forward(
     hidden_shape = (*input_shape, -1, self.head_dim)
     _has_qk_norm = hasattr(self, "q_norm") and hasattr(self, "k_norm")
 
-    if _pd._enabled:
+    if _enabled:
         _dev = hidden_states.device
         _stream = torch.cuda.current_stream(_dev)
         ev = [torch.cuda.Event(enable_timing=True) for _ in range(9)]
         _cpu_ts = []
 
         def _rec(i):
-            if _pd._sync_mode:
+            if _sync_mode:
                 torch.cuda.synchronize(_dev)
             ev[i].record(_stream)
-            if _pd._sync_mode:
+            if _sync_mode:
                 _cpu_ts.append(time.perf_counter())
 
         _rec(0)
@@ -211,7 +865,7 @@ def profiled_dct_upstream_flashinfer_forward(
     key_states = key_states.transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-    if _pd._enabled:
+    if _enabled:
         _rec(1)
 
     # Step 2: RoPE + DCT cache update + FI counter advance on layer 0.
@@ -248,7 +902,7 @@ def profiled_dct_upstream_flashinfer_forward(
         cache.last_page_idx.fill_(cache.last_page_idx_py)
         cache.last_page_len_buf.fill_(cache.last_page_len_py)
 
-    if _pd._enabled:
+    if _enabled:
         _rec(2)
 
     # Step 3: paged views from FI buf (cache.buf_views[l] is the SoT — flat
@@ -266,7 +920,7 @@ def profiled_dct_upstream_flashinfer_forward(
     paged_k = middle[:, :, :, 0, :, 0, :]   # (B, H, num_pages, ps, d)
     paged_v = middle[:, :, :, 1, :, 0, :]
 
-    if _pd._enabled:
+    if _enabled:
         _rec(3)
 
     # Step 4: compressed page cache (DCT proxy for scoring).
@@ -274,7 +928,7 @@ def profiled_dct_upstream_flashinfer_forward(
         self, paged_k, paged_v, num_pages, comp_size, cfg,
     )
 
-    if _pd._enabled:
+    if _enabled:
         _rec(4)
 
     # Step 5: score pages.
@@ -306,7 +960,7 @@ def profiled_dct_upstream_flashinfer_forward(
             out=self._page_scores_buf[:, :, :num_pages],
         )
 
-    if _pd._enabled:
+    if _enabled:
         _rec(5)
 
     # Step 6: fused topk + pack. Writes head-local indices into
@@ -334,7 +988,7 @@ def profiled_dct_upstream_flashinfer_forward(
         allow_head_local_multibatch=True,
     )
 
-    if _pd._enabled:
+    if _enabled:
         _rec(6)
 
     # Step 7: bias indices to physical pages + FI K/V write + wrapper.run.
@@ -356,7 +1010,7 @@ def profiled_dct_upstream_flashinfer_forward(
         query_states, cache, self.layer_idx,
     )
 
-    if _pd._enabled:
+    if _enabled:
         _rec(7)
 
     # Verify path — outside the event window. Recreates the same K/V set that
@@ -398,7 +1052,7 @@ def profiled_dct_upstream_flashinfer_forward(
     attn_output = attn_output_fi.transpose(1, 2).reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)
 
-    if _pd._enabled:
+    if _enabled:
         _rec(8)
         step_names = [
             "1_qkv_proj",
@@ -411,13 +1065,13 @@ def profiled_dct_upstream_flashinfer_forward(
             "8_o_proj",
         ]
         for i, name in enumerate(step_names):
-            _pd._pending_events.append((name, ev[i], ev[i + 1]))
-        if _pd._sync_mode:
+            _pending_events.append((name, ev[i], ev[i + 1]))
+        if _sync_mode:
             for i, name in enumerate(step_names):
                 cpu_ms = (_cpu_ts[i + 1] - _cpu_ts[i]) * 1000
-                _pd._cpu_timings[name].append(cpu_ms)
+                _cpu_timings[name].append(cpu_ms)
 
-    _pd._current_layer += 1
+    _current_layer += 1
     return attn_output, None
 
 
@@ -690,7 +1344,7 @@ def profiled_baseline_upstream_flashinfer_forward(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
-        attention_interface = _pd._get_attention_interface(self)
+        attention_interface = _get_attention_interface(self)
         attn_output, attn_weights = attention_interface(
             self, query_states, key_states, value_states, attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
@@ -710,7 +1364,7 @@ def profiled_baseline_upstream_flashinfer_forward(
             "_fi_baseline_cache_ref[0] before decode."
         )
 
-    if _pd._enabled:
+    if _enabled:
         _dev = hidden_states.device
         _stream = torch.cuda.current_stream(_dev)
         ev = [torch.cuda.Event(enable_timing=True) for _ in range(5)]
@@ -720,7 +1374,7 @@ def profiled_baseline_upstream_flashinfer_forward(
     key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-    if _pd._enabled:
+    if _enabled:
         ev[1].record(_stream)
 
     cos, sin = position_embeddings
@@ -777,20 +1431,20 @@ def profiled_baseline_upstream_flashinfer_forward(
         layer_buf[phys, 0, slot] = k_flat
         layer_buf[phys, 1, slot] = v_flat
 
-    if _pd._enabled:
+    if _enabled:
         ev[2].record(_stream)
 
     q_flat = query_states.reshape(cache_bsz, cache.num_qo_heads, cache.head_dim).contiguous()
     attn_output = cache.wrapper.run(q_flat, cache.buf[self.layer_idx])
     attn_output = attn_output.view(cache_bsz, cache.num_qo_heads, 1, cache.head_dim)
 
-    if _pd._enabled:
+    if _enabled:
         ev[3].record(_stream)
 
     attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)
 
-    if _pd._enabled:
+    if _enabled:
         ev[4].record(_stream)
         step_names = [
             "1_qkv_proj",
@@ -799,19 +1453,20 @@ def profiled_baseline_upstream_flashinfer_forward(
             "9_o_proj",
         ]
         for i, name in enumerate(step_names):
-            _pd._pending_events.append((name, ev[i], ev[i + 1]))
+            _pending_events.append((name, ev[i], ev[i + 1]))
 
     return attn_output, None
 
 
 def _reset_mode_state():
+    global _current_layer, _enabled
     _upstream_fi_cache_ref[0] = None
     _fi_baseline_cache_ref[0] = None
-    _pd._step_timings.clear()
-    _pd._cpu_timings.clear()
-    _pd._pending_events.clear()
-    _pd._enabled = False
-    _pd._current_layer = 0
+    _step_timings.clear()
+    _cpu_timings.clear()
+    _pending_events.clear()
+    _enabled = False
+    _current_layer = 0
 
 
 def _probe_event_record_in_graph(device) -> bool:
@@ -844,28 +1499,30 @@ def _probe_event_record_in_graph(device) -> bool:
 
 
 class _CudagraphBreakdownToggle:
-    """Enable `_pd._enabled` (with `_pd._sync_mode` forced off) for the
+    """Enable `_enabled` (with `_sync_mode` forced off) for the
     duration of a CUDA-graph priming + capture block, so the chained-event
     chain in `profiled_dct_upstream_flashinfer_forward` records into the
     captured graph.
 
-    Do NOT call `_pd._flush_events()` inside the cudagraph block — the
+    Do NOT call `_flush_events()` inside the cudagraph block — the
     read-after-final-replay pattern requires `_pending_events` to retain
     its capture-time entries until the explicit walk. `_flush_events()`
     clears the list and would break the readout.
     """
 
     def __enter__(self):
-        self._old_enabled = _pd._enabled
-        self._old_sync_mode = _pd._sync_mode
-        _pd._enabled = True
-        _pd._sync_mode = False
-        _pd._pending_events.clear()  # discard stale events from previous mode
+        global _enabled, _sync_mode
+        self._old_enabled = _enabled
+        self._old_sync_mode = _sync_mode
+        _enabled = True
+        _sync_mode = False
+        _pending_events.clear()  # discard stale events from previous mode
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        _pd._enabled = self._old_enabled
-        _pd._sync_mode = self._old_sync_mode
+        global _enabled, _sync_mode
+        _enabled = self._old_enabled
+        _sync_mode = self._old_sync_mode
         return False
 
 
@@ -1031,6 +1688,10 @@ def parse_args():
                         "cache slot every time, so this is for TIMING "
                         "measurement only — never use for correctness runs. "
                         "Implies --cudagraph.")
+
+    p.add_argument("--benchmark_topk", action="store_true",
+                   help="Run a standalone micro-benchmark of the topk "
+                        "implementations over representative shapes and exit.")
 
     return p.parse_args()
 
@@ -1293,7 +1954,7 @@ def _print_graph_breakdown(
     #
     # Unit reconciliation: `eager_per_token[name]` is per-LAYER-per-step
     # (each of the N decoder layers records its own substep events into
-    # `_pd._step_timings`, and the eager-stash averages those without summing
+    # `_step_timings`, and the eager-stash averages those without summing
     # across layers). `substep_per_token[name]` is per-STEP TOTAL (sum over
     # all layers, divided by num_replays). To compare on equal footing, we
     # scale the eager value up to per-step by multiplying by `num_layers`.
@@ -1591,9 +2252,10 @@ _CUBLASLT_PATTERNS = ("gemm", "cutlass", "ampere_")  # case-insensitive
 # Runner
 # ---------------------------------------------------------------------------
 def _run_one_mode(model, tokenizer, args, mode, original_forward):
+    global _current_layer, _enabled, _sync_mode
     _reset_mode_state()
-    _pd._sync_mode = args.sync
-    _pd._profile_topk_impl.value = args.topk_impl
+    _sync_mode = args.sync
+    _profile_topk_impl.value = args.topk_impl
 
     # Per-mode breakdown overrides (locals, not args mutation — args is reused
     # across modes when --mode all). Baseline can't run DCT-only breakdown
@@ -1646,7 +2308,7 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
 
     chunk_size = args.chunk_size
     print(f"  Prefilling ({args.context_length} tokens, bsz={bsz}, chunk={chunk_size})...")
-    _pd._enabled = False
+    _enabled = False
     torch.cuda.synchronize(device)
     t0 = time.perf_counter()
     with torch.no_grad():
@@ -1724,9 +2386,10 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
     total_times = []
 
     def _do_one_decode_step(step_idx, profiled):
+        global _current_layer
         nonlocal next_token, past_key_values
         if profiled:
-            _pd._current_layer = 0
+            _current_layer = 0
         cache_position = torch.tensor([prefill_len + step_idx], device=device)
         torch.cuda.synchronize(device)
         t0 = time.perf_counter() if profiled else None
@@ -1736,7 +2399,7 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
                 use_cache=True, cache_position=cache_position,
             )
         if profiled:
-            _pd._flush_events()
+            _flush_events()
             total_times.append((time.perf_counter() - t0) * 1000)
         past_key_values = out.past_key_values
         next_token = out.logits[:, -1:].argmax(dim=-1)
@@ -1777,7 +2440,7 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
 
     with sdpa_ctx:
         print(f"  Warming up ({args.warmup_steps} steps)...")
-        _pd._enabled = False
+        _enabled = False
         for step in range(args.warmup_steps):
             _do_one_decode_step(step, profiled=False)
         torch.cuda.synchronize(device)
@@ -1789,23 +2452,23 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
                     m._verify_diffs = []
 
         print(f"  Profiling ({args.num_decode_steps} steps)...")
-        _pd._step_timings.clear()
-        _pd._cpu_timings.clear()
-        _pd._pending_events.clear()
-        _pd._enabled = True
+        _step_timings.clear()
+        _cpu_timings.clear()
+        _pending_events.clear()
+        _enabled = True
         for step in range(args.num_decode_steps):
             _do_one_decode_step(args.warmup_steps + step, profiled=True)
-        _pd._enabled = False
+        _enabled = False
     # B1: stash per-substep eager averages BEFORE the cudagraph block so the
     # graph-mode bucketer can compute eager_ms / graph_ms ratios as a disambig
-    # sanity check. Reads from `_pd._step_timings` populated by the eager
-    # forward's `_pd._flush_events()` call (deque of per-step ms, one entry
+    # sanity check. Reads from `_step_timings` populated by the eager
+    # forward's `_flush_events()` call (deque of per-step ms, one entry
     # per substep per step). MUST live here in `_run_one_mode` (not in
     # `main()`); placing it near `print_profile` would be too late — bucketer
     # below reads it during this same `_run_one_mode` invocation.
-    _pd._last_eager_per_token = {
+    _last_eager_per_token = {
         name: sum(t) / len(t)
-        for name, t in _pd._step_timings.items() if t
+        for name, t in _step_timings.items() if t
     }
     torch.cuda.synchronize(device)
 
@@ -1954,7 +2617,7 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
             try:
                 if args.cudagraph_breakdown:
                     # discard priming-loop events; only capture-time events should be read
-                    _pd._pending_events.clear()
+                    _pending_events.clear()
 
                 # Seal-capture: force n_new=1 on every DCT layer just before
                 # capture so the captured graph contains the slow-path
@@ -2240,7 +2903,7 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
                             }
                     else:  # method == "events" — Option A path (dormant on this box)
                         substep_count = {}
-                        for name, ev_s, ev_e in _pd._pending_events:
+                        for name, ev_s, ev_e in _pending_events:
                             substep_total[name] = (
                                 substep_total.get(name, 0.0)
                                 + ev_s.elapsed_time(ev_e)
@@ -2283,9 +2946,7 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
                                 all_kernel_sum_ms / num_replays
                                 if all_kernel_sum_ms is not None else None
                             ),
-                            eager_per_token=getattr(
-                                _pd, "_last_eager_per_token", None
-                            ),
+                            eager_per_token=_last_eager_per_token,
                             seal_microbench=seal_mb,
                             seal_capture_active=_capture_with_seal,
                             page_size=args.page_size,
@@ -2309,7 +2970,7 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
 
     return (
         avg_total, tok_s,
-        dict(_pd._step_timings), dict(_pd._cpu_timings),
+        dict(_step_timings), dict(_cpu_timings),
         verify_ok, graph_stats,
     )
 
@@ -2319,6 +2980,10 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
 # ---------------------------------------------------------------------------
 def main():
     args = parse_args()
+
+    if getattr(args, 'benchmark_topk', False):
+        run_benchmark_topk()
+        return
 
     original_forward = get_original_forward(args.model)
     model, tokenizer = load_model_and_tokenizer(args.model)
