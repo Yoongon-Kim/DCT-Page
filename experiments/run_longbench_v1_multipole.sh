@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# Run from repo root regardless of where this script is invoked: it now
+# lives in experiments/, but its relative paths (eval_*.py, baselines/,
+# results/) are repo-root-relative.
+cd "$(dirname "$0")/.." || exit 1
 # LongBench v1 Evaluation — Multipole Attention
 # Sweeps percent_clusters and percentiles values by rewriting multipole_attn/config.py.
 # Runs the same tasks as run_longbench_v1.sh.

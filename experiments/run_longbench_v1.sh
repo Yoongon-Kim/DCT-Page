@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# Run from repo root regardless of where this script is invoked: it now
+# lives in experiments/, but its relative paths (eval_*.py, baselines/,
+# results/) are repo-root-relative.
+cd "$(dirname "$0")/.." || exit 1
 # LongBench v1 Evaluation — Baseline vs DCT Page Attention
 # Runs baseline (full attention) then sweeps top_k values.
 # Results are saved per-task under results/longbench_v1/<run_name>/.

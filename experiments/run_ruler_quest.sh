@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# Run from repo root regardless of where this script is invoked: it now
+# lives in experiments/, but its relative paths (eval_*.py, baselines/,
+# results/) are repo-root-relative.
+cd "$(dirname "$0")/.." || exit 1
 # RULER Evaluation — Quest-style scoring (page_attention + score_use_quest_minmax)
 # Runs LLaMA (GPU 2) and Qwen3 (GPU 3) in parallel for 32K and 64K contexts.
 # page_size=32, page_budget=64 (top_k=64)

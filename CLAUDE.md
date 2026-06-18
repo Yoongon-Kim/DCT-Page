@@ -110,20 +110,20 @@ Model support: **Llama 3.x** (`replace_llama_attn`) and **Qwen3** (`replace_qwen
 - `benchmark/data/` — prepared `longbench_v1_data/` and `ruler_data/`
 - `benchmark/eval_ruler/` — RULER infrastructure (`data/prepare.py`, `eval/evaluate.py`, `synthetic.yaml`, `config_tasks.sh`). `pred/predict_dctpage.py` is a prediction-only path that mirrors the official RULER pipeline.
 
-### Run scripts (`run_*.sh` at repo root)
+### Run scripts (`experiments/run_*.sh`)
 
 Sweep scripts — each invokes `eval_ruler.py` / `eval_longbench_v{1,2}.py` with a parameter grid and `--skip_existing` so interrupted runs resume cleanly.
 
 | Script | Calls | Notes |
 |---|---|---|
-| `run_ruler.sh` | RULER DCT-Page | Default `Qwen/Qwen3-8B`, sweeps `(page_size,top_k)` × `compress_ratio` × `unselected_mode` × `compressed_token_rope` × `weight_compressed_by_population`. |
-| `run_ruler_llama.sh` | RULER DCT-Page | Llama variant of the above. |
-| `run_ruler_seer.sh` | RULER SeerAttention-R | Sweeps `token_budget`. |
-| `run_ruler_multipole.sh` | RULER Multipole | Sweeps `percent_clusters`, `percentiles`, `use_replacement`. |
-| `run_ruler_duo.sh` | RULER DuoAttention | Sweeps `sparsity`; requires `duo_env`. Rewrites `baselines/duo_attn/config.py` in place. |
-| `run_ruler_quest.sh` | RULER Quest-minmax | Runs `page_attention` with `--score_use_quest_minmax`; launches LLaMA on GPU 2 and Qwen3 on GPU 3 in parallel. |
-| `run_longbench_v1.sh`, `run_longbench_v1_llama.sh`, `run_longbench_v1_seer.sh`, `run_longbench_v1_multipole.sh`, `run_longbench_v1_duo.sh` | LongBench v1 per method | — |
-| `run_longbench_v2.sh`, `run_longbench_v2_llama.sh`, `run_longbench_v2_seer.sh`, `run_longbench_v2_multipole.sh`, `run_longbench_v2_duo.sh` | LongBench v2 per method | — |
+| `experiments/run_ruler.sh` | RULER DCT-Page | Default `Qwen/Qwen3-8B`, sweeps `(page_size,top_k)` × `compress_ratio` × `unselected_mode` × `compressed_token_rope` × `weight_compressed_by_population`. |
+| `experiments/run_ruler_llama.sh` | RULER DCT-Page | Llama variant of the above. |
+| `experiments/run_ruler_seer.sh` | RULER SeerAttention-R | Sweeps `token_budget`. |
+| `experiments/run_ruler_multipole.sh` | RULER Multipole | Sweeps `percent_clusters`, `percentiles`, `use_replacement`. |
+| `experiments/run_ruler_duo.sh` | RULER DuoAttention | Sweeps `sparsity`; requires `duo_env`. Rewrites `baselines/duo_attn/config.py` in place. |
+| `experiments/run_ruler_quest.sh` | RULER Quest-minmax | Runs `page_attention` with `--score_use_quest_minmax`; launches LLaMA on GPU 2 and Qwen3 on GPU 3 in parallel. |
+| `experiments/run_longbench_v1.sh`, `experiments/run_longbench_v1_llama.sh`, `experiments/run_longbench_v1_seer.sh`, `experiments/run_longbench_v1_multipole.sh`, `experiments/run_longbench_v1_duo.sh` | LongBench v1 per method | — |
+| `experiments/run_longbench_v2.sh`, `experiments/run_longbench_v2_llama.sh`, `experiments/run_longbench_v2_seer.sh`, `experiments/run_longbench_v2_multipole.sh`, `experiments/run_longbench_v2_duo.sh` | LongBench v2 per method | — |
 
 ## Commands
 
@@ -152,14 +152,14 @@ python eval_ruler.py --mode baseline --base_model Qwen/Qwen3-8B \
   --seq_lengths 32768 --output_dir results/ruler --run_name baseline
 
 # Baseline sweep
-bash run_ruler.sh            # Qwen3-8B default
-bash run_ruler_llama.sh      # Llama-3.1-8B-Instruct
+bash experiments/run_ruler.sh            # Qwen3-8B default
+bash experiments/run_ruler_llama.sh      # Llama-3.1-8B-Instruct
 
 # Other methods (may need a dedicated env; see baselines/<name>/config.py)
-bash run_ruler_seer.sh
-bash run_ruler_multipole.sh
-bash run_ruler_duo.sh         # activates duo_env
-bash run_ruler_quest.sh       # Quest-minmax, parallel on two GPUs
+bash experiments/run_ruler_seer.sh
+bash experiments/run_ruler_multipole.sh
+bash experiments/run_ruler_duo.sh         # activates duo_env
+bash experiments/run_ruler_quest.sh       # Quest-minmax, parallel on two GPUs
 ```
 
 ### LongBench

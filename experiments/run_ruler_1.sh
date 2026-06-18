@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# Run from repo root regardless of where this script is invoked: it now
+# lives in experiments/, but its relative paths (eval_*.py, baselines/,
+# results/) are repo-root-relative.
+cd "$(dirname "$0")/.." || exit 1
 # RULER Evaluation — DCT Page Attention (DCT-lowpass-IDCT scoring proxy)
 # Sweeps (page_size, top_k) pairs with compress_ratio 1/32 and 4/32.
 set -e

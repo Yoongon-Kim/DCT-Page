@@ -1,39 +1,21 @@
 #!/bin/bash
-# RULER Evaluation — Multipole Attention
+
+# Run from repo root regardless of where this script is invoked: it now
+# lives in experiments/, but its relative paths (eval_*.py, baselines/,
+# results/) are repo-root-relative.
+cd "$(dirname "$0")/.." || exit 1
+# LongBench v2 Evaluation — Multipole Attention
 # Sweeps percent_clusters and percentiles values by rewriting multipole_attn/config.py.
 set -e
 
-# ---- Configuration (env defaults, overridable via CLI flags below) ----
+# ---- Configuration ----
 BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
-NUM_SAMPLES="${NUM_SAMPLES:-25}"
-PREPARE_FLAG=""
-
-# ---- Parse CLI flags ----
-usage() {
-    echo "Usage: $0 [--base_model MODEL] [--num_samples N] [--prepare]"
-}
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --base_model)   BASE_MODEL="$2"; shift 2 ;;
-        --num_samples)  NUM_SAMPLES="$2"; shift 2 ;;
-        --prepare)      PREPARE_FLAG="--prepare"; shift ;;
-        -h|--help)      usage; exit 0 ;;
-        *)              echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
-    esac
-done
-
-# Derive a short model tag from BASE_MODEL (used for output dir + run name).
-# Only Llama 3.x and Qwen3 are supported — eval_ruler.py enforces this.
-case "$(echo "$BASE_MODEL" | tr '[:upper:]' '[:lower:]')" in
-    *llama*)  MODEL_TAG="llama" ;;
-    *qwen3*)  MODEL_TAG="qwen" ;;
-    *) echo "Unsupported BASE_MODEL: $BASE_MODEL (only Llama 3.x / Qwen3)"; exit 1 ;;
-esac
-
-OUTPUT_DIR="${OUTPUT_DIR:-results/ruler}"
-
-# Sequence lengths to evaluate
-SEQ_LENGTHS="${SEQ_LENGTHS:-32768}" #"${SEQ_LENGTHS:-4096 8192 16384 32768 65536 131072}"
+MODEL_FAMILY="${MODEL_FAMILY:-llama3}"
+MAX_INPUT_LEN="${MAX_INPUT_LEN:-127500}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
+NUM_SAMPLES="${NUM_SAMPLES:--1}"
+PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-2048}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/longbench_v2}"
 
 # Fixed multipole parameters
 USE_CENTROIDS=True
@@ -53,7 +35,7 @@ write_config() {
 Multipole Attention evaluation configuration.
 
 Edit this file to change model, clustering parameters, and attention behavior
-before running eval_ruler.py with --mode multipole_attention.
+before running eval_longbench_v1.py or eval_longbench_v2.py with --mode multipole_attention.
 
 Key parameters:
   - percent_clusters_lst: percentage of keys to retain per hierarchy level
@@ -89,9 +71,9 @@ PYEOF
 
 # ---- Sweep percent_clusters x percentiles x use_replacement ----
 for PCT_CLUSTERS in 6.25; do
-    for PERCENTILES in 3131 4091; do
-        for REPL in False; do
-            RUN_NAME="${MODEL_TAG}_multipole_pct${PCT_CLUSTERS}_ptl${PERCENTILES}_repl${REPL}"
+    for PERCENTILES in 1156 2180; do
+        for REPL in True False; do
+            RUN_NAME="${MODEL_FAMILY}_multipole_pct${PCT_CLUSTERS}_ptl${PERCENTILES}_repl${REPL}"
 
             echo ""
             echo "===================================================================="
@@ -100,20 +82,22 @@ for PCT_CLUSTERS in 6.25; do
 
             write_config "$PCT_CLUSTERS" "$PERCENTILES" "$REPL" "$CLUSTER_INTERVAL"
 
-            python eval_ruler.py \
+            python eval_longbench_v2.py \
                 --mode multipole_attention \
                 --base_model "$BASE_MODEL" \
-                --skip_existing \
-                $PREPARE_FLAG \
-                --seq_lengths $SEQ_LENGTHS \
+                --max_input_len "$MAX_INPUT_LEN" \
+                --max_new_tokens "$MAX_NEW_TOKENS" \
                 --num_samples "$NUM_SAMPLES" \
+                --prefill_chunk_size "$PREFILL_CHUNK_SIZE" \
                 --output_dir "$OUTPUT_DIR" \
                 --run_name "$RUN_NAME"
         done
     done
 done
 
+# ---- Summarize all results ----
 echo ""
 echo "============================================================"
-echo "ALL RUNS COMPLETE. Results in: $OUTPUT_DIR/"
+echo "SUMMARIZING ALL RESULTS"
 echo "============================================================"
+python3 summarize_longbench_v2.py "$OUTPUT_DIR"

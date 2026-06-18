@@ -1,27 +1,23 @@
 #!/bin/bash
-# LongBench v1 Evaluation — SeerAttention-R
+
+# Run from repo root regardless of where this script is invoked: it now
+# lives in experiments/, but its relative paths (eval_*.py, baselines/,
+# results/) are repo-root-relative.
+cd "$(dirname "$0")/.." || exit 1
+# LongBench v2 Evaluation — SeerAttention-R
 # Sweeps token_budget values by rewriting seer_attn/config.py.
-# Runs the same tasks as run_longbench_v1.sh.
 set -e
 
 # ---- Configuration ----
 BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-8B}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-127500}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
-OUTPUT_DIR="${OUTPUT_DIR:-results/longbench_v1}"
-
-# Same tasks as run_longbench_v1.sh
-TASKS="${TASKS:-narrativeqa qasper gov_report 2wikimqa multifieldqa_en triviaqa}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/longbench_v2}"
 
 # Fixed seer parameters
 SEER_MODEL="${SEER_MODEL:-SeerAttention/SeerAttention-Decode-Qwen3-8B-AttnGates}"
 START_LAYER=0
-
-# Build task args
-TASK_ARGS=""
-if [ -n "$TASKS" ]; then
-    TASK_ARGS="--tasks $TASKS"
-fi
 
 CONFIG_FILE="seer_attn/config.py"
 
@@ -68,7 +64,7 @@ SEER_ATTN_CONFIG = {
 PYEOF
 }
 
-# ---- Sweep sparsity_method x token_budget/threshold ----
+# ---- Sweep token_budget ----
 for TOKEN_BUDGET in 1156 2180; do
     RUN_NAME="seer_budget${TOKEN_BUDGET}"
 
@@ -79,15 +75,14 @@ for TOKEN_BUDGET in 1156 2180; do
 
     write_config "$SEER_MODEL" "token_budget" "$TOKEN_BUDGET" "0.0" "$START_LAYER"
 
-    python eval_longbench_v1.py \
+    python eval_longbench_v2.py \
         --mode seer_attention \
         --base_model "$BASE_MODEL" \
         --max_input_len "$MAX_INPUT_LEN" \
+        --max_new_tokens "$MAX_NEW_TOKENS" \
         --num_samples "$NUM_SAMPLES" \
         --output_dir "$OUTPUT_DIR" \
-        --run_name "$RUN_NAME" \
-        --weight_compressed_by_population \
-        $TASK_ARGS
+        --run_name "$RUN_NAME"
 done
 
 # ---- Summarize all results ----
@@ -95,4 +90,4 @@ echo ""
 echo "============================================================"
 echo "SUMMARIZING ALL RESULTS"
 echo "============================================================"
-python3 summarize_longbench_v1.py "$OUTPUT_DIR"
+python3 summarize_longbench_v2.py "$OUTPUT_DIR"

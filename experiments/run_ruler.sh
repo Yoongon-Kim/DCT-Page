@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# Run from repo root regardless of where this script is invoked: it now
+# lives in experiments/, but its relative paths (eval_*.py, baselines/,
+# results/) are repo-root-relative.
+cd "$(dirname "$0")/.." || exit 1
 # RULER Evaluation — DCT Page Attention (DCT-lowpass-IDCT scoring proxy)
 # Sweeps (page_size, top_k) pairs with compress_ratio 1/32 and 4/32.
 set -e
@@ -50,7 +55,7 @@ GROUP_AGG_METHOD="max"
 MODE="drop"
 COMP_TOKEN_ROPE="mixed"
 # ---- Sweep (page_size, top_k) x (compress_ratio, comp_kv_quant) ----
-for PS_TK in "16,64" "32,32"; do
+for PS_TK in "16,128" "32,64"; do
     IFS=',' read -r PAGE_SIZE TOP_K <<< "$PS_TK"
     for CR_QUANT in "0.0625,none" "0.125,fp8_e4m3" "0.125,fp8_e5m2" "0.25,int4"; do
         IFS=',' read -r COMPRESS_RATIO COMP_KV_QUANT <<< "$CR_QUANT"

@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# Run from repo root regardless of where this script is invoked: it now
+# lives in experiments/, but its relative paths (eval_*.py, baselines/,
+# results/) are repo-root-relative.
+cd "$(dirname "$0")/.." || exit 1
 # RULER Evaluation — InfLLM (accuracy sweep)
 # Varies the 5 accuracy-relevant knobs entirely through CLI flags on
 # eval_ruler.py: --inf_llm_topk, --inf_llm_block_size, --inf_llm_n_local,

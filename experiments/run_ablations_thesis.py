@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parent.parent  # experiments/ -> repo root
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "results/ruler" / "ablations"
 
 BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"

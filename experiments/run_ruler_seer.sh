@@ -1,14 +1,44 @@
 #!/bin/bash
-# LongBench v2 Evaluation — SeerAttention-R
+
+# Run from repo root regardless of where this script is invoked: it now
+# lives in experiments/, but its relative paths (eval_*.py, baselines/,
+# results/) are repo-root-relative.
+cd "$(dirname "$0")/.." || exit 1
+# RULER Evaluation — SeerAttention-R
 # Sweeps token_budget values by rewriting seer_attn/config.py.
 set -e
 
-# ---- Configuration ----
+# ---- Configuration (env defaults, overridable via CLI flags below) ----
 BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-8B}"
-MAX_INPUT_LEN="${MAX_INPUT_LEN:-127500}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
-NUM_SAMPLES="${NUM_SAMPLES:--1}"
-OUTPUT_DIR="${OUTPUT_DIR:-results/longbench_v2}"
+NUM_SAMPLES="${NUM_SAMPLES:-25}"
+PREPARE_FLAG=""
+
+# ---- Parse CLI flags ----
+usage() {
+    echo "Usage: $0 [--base_model MODEL] [--num_samples N] [--prepare]"
+}
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --base_model)   BASE_MODEL="$2"; shift 2 ;;
+        --num_samples)  NUM_SAMPLES="$2"; shift 2 ;;
+        --prepare)      PREPARE_FLAG="--prepare"; shift ;;
+        -h|--help)      usage; exit 0 ;;
+        *)              echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
+
+# Derive a short model tag from BASE_MODEL (used for output dir + run name).
+# Only Llama 3.x and Qwen3 are supported — eval_ruler.py enforces this.
+case "$(echo "$BASE_MODEL" | tr '[:upper:]' '[:lower:]')" in
+    *llama*)  MODEL_TAG="llama" ;;
+    *qwen3*)  MODEL_TAG="qwen" ;;
+    *) echo "Unsupported BASE_MODEL: $BASE_MODEL (only Llama 3.x / Qwen3)"; exit 1 ;;
+esac
+
+OUTPUT_DIR="${OUTPUT_DIR:-results/ruler}"
+
+# Sequence lengths to evaluate
+SEQ_LENGTHS="${SEQ_LENGTHS:-32768}" # "${SEQ_LENGTHS:-4096 8192 16384 32768 65536 131072}"
 
 # Fixed seer parameters
 SEER_MODEL="${SEER_MODEL:-SeerAttention/SeerAttention-Decode-Qwen3-8B-AttnGates}"
@@ -27,7 +57,7 @@ write_config() {
 SeerAttention-R evaluation configuration.
 
 Edit this file to change model checkpoint, sparsity method, and budget/threshold
-before running eval_longbench_v1.py or eval_longbench_v2.py with --mode seer_attention.
+before running eval_ruler.py with --mode seer_attention.
 
 Available HF checkpoints (SeerAttention-R, decode sparse only):
   - SeerAttention/SeerAttention-Decode-Qwen3-4B-AttnGates
@@ -61,7 +91,7 @@ PYEOF
 
 # ---- Sweep token_budget ----
 for TOKEN_BUDGET in 1156 2180; do
-    RUN_NAME="seer_budget${TOKEN_BUDGET}"
+    RUN_NAME="${MODEL_TAG}_seer_budget${TOKEN_BUDGET}"
 
     echo ""
     echo "===================================================================="
@@ -70,19 +100,17 @@ for TOKEN_BUDGET in 1156 2180; do
 
     write_config "$SEER_MODEL" "token_budget" "$TOKEN_BUDGET" "0.0" "$START_LAYER"
 
-    python eval_longbench_v2.py \
+    python eval_ruler.py \
         --mode seer_attention \
         --base_model "$BASE_MODEL" \
-        --max_input_len "$MAX_INPUT_LEN" \
-        --max_new_tokens "$MAX_NEW_TOKENS" \
+        $PREPARE_FLAG \
+        --seq_lengths $SEQ_LENGTHS \
         --num_samples "$NUM_SAMPLES" \
         --output_dir "$OUTPUT_DIR" \
         --run_name "$RUN_NAME"
 done
 
-# ---- Summarize all results ----
 echo ""
 echo "============================================================"
-echo "SUMMARIZING ALL RESULTS"
+echo "ALL RUNS COMPLETE. Results in: $OUTPUT_DIR/"
 echo "============================================================"
-python3 summarize_longbench_v2.py "$OUTPUT_DIR"

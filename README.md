@@ -82,13 +82,13 @@ Each baseline folder has a `config.py` with defaults (pattern paths, model names
 - `benchmark/eval_ruler/` — RULER pipeline (`data/prepare.py`, `eval/evaluate.py`, `synthetic.yaml`, `config_tasks.sh`)
   - `pred/predict_dctpage.py` — prediction-only DCT-Page path compatible with the official RULER evaluator.
 
-### Run scripts (`run_*.sh` at the repo root)
+### Run scripts (in `experiments/`)
 
 Each sweep script calls the corresponding `eval_*.py` with a parameter grid. All use `--skip_existing` so interrupted runs resume cleanly.
 
-- RULER: `run_ruler.sh` (Qwen3), `run_ruler_llama.sh`, `run_ruler_seer.sh`, `run_ruler_multipole.sh`, `run_ruler_duo.sh`, `run_ruler_quest.sh`
-- LongBench v1: `run_longbench_v1.sh`, `run_longbench_v1_llama.sh`, `run_longbench_v1_seer.sh`, `run_longbench_v1_multipole.sh`, `run_longbench_v1_duo.sh`
-- LongBench v2: `run_longbench_v2.sh`, `run_longbench_v2_llama.sh`, `run_longbench_v2_seer.sh`, `run_longbench_v2_multipole.sh`, `run_longbench_v2_duo.sh`
+- RULER: `experiments/run_ruler.sh` (Qwen3), `experiments/run_ruler_llama.sh`, `experiments/run_ruler_seer.sh`, `experiments/run_ruler_multipole.sh`, `experiments/run_ruler_duo.sh`, `experiments/run_ruler_quest.sh`
+- LongBench v1: `experiments/run_longbench_v1.sh`, `experiments/run_longbench_v1_llama.sh`, `experiments/run_longbench_v1_seer.sh`, `experiments/run_longbench_v1_multipole.sh`, `experiments/run_longbench_v1_duo.sh`
+- LongBench v2: `experiments/run_longbench_v2.sh`, `experiments/run_longbench_v2_llama.sh`, `experiments/run_longbench_v2_seer.sh`, `experiments/run_longbench_v2_multipole.sh`, `experiments/run_longbench_v2_duo.sh`
 
 ## Setup
 
@@ -108,7 +108,7 @@ Baseline-specific setup:
 
 Benchmark data lives under `benchmark/data/` and is **gitignored** (~136 MB), so a fresh clone starts without it. Both sources regenerate on demand — no manual download step:
 
-- **RULER** — synthetic. Pass `--prepare` to an `eval_ruler.py` run (or any `run_ruler*.sh`) to generate and cache it under `benchmark/data/ruler_data/` via [benchmark/eval_ruler/data/prepare.py](benchmark/eval_ruler/data/prepare.py).
+- **RULER** — synthetic. Pass `--prepare` to an `eval_ruler.py` run (or any `experiments/run_ruler*.sh`) to generate and cache it under `benchmark/data/ruler_data/` via [benchmark/eval_ruler/data/prepare.py](benchmark/eval_ruler/data/prepare.py).
 - **LongBench v1** — `eval_longbench_v1.py` auto-downloads each task from the `THUDM/LongBench` Hugging Face dataset on first run when no local `benchmark/data/longbench_v1_data/<task>.jsonl` exists (needs network + HF access).
 
 ## Basic usage (DCT-Page)
@@ -232,12 +232,12 @@ python eval_ruler.py --mode inf_llm --base_model meta-llama/Llama-3.1-8B-Instruc
 ### Sweep scripts
 
 ```bash
-BASE_MODEL=Qwen/Qwen3-8B           bash run_ruler.sh
-BASE_MODEL=meta-llama/Llama-3.1-8B-Instruct bash run_ruler_llama.sh
-bash run_ruler_seer.sh
-bash run_ruler_multipole.sh
-bash run_ruler_duo.sh              # activates duo_env
-bash run_ruler_quest.sh            # launches LLaMA on GPU 2, Qwen3 on GPU 3
+BASE_MODEL=Qwen/Qwen3-8B           bash experiments/run_ruler.sh
+BASE_MODEL=meta-llama/Llama-3.1-8B-Instruct bash experiments/run_ruler_llama.sh
+bash experiments/run_ruler_seer.sh
+bash experiments/run_ruler_multipole.sh
+bash experiments/run_ruler_duo.sh              # activates duo_env
+bash experiments/run_ruler_quest.sh            # launches LLaMA on GPU 2, Qwen3 on GPU 3
 ```
 
 ### Prediction-only path
