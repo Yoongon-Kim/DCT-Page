@@ -375,28 +375,6 @@ def _compute_rope_cos_sin(positions, config, device, dtype):
     return cos, sin
 
 
-def _apply_decode_query_rope(attn_module, query_states, cos, sin, cfg):
-    """Apply RoPE to a single-token decode query, using Triton when safe."""
-    if (
-        cfg.use_triton
-        and query_states.shape[0] == 1
-        and query_states.shape[2] == 1
-        and cos.ndim == 3
-        and sin.ndim == 3
-        and cos.shape[0] == 1
-        and sin.shape[0] == 1
-        and cos.shape[1] == 1
-        and sin.shape[1] == 1
-    ):
-        q_rope_buf = getattr(attn_module, "_q_rope_buf", None)
-        if q_rope_buf is None or q_rope_buf.shape != query_states.shape:
-            attn_module._q_rope_buf = torch.empty_like(query_states)
-            q_rope_buf = attn_module._q_rope_buf
-        return apply_rope_q_direct(query_states, cos[0, 0].contiguous(), sin[0, 0].contiguous(), q_rope_buf)
-    query_states_rope, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
-    return query_states_rope
-
-
 def _get_or_build_original_position_rope_tables(attn_module, required_len, config, device, dtype):
     """Cache 2D RoPE tables for contiguous original token positions [0, required_len)."""
     cached_len = getattr(attn_module, "_orig_pos_rope_cache_len", 0)
@@ -422,25 +400,6 @@ def _get_or_build_original_position_rope_tables(attn_module, required_len, confi
         attn_module._orig_pos_rope_cos_2d[:required_len],
         attn_module._orig_pos_rope_sin_2d[:required_len],
     )
-
-
-def _compute_rope_cos_sin_for_position_ids(position_ids, config, device, dtype):
-    """Compute cos/sin for arbitrary per-head position ids.
-
-    Args:
-        position_ids: integer tensor shaped [..., seq_len]
-
-    Returns:
-        cos, sin: tensors shaped [..., seq_len, head_dim]
-    """
-    inv_freq, attention_scaling = _get_rope_inv_freq_and_scaling(config, device)
-    freqs = position_ids.to(device=device, dtype=torch.float32).unsqueeze(-1) * inv_freq.view(
-        *([1] * position_ids.dim()), -1
-    )
-    emb = torch.cat((freqs, freqs), dim=-1)
-    cos = (emb.cos() * attention_scaling).to(dtype)
-    sin = (emb.sin() * attention_scaling).to(dtype)
-    return cos, sin
 
 
 # ---------------------------------------------------------------------------
@@ -1016,71 +975,6 @@ def _compute_debug_oracle_page_scores(attn_module, query_states, paged_k, cfg, c
         cfg.group_agg_method,
         attn_module.num_key_value_groups,
     )
-
-
-def _apply_original_position_rope_to_final_k(
-    attn_module,
-    final_k,
-    selected_indices,
-    num_pages,
-    actual_recent,
-    cfg,
-    model_config,
-):
-    """Apply RoPE to assembled drop-mode KV using the tokens' original positions."""
-    bsz, num_kv_heads, _, head_dim = final_k.shape
-    actual_top_k = selected_indices.shape[2]
-    selected_indices_long = selected_indices.to(torch.long)
-    sink_tokens = cfg.num_sink_pages * cfg.page_size
-    cos_table, sin_table = _get_or_build_original_position_rope_tables(
-        attn_module,
-        num_pages * cfg.page_size + sink_tokens + actual_recent,
-        model_config,
-        final_k.device,
-        final_k.dtype,
-    )
-
-    cos_parts = []
-    sin_parts = []
-
-    if sink_tokens > 0:
-        sink_cos = cos_table[:sink_tokens].view(1, 1, sink_tokens, head_dim)
-        sink_sin = sin_table[:sink_tokens].view(1, 1, sink_tokens, head_dim)
-        cos_parts.append(sink_cos.expand(bsz, num_kv_heads, -1, -1))
-        sin_parts.append(sink_sin.expand(bsz, num_kv_heads, -1, -1))
-
-    middle_start = sink_tokens
-    middle_end = middle_start + num_pages * cfg.page_size
-    if actual_top_k > 0:
-        page_cos_table = cos_table[middle_start:middle_end].view(num_pages, cfg.page_size, head_dim)
-        page_sin_table = sin_table[middle_start:middle_end].view(num_pages, cfg.page_size, head_dim)
-        selected_cos = page_cos_table[selected_indices_long].reshape(
-            bsz, num_kv_heads, actual_top_k * cfg.page_size, head_dim
-        )
-        selected_sin = page_sin_table[selected_indices_long].reshape(
-            bsz, num_kv_heads, actual_top_k * cfg.page_size, head_dim
-        )
-        cos_parts.append(selected_cos)
-        sin_parts.append(selected_sin)
-
-    if actual_recent > 0:
-        recent_start = middle_end
-        recent_cos = cos_table[recent_start:recent_start + actual_recent].view(
-            1, 1, actual_recent, head_dim
-        )
-        recent_sin = sin_table[recent_start:recent_start + actual_recent].view(
-            1, 1, actual_recent, head_dim
-        )
-        cos_parts.append(recent_cos.expand(bsz, num_kv_heads, -1, -1))
-        sin_parts.append(recent_sin.expand(bsz, num_kv_heads, -1, -1))
-
-    if len(cos_parts) == 1:
-        cos = cos_parts[0]
-        sin = sin_parts[0]
-    else:
-        cos = torch.cat(cos_parts, dim=2)
-        sin = torch.cat(sin_parts, dim=2)
-    return _apply_rope(final_k, cos, sin)
 
 
 
