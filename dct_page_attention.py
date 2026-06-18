@@ -1669,7 +1669,7 @@ def dct_page_attention_forward_upstream_flashinfer(
 ) -> tuple:
     """Upstream-FlashInfer-backed decode forward. Drop-mode only.
 
-    Mirrors `profile_decode_upstream_flash_infer.profiled_dct_upstream_flashinfer_forward`
+    Mirrors `profile_decode.profiled_dct_upstream_flashinfer_forward`
     minus the profiler instrumentation, with the additional Quest-minmax
     branch from the fork-FI variant. Lazy-builds the upstream-FI cache on
     the first decode step (layer 0) so eval scripts keep using
@@ -1967,7 +1967,7 @@ def _init_upstream_fi_build_kwargs(model):
 def _set_upstream_fi_max_decode_steps(model, max_decode_steps):
     """Set per-instance `_upstream_fi_build_kwargs['max_decode_steps']` on
     every attention module. The +16 padding mirrors the profile driver
-    (profile_decode_upstream_flash_infer.py:425) — covers EOS-token-dodging
+    (profile_decode.py:425) — covers EOS-token-dodging
     overshoots without crashing on `cache overflow`.
     """
     padded = int(max_decode_steps) + 16

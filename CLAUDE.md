@@ -102,7 +102,7 @@ Model support: **Llama 3.x** (`replace_llama_attn`) and **Qwen3** (`replace_qwen
 | File | Purpose |
 |---|---|
 | `speed_dummy.py` | Decode throughput benchmark with dummy (random) token inputs. `--mode baseline\|dct\|multipole` (one per run). |
-| `profile_decode_upstream_flash_infer.py` | Per-stage decode-path timing with chained CUDA events, across four modes: `baseline_upstream_flashinfer` / `baseline_sdpa` (full-KV) and `dct_sdpa` / `dct_upstream_flashinfer` (DCT page-selected). `--mode all` runs all four with a comparison table; `--sdpa_backend` pins SDPA (FA2 etc.) for the SDPA modes; `--cudagraph` adds a graph-replay ceiling; `--benchmark_topk` runs a standalone topk micro-benchmark. (Absorbed the former standalone `profile_decode.py`.) |
+| `profile_decode.py` | Per-stage decode-path timing with chained CUDA events, across four modes: `baseline_upstream_flashinfer` / `baseline_sdpa` (full-KV) and `dct_sdpa` / `dct_upstream_flashinfer` (DCT page-selected). `--mode all` runs all four with a comparison table; `--sdpa_backend` pins SDPA (FA2 etc.) for the SDPA modes; `--cudagraph` adds a graph-replay ceiling; `--benchmark_topk` runs a standalone topk micro-benchmark. Single self-contained file covering both SDPA and FlashInfer paths. |
 | `compare_speed_dummy.sh` | Wrapper that runs baseline + DCT configurations and prints a tok/s comparison table. |
 
 ### `benchmark/`
@@ -200,7 +200,7 @@ python speed/speed_dummy.py --mode dct \
   --page_size 32 --top_k 64 --compress_ratio 0.03125 \
   --unselected_mode drop
 
-python speed/profile_decode_upstream_flash_infer.py --context_length 32768 \
+python speed/profile_decode.py --context_length 32768 \
   --model meta-llama/Llama-3.1-8B-Instruct \
   --page_size 32 --top_k 64 --mode all --sdpa_backend flash
 ```

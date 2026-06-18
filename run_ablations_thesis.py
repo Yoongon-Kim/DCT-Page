@@ -168,7 +168,7 @@ def eval_ruler_cmd(cfg: Cfg, output_dir: Path, num_samples: int, prepare: bool) 
 
 def throughput_cmd(P: int, B: int, num_decode_steps: int, warmup_steps: int) -> list[str]:
     return [
-        sys.executable, str(REPO_ROOT / "speed" / "profile_decode_upstream_flash_infer.py"),
+        sys.executable, str(REPO_ROOT / "speed" / "profile_decode.py"),
         "--model", BASE_MODEL,
         "--context_length", str(SEQ_LEN),
         "--num_decode_steps", str(num_decode_steps),

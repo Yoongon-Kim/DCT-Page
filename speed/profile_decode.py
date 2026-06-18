@@ -20,7 +20,7 @@ Modes (via `--mode`, default `dct_upstream_flashinfer`):
   - all                          : run all four back-to-back with comparison.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=1 python speed/profile_decode_upstream_flash_infer.py \\
+    CUDA_VISIBLE_DEVICES=1 python speed/profile_decode.py \\
         --context_length 32768 --page_size 32 --top_k 64 \\
         --num_sink_pages 1 --num_recent_pages 5 \\
         --num_decode_steps 128 --warmup_steps 8 \\
@@ -2706,7 +2706,7 @@ def _run_one_mode(model, tokenizer, args, mode, original_forward):
                 if args.cudagraph_breakdown:
                     # Layer windowing — required reading before touching the disambig logic.
                     #
-                    # The eager forward at speed/profile_decode_upstream_flash_infer.py:204-228
+                    # The eager forward at speed/profile_decode.py:204-228
                     # emits the following GPU event stream PER LAYER (linear, no branches at
                     # steady state for unfused-qkv Llama-3.1-8B):
                     #
