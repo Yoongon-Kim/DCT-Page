@@ -24,12 +24,12 @@ The repo also hosts side-by-side **baselines** (SeerAttention-R, Multipole, Ques
 | File | Role |
 |---|---|
 | `config.py` | `DCTPageConfig` dataclass with all hyperparameters |
-| `dct_page_attention.py` | Main attention forward, compression, RoPE, monkey-patch entry points (~1600+ lines) |
+| `dct_page_attention.py` | Main attention forward, compression, RoPE, monkey-patch entry points (~2150 lines) |
 | `triton_kernels.py` | Fused Triton kernels for score / topk / KV-assemble / RoPE with PyTorch fallbacks (~2100 lines) |
 
 Key functions in `dct_page_attention.py`:
 - `dct_page_attention_forward()` — replacement forward. Prefill: standard attention + KV pre-allocation. Decode: score pages → topk → assemble → SDPA.
-- `replace_llama_attn()` (line 1528), `replace_qwen2_attn()` (line 1390), `replace_qwen3_attn()` (line 1458) — monkey-patch entry points. Call **before** `from_pretrained()`.
+- `replace_llama_attn()`, `replace_qwen2_attn()`, `replace_qwen3_attn()` — monkey-patch entry points. Call **before** `from_pretrained()`.
 - `_update_comp_cache()` — incremental DCT-lowpass-IDCT page compression; only processes new pages each step.
 - `_build_dct_projection_matrix()` — builds the lowpass-IDCT projection used for both scoring and compressed-mode KV.
 - `PreAllocatedLayer` — fixed-stride KV buffer replacing `DynamicLayer` for O(1) decode append.
@@ -47,8 +47,8 @@ Key kernels in `triton_kernels.py` (every kernel has a PyTorch fallback):
 | `page_size` | `32` | Tokens per page |
 | `top_k` | `64` | Pages selected for full attention |
 | `num_sink_pages` | `1` | First N physical pages always attended (sink) |
-| `num_recent_pages` | `5` | Number of full recent pages always attended; EXCLUDES the currently-open partial page (open page is implicit, always also attended). Total recent slots = `num_recent_pages + 1`. |
-| `compress_ratio` | `0.03125` | Per-page compression (e.g. 32 → 1 token) |
+| `num_recent_pages` | `4` | Number of full recent pages always attended; EXCLUDES the currently-open partial page (open page is implicit, always also attended). Total recent slots = `num_recent_pages + 1`. |
+| `compress_ratio` | `0.125` | Per-page compression (e.g. 32 → 4 tokens) |
 | `min_decode_kv_len_for_paging` | `8192` | Fallback to baseline decode attention below this KV length |
 | `scoring_method` | `"max"` | `"mean" \| "max" \| "sum"` |
 | `group_agg_method` | `"mean"` | `"mean" \| "max" \| "topp"` — GQA per-group aggregation |
@@ -72,8 +72,11 @@ Key kernels in `triton_kernels.py` (every kernel has a PyTorch fallback):
 | `eval_longbench_v2.py` | LongBench v2 (503 multiple-choice, by difficulty/length) | baseline, page_attention, rope_gap, seer_attention, multipole_attention, quest_attention, duo_attention, inf_llm |
 | `eval_aime25.py` | AIME 2025 (30 problems, pass@1) — **Qwen3-8B only** | baseline, page_attention, seer_attention, seer_prefill, multipole_attention, quest_attention, duo_attention |
 | `eval_gpqa.py` | GPQA (diamond/main/extended, MC accuracy) — **Qwen3-8B only** | same set as AIME |
+| `eval_math500.py` | MATH-500 (500 competition-math problems, boxed-answer accuracy) — **Qwen3-8B** | baseline, page_attention, seer_attention, seer_prefill, multipole_attention, quest_attention, duo_attention, inf_llm |
 
 All eval scripts prepend `baselines/` to `sys.path` so baseline packages are importable.
+
+`math_grader.py` (repo root) — vendored math-answer grading (boxed-answer extraction + numeric/symbolic equivalence); used by `eval_aime25.py` and `eval_math500.py`.
 
 Model support: **Llama 3.x** (`replace_llama_attn`) and **Qwen3** (`replace_qwen3_attn`, with q_norm/k_norm). Qwen2 patch exists but is not wired into modern eval scripts.
 

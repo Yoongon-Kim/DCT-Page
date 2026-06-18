@@ -8,7 +8,7 @@ During autoregressive decoding, the KV cache is divided into fixed-size pages. E
 
 Default configuration:
 - score proxy: **DCT-lowpass-IDCT**
-- `page_size=32`, `top_k=64`, `compress_ratio=0.03125` (`comp_size=1`)
+- `page_size=32`, `top_k=64`, `compress_ratio=0.125` (`comp_size=4`)
 - `unselected_mode="drop"` (speed) — switch to `"compressed"` for a quality floor
 
 ## Layout
@@ -124,8 +124,8 @@ replace_llama_attn(
     page_size=32,
     top_k=64,
     num_sink_pages=1,
-    num_recent_pages=5,
-    compress_ratio=0.03125,
+    num_recent_pages=4,
+    compress_ratio=0.125,
     scoring_method="max",
     group_agg_method="mean",
     unselected_mode="drop",          # or "compressed"
@@ -151,8 +151,8 @@ For Qwen3-8B use `replace_qwen3_attn(...)`.
 | `page_size` | `32` |
 | `top_k` | `64` |
 | `num_sink_pages` | `1` |
-| `num_recent_pages` | `5` |
-| `compress_ratio` | `0.03125` |
+| `num_recent_pages` | `4` |
+| `compress_ratio` | `0.125` |
 | `min_decode_kv_len_for_paging` | `8192` |
 | `scoring_method` | `"max"` |
 | `group_agg_method` | `"mean"` |
