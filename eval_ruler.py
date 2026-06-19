@@ -2,7 +2,7 @@
 Unified RULER benchmark evaluation.
 
 Supports many attention modes (baseline, page_attention, seer_attention,
-seer_prefill, multipole_attention, quest_attention, duo_attention,
+seer_prefill, multipole_attention, quest_attention,
 inf_llm) with optional data preparation.  Mirrors the mode-based
 dispatch pattern of eval_longbench_v1.py.
 
@@ -111,7 +111,6 @@ def parse_args():
                         choices=["baseline", "page_attention", "seer_attention",
                                  "seer_prefill",
                                  "multipole_attention", "quest_attention",
-                                 "duo_attention",
                                  "inf_llm"])
 
     # Model
@@ -299,8 +298,6 @@ def parse_args():
                 args.run_name += f"_ci{args.multipole_cluster_interval}"
         elif args.mode == "quest_attention":
             args.run_name = f"{tag}_quest_ps{args.quest_page_size}_pb{args.quest_top_k}"
-        elif args.mode == "duo_attention":
-            args.run_name = f"{tag}_duo_attention"
         elif args.mode == "inf_llm":
             args.run_name = (f"{tag}_inf_llm_topk{args.inf_llm_topk}"
                              f"_bs{args.inf_llm_block_size}"
@@ -596,8 +593,6 @@ def apply_monkey_patch(args):
         replace_attn_multipole(cfg)
     elif args.mode == "quest_attention":
         pass  # Quest uses custom model class, no monkey-patch needed
-    elif args.mode == "duo_attention":
-        pass  # DuoAttention patches per-instance forwards post-load (see load_model_and_tokenizer)
     elif args.mode == "inf_llm":
         pass  # InfLLM patches per-instance forwards post-load (see load_model_and_tokenizer)
     elif args.mode == "baseline":
@@ -694,8 +689,8 @@ def load_model_and_tokenizer(args):
         tokenizer = AutoTokenizer.from_pretrained(base_model)
         print(f"Model loaded. Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
     else:
-        # DuoAttention's and InfLLM's replacement forwards assume eager-style Q/K/V signatures.
-        attn_impl = "eager" if args.mode in {"duo_attention", "inf_llm"} else "sdpa"
+        # InfLLM's replacement forward assumes eager-style Q/K/V signatures.
+        attn_impl = "eager" if args.mode == "inf_llm" else "sdpa"
         print(f"Loading model: {args.base_model} (attn: {attn_impl})")
         tokenizer = AutoTokenizer.from_pretrained(args.base_model)
         yarn_kwargs = {}
@@ -711,13 +706,7 @@ def load_model_and_tokenizer(args):
                 },
                 "max_position_embeddings": 131072,
             }
-        # Old transformers envs (duo_attention) only accept torch_dtype=;
-        # transformers 5.x (main DCT-Page env, including inf_llm) only accepts dtype=.
-        dtype_kwarg = (
-            {"torch_dtype": torch.bfloat16}
-            if args.mode == "duo_attention"
-            else {"dtype": torch.bfloat16}
-        )
+        dtype_kwarg = {"dtype": torch.bfloat16}
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
             **dtype_kwarg,
@@ -732,13 +721,6 @@ def load_model_and_tokenizer(args):
             from multipole_attn import init_multipole_layers
             init_multipole_layers(model)
             print("Multipole attention layers initialized.")
-
-        if args.mode == "duo_attention":
-            from duo_attn import init_duo_attention, assert_llama
-            from duo_attn.config import DUO_ATTN_CONFIG
-            assert_llama(args.base_model)
-            DUO_ATTN_CONFIG["base_model"] = args.base_model
-            init_duo_attention(model, DUO_ATTN_CONFIG)
 
         if args.mode == "inf_llm":
             from infllm import (
@@ -823,18 +805,6 @@ def predict_task(model, tokenizer, task, task_config, data_dir, pred_dir, args):
                         attention_mask=torch.ones_like(input_ids),
                         max_length=input_len + tokens_to_generate,
                         do_sample=False,
-                    )
-                elif args.mode == "duo_attention":
-                    # DuoAttention's v4.34 tuple-cache forward is incompatible
-                    # with transformers>=4.37 generate()'s DynamicCache. Use a
-                    # manual greedy loop matching duo-attention/eval/LongBench/pred.py.
-                    from duo_attn import duo_generate_greedy
-                    _eos = model.generation_config.eos_token_id
-                    eos_ids = _eos if isinstance(_eos, (list, tuple)) else [_eos]
-                    output_ids = duo_generate_greedy(
-                        model, input_ids,
-                        max_new_tokens=tokens_to_generate,
-                        eos_token_ids=eos_ids,
                     )
                 elif args.mode == "inf_llm":
                     # InfLLM uses a stateful ContextManager KV cache that HF

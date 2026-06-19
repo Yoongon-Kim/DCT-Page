@@ -430,7 +430,7 @@ def parse_args():
 
     # Mode
     parser.add_argument("--mode", type=str, required=True,
-                        choices=["baseline", "page_attention", "seer_attention", "multipole_attention", "quest_attention", "duo_attention", "inf_llm"])
+                        choices=["baseline", "page_attention", "seer_attention", "multipole_attention", "quest_attention", "inf_llm"])
 
     # Model
     parser.add_argument("--base_model", type=str,
@@ -560,8 +560,6 @@ def parse_args():
             args.run_name = f"{tag}_multipole_attention"
         elif args.mode == "quest_attention":
             args.run_name = f"{tag}_quest_ps{args.quest_page_size}_pb{args.quest_top_k}"
-        elif args.mode == "duo_attention":
-            args.run_name = f"{tag}_duo_attention"
         elif args.mode == "inf_llm":
             args.run_name = (f"{tag}_inf_llm_topk{args.inf_llm_topk}"
                              f"_bs{args.inf_llm_block_size}"
@@ -981,8 +979,6 @@ def main():
         from multipole_attn.config import MULTIPOLE_ATTN_CONFIG
         MULTIPOLE_ATTN_CONFIG["base_model"] = args.base_model
         replace_attn_multipole(MULTIPOLE_ATTN_CONFIG)
-    elif args.mode == "duo_attention":
-        pass  # DuoAttention patches per-instance forwards post-load
     elif args.mode == "inf_llm":
         pass  # InfLLM patches per-instance forwards post-load
     elif args.mode not in ("seer_attention", "quest_attention"):
@@ -1045,8 +1041,8 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(base_model)
         print(f"Model loaded. Params: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
     else:
-        # DuoAttention's and InfLLM's replacement forwards assume eager-style Q/K/V signatures.
-        attn_impl = "eager" if args.mode in {"duo_attention", "inf_llm"} else "sdpa"
+        # InfLLM's replacement forward assumes eager-style Q/K/V signatures.
+        attn_impl = "eager" if args.mode == "inf_llm" else "sdpa"
         print(f"Loading model: {args.base_model} (attn: {attn_impl})")
         tokenizer = AutoTokenizer.from_pretrained(args.base_model)
         yarn_kwargs = {}
@@ -1062,13 +1058,7 @@ def main():
                 },
                 "max_position_embeddings": 131072,
             }
-        # duo_attention is pinned to transformers 4.45 (torch_dtype=); everything else
-        # (including inf_llm post-5.2.0 migration) is on the main DCT-Page env (dtype=).
-        dtype_kwarg = (
-            {"torch_dtype": torch.bfloat16}
-            if args.mode == "duo_attention"
-            else {"dtype": torch.bfloat16}
-        )
+        dtype_kwarg = {"dtype": torch.bfloat16}
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
             **dtype_kwarg,
@@ -1083,13 +1073,6 @@ def main():
             from multipole_attn import init_multipole_layers
             init_multipole_layers(model)
             print("Multipole attention layers initialized.")
-
-        if args.mode == "duo_attention":
-            from duo_attn import init_duo_attention, assert_llama
-            from duo_attn.config import DUO_ATTN_CONFIG
-            assert_llama(args.base_model)
-            DUO_ATTN_CONFIG["base_model"] = args.base_model
-            init_duo_attention(model, DUO_ATTN_CONFIG)
 
         if args.mode == "inf_llm":
             from infllm import (
@@ -1200,9 +1183,6 @@ def main():
             "page_budget": args.quest_top_k,
             "token_budget": args.quest_page_size * args.quest_top_k,
         }
-    elif args.mode == "duo_attention":
-        from duo_attn.config import DUO_ATTN_CONFIG
-        summary["duo_attn_config"] = DUO_ATTN_CONFIG
     elif args.mode == "inf_llm":
         from infllm.config import INF_LLM_CONFIG
         summary["inf_llm_config"] = INF_LLM_CONFIG

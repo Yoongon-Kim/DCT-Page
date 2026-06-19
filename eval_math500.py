@@ -64,7 +64,7 @@ QWEN3_SUPPORTED_MODES = {
 }
 LLAMA_ONLY_MODES = {"inf_llm"}
 UNSUPPORTED_MODES = {
-    "seer_prefill", "quest_attention", "duo_attention",
+    "seer_prefill", "quest_attention",
 }
 
 
@@ -154,7 +154,6 @@ def parse_args():
                         choices=["baseline", "page_attention", "seer_attention",
                                  "seer_prefill",
                                  "multipole_attention", "quest_attention",
-                                 "duo_attention",
                                  "inf_llm"])
 
     parser.add_argument("--base_model", type=str, default="Qwen/Qwen3-8B")

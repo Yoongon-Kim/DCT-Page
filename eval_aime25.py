@@ -4,7 +4,7 @@ AIME 2025 evaluation for DCT Page Attention and baseline attention mechanisms.
 Evaluates Qwen3-8B (the default reasoning model in this harness) on the
 AIME 2025 math competition (30 integer-answer problems) across the attention
 modes exposed by eval_ruler.py. Modes that do not support Qwen3
-(seer_prefill, quest_attention, duo_attention) are still listed in
+(seer_prefill, quest_attention) are still listed in
 --mode for parity, but the script raises ValueError before model load if one
 is selected. inf_llm is Llama-only (runs in the main env; upstream is vendored) and
 requires --base_model pointing to a Llama-family checkpoint.
@@ -64,7 +64,7 @@ QWEN3_SUPPORTED_MODES = {
 LLAMA_ONLY_MODES = {"inf_llm"}
 # Modes intentionally listed in --mode for argparse parity but unsupported here.
 UNSUPPORTED_MODES = {
-    "seer_prefill", "quest_attention", "duo_attention",
+    "seer_prefill", "quest_attention",
 }
 
 
@@ -163,7 +163,6 @@ def parse_args():
                         choices=["baseline", "page_attention", "seer_attention",
                                  "seer_prefill",
                                  "multipole_attention", "quest_attention",
-                                 "duo_attention",
                                  "inf_llm"])
 
     # Model — Qwen3-8B default; Llama-family accepted for inf_llm mode

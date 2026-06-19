@@ -2,9 +2,9 @@
 GPQA evaluation for DCT Page Attention and baseline attention mechanisms.
 
 Evaluates Qwen3-8B (the only supported reasoning model in this harness) on the
-GPQA multiple-choice benchmark across the same eight attention modes exposed by
+GPQA multiple-choice benchmark across the attention modes exposed by
 eval_ruler.py. Attention modes that do not support Qwen3 (seer_prefill,
-quest_attention, duo_attention) are still listed in --mode for parity,
+quest_attention) are still listed in --mode for parity,
 but the script raises ValueError before model load if one is selected.
 
 Default subset is gpqa_diamond (198 hardest questions); --gpqa_subset switches
@@ -59,7 +59,7 @@ QWEN3_SUPPORTED_MODES = {
     "baseline", "page_attention", "seer_attention", "multipole_attention",
 }
 QWEN3_UNSUPPORTED_MODES = {
-    "seer_prefill", "quest_attention", "duo_attention",
+    "seer_prefill", "quest_attention",
 }
 
 
@@ -159,8 +159,7 @@ def parse_args():
     parser.add_argument("--mode", type=str, required=True,
                         choices=["baseline", "page_attention", "seer_attention",
                                  "seer_prefill",
-                                 "multipole_attention", "quest_attention",
-                                 "duo_attention"])
+                                 "multipole_attention", "quest_attention"])
 
     # Model — Qwen3-8B only
     parser.add_argument("--base_model", type=str,

@@ -173,7 +173,6 @@ See **[CLAUDE.md](CLAUDE.md)** for the full file-by-file map, architecture detai
 
 ## Notes
 
-- The only active score proxy is **DCT-lowpass-IDCT**; earlier Haar / Walsh-Hadamard / direct-spectral variants have been removed.
 - `drop` mode targets speed; `compressed` mode is for accuracy studies (sets a quality floor by retaining a compressed view of unselected pages).
 - Benchmark data under `benchmark/data/` is gitignored (~136 MB) and regenerates on demand (RULER synthetic via `--prepare`; LongBench auto-downloaded from Hugging Face).
 - LongBench v1 semantics follow the FastKV adjustments (prompt formatting, no-chat tasks, metric computation).
