@@ -158,7 +158,6 @@ Side-by-side implementations under [baselines/](baselines/), selected via `--mod
 | **Multipole** | hierarchical k-means page clustering | Llama 3.x, Qwen2/3 |
 | **Quest** | per-page min/max key metadata + CUDA kernels | Llama 2/3.x, Mistral, Qwen3 |
 | **InfLLM** | retrieval-based block attention (vendored) | Llama 3.x |
-| **DuoAttention** | streaming/retrieval head split | Llama 3.x (separate env) |
 
 Setup notes (extra envs, kernel builds, checkpoints) are in [CLAUDE.md](CLAUDE.md#baselines).
 
