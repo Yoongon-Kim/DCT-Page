@@ -1,19 +1,34 @@
+# === Core ML stack ===
+# Hard-pinned: these are coupled by ABI / Triton-kernel / attention-API
+# compatibility, and the repo monkey-patches transformers' attention internals.
+# Do NOT bump without re-validating (verify_kernels.py + a smoke RULER/LongBench run).
+# In particular: torch<->triton are an ABI pair, and datasets 4.x/5.x dropped
+# script-based loading used by the RULER/LongBench data paths.
 torch==2.11.0
 transformers==5.5.4
-datasets==3.0.1
-accelerate==1.13.0
 triton==3.6.0
+accelerate==1.13.0
+datasets==3.0.1
 numpy==2.3.5
 scipy==1.17.1
-tqdm==4.67.3
-sentencepiece==0.2.0
-PyYAML==6.0.3
-tenacity==9.1.4
-wonderwords==3.0.1
-nltk==3.9.3
-rouge==1.0.1
-fuzzywuzzy==0.18.0
-python-Levenshtein==0.27.3
-jieba==0.42.1
-html2text==2025.4.15
-beautifulsoup4==4.13.5
+
+# === Utilities ===
+# Lower-bounded only; any recent release works (stable leaf dependencies).
+tqdm>=4.67.3
+PyYAML>=6.0.3
+tenacity>=9.1.4
+sentencepiece>=0.2.0
+nltk>=3.9.3
+rouge>=1.0.1
+fuzzywuzzy>=0.18.0
+jieba>=0.42.1
+wonderwords>=3.0.1
+
+# === Optional ===
+# Not needed for the core eval pipeline (the RULER essay JSON is already vendored).
+# beautifulsoup4 + html2text: only to regenerate source data via
+#   benchmark/eval_ruler/data/synthetic/json/download_paulgraham_essay.py
+# python-Levenshtein: optional C-speedup for fuzzywuzzy (pure-Python fallback otherwise).
+beautifulsoup4>=4.13.5
+html2text>=2025.4.15
+python-Levenshtein>=0.27.3
